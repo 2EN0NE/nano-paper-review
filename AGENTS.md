@@ -1,35 +1,68 @@
-# paper-rag — 离线论文检索服务
+# nano-paper-review — Agent 开发指南
+
+> **维护原则**：本文档仅保留项目入口必须知晓的要点。每完成一个重要任务，若产生新的设计知识，按此分级沉淀——
+>
+> - **一级**（这里）：架构全景、关键设计决策摘要、规范约定
+> - **二级**：`CONTEXT.md`（领域词汇）、`SPEC.md`（需求规格）
+> - **三级**：`docs/*.md`（模块细节、API 参考、部署步骤、ADR）
+
+## 首先阅读
+
+在开始任何开发工作前，按顺序阅读：
+
+1. **[CONTEXT.md](./CONTEXT.md)** — 领域词汇表。**Subject**、**Reference**、**Review Phase**、**Intermediates** 等核心术语的唯一定义来源。涉及管线概念时必须对齐此文件。
+2. **[SPEC.md](./SPEC.md)** — 需求与设计决策规格。检索系统的完整用户故事、技术选型理由（CJK 分词策略、加权 Mean Pooling、后过滤 vs 前过滤等）、接口契约。
+3. **`docs/SPEC-PIPELINE.md`** — 管线编制的需求规格。管线的用户故事、Phase 执行模型、Step 形态、模板变量系统、重试策略。
 
 ## 项目目的
 
-在同一台 2C/4G 无 GPU 的离线 Linux 机器上检索中文技术论文。核心是 BM25 + 向量双路索引 + RRF 混合排序 + Cross-Encoder 精排。上层评审流水线通过 CLI 或 HTTP API 调用。
+离线技术论文评审工具。核心是**评审流水线**（批量格式归一化 → 逐篇 Agent 评审 → 批量化持久化），依赖本地混合检索引擎（BM25 + FAISS + Cross-Encoder 精排）驱动相似文章匹配。
 
 ## 架构速览
 
 ```
 src/paper_rag/
-├── store.py     # SQLite（FTS5 BM25）+ FAISS 持久化 ← 项目核心
-├── extractor.py # PDF 提取（PyMuPDF）+ 文件名元数据解析
-├── chunker.py   # 512 字分块，overlap 128，参考文献截断
-├── indexer.py   # build_index 函数：分块 → embedding → Mean Pooling → FAISS
-├── models.py    # bge-small-zh-v1.5 embedding 模型管理
-├── retriever.py # BM25 + Vector → RRF → (可选) Cross-Encoder 精排
-├── reranker.py  # bge-reranker-v2-m3 精排模型
-├── server.py    # Flask HTTP API
-├── config.py    # Pydantic 配置加载
-└── cli.py       # Typer CLI（index / search / status / serve）
+├── orchestrator.py     # 评审管线执行引擎 ← 项目核心
+├── template_engine.py  # 模板变量替换 + Agent 前缀生成
+├── store.py            # SQLite（FTS5 BM25）+ FAISS 持久化
+├── extractor.py        # PDF 提取（PyMuPDF）+ 文件名元数据解析
+├── chunker.py          # 512 字分块，overlap 128，参考文献截断
+├── indexer.py          # build_index：分块 → embedding → Mean Pooling → FAISS
+├── models.py           # bge-small-zh-v1.5 embedding 模型管理
+├── retriever.py        # BM25 + Vector → RRF → (可选) Cross-Encoder 精排
+├── reranker.py         # bge-reranker-v2-m3 精排封装
+├── server.py           # Flask HTTP API
+├── config.py           # Pydantic 配置加载
+└── cli.py              # paper-review CLI（Typer）
+
+pipeline/
+├── pipeline.yaml       # 管线编排定义
+├── pre-review/         # .py / .md 批量执行
+├── review-pipeline/    # .py / .md 逐篇 Agent 步骤
+└── post-review/        # .py / .md 批量执行
 ```
 
-测试 mirrors src——`tests/test_store.py`、`tests/test_chunker.py` 等。
+测试 mirrors src —— `tests/test_store.py`、`tests/test_orchestrator.py` 等。
+
+## 规范约定
+
+- **`Store` 是唯一持久化入口**：所有索引操作（add/remove/rebuild）通过 Store，不直接操作 SQLite。
+- **配置读取**：`config.py` 的 Pydantic 模型；默认值在 `store.py` 顶层常量。
+- **向量序列化**：`struct.pack("f" * dim, *vec)` 写入 BLOB。
+- **CLI**：Typer 框架，`paper-review` 统一入口。新增子命令时，docstring 即为 `--help` 文案，必须写清用法和选项含义。
 
 ## 关键设计决策
 
-- **存储**: SQLite FTS5（标准库自带，零额外依赖）。CJK 分词方法：索引/查询时在汉字之间插入空格，FTS5 unicode61 分词器按空格分 token。
-- **向量**: FAISS IndexFlatIP（内积，配合 L2 归一化等价余弦）。两套独立索引：`papers.index`（文档级）+ `chunks.index`（chunk 级）。`id_map.json` 记录 FAISS 索引位置 ↔ chunk_id/paper_id。
-- **文档向量**: 加权 Mean Pooling。每篇论文的 chunk 按位置权重（head=5.0 / body=2.0 / tail=4.0，三段比例可配置）加权平均，然后 L2 归一化。
-- **检索范围**: 全库搜索后按 pool 过滤（后过滤），非搜索前过滤。保证跨池潜在匹配不被漏掉。
-- **内容去重**: SHA-256 内容哈希 → content_dedup 表。同内容不同文件名的论文仅存元数据，共享向量。
-- **Embedding 指纹**: 写入 embed_fingerprint 表。load 时对比，不一致则 warn + 提供 `rebuild_doc_vectors()`。
+详细讨论见 `SPEC.md`，此处仅列要点：
+
+- **CJK 分词**：索引/查询时在汉字间插入空格，FTS5 unicode61 按空格分 token。
+- **双 FAISS 索引**：`papers.index`（文档级）+ `chunks.index`（chunk 级），IndexFlatIP + L2 归一化 = 余弦相似度。
+- **文档向量**：加权 Mean Pooling，按位置三段加权（head=5.0 / body=2.0 / tail=4.0，比例可配置）。
+- **检索后过滤**：全库搜索 → RRF 融合 → 按 pool 过滤结果，保证不遗漏跨池匹配。
+- **内容去重**：SHA-256 哈希 → content_dedup 表。
+- **Embedding 指纹**：写入 `embed_fingerprint`，加载时对比，不一致则 warn + `rebuild_doc_vectors()`。
+- **Agent 步骤**：通过 `subprocess.run(["pi", "-m", prompt])` 调用 pi。理由见 `docs/adr/0001-subprocess-pi-agent-steps.md`。
+- **管线执行模型**：Pre/Post 批量模式，Review 逐篇模式。Step 排序优先级：pipeline.yaml 显式声明 > 文件名前缀 > OS 排序。
 
 ## 检索管道
 
@@ -40,52 +73,27 @@ query → BM25(FTS5, chunk级) → max聚合到论文分
       → Cross-Encoder精排    → Top-5结果
 ```
 
-`pool_filter` 在后端位置作用（全库搜→过滤结果）。
+`pool_filter` 在 RRF 后作用（后过滤）。
+
+## 评审流水线
+
+```
+Pre Phase (batch) → Review Phase (per subject) → Post Phase (batch)
+```
+
+- **Step 形态**：`.py`（Python 直接执行）或 `.md`（pi agent 调用）
+- **中间产物**：`{output_dir}/intermediates/{subject}/{step}/output.json`
+- **模板变量**：`.md` 中 `{subject.name}`, `{intermediates.XX.data.YY}` 等，提交 Agent 前替换
+- **Agent 前缀**：框架自动拼接前序步骤汇总 + 输出约束
+- **错误策略**：pipeline.yaml 定义重试 + skip/abort
+- **CLI**：`paper-review review <path>` 统一入口
+
+详见 `CONTEXT.md`（术语）、`docs/PIPELINE.md`（设计）、`docs/SPEC-PIPELINE.md`（需求规格）。
 
 ## 测试策略
 
-- Seam: `Store(":memory:")` 纯内存 SQLite，无需真实文件
-- 测试数据: `tests/` 中用确定性纯文本模拟 PDF 内容
-- 不测试: FAISS 和 sentence-transformers 的第三方行为；HTTP 路由单独集成测试
+- **Seam**：`Store(":memory:")` 纯内存 SQLite；管线测试用临时目录 + mock `subprocess.run`
+- **测试数据**：确定性纯文本模拟 PDF 内容
+- **不测试**：FAISS 和 sentence-transformers 的第三方行为；HTTP 路由单独集成测试
 
-前置条件: `PYTHONPATH=src pip install -e .`
-
-## 约定与提示
-
-- `store.py` 中 `Store` 是唯一的持久化入口。所有索引操作（add/remove/rebuild）走 Store。
-- 添加新功能时优先在 Store 中加方法，而非绕过 Store 直接操作 SQLite。
-- config 读取在 `config.py`，默认值在 `store.py` 顶层常量。
-- 向量序列化用 `struct.pack("f" * dim, *vec)` 写入 BLOB。
-
-## 评审流水线（Phase 2）
-
-上层评审管线：Pre Phase（批量归一化）→ Review Phase（逐篇 Agent 评审）→ Post Phase（批量持久化）。
-
-编排定义: `pipeline.yaml` > 文件名前缀 > OS 排序。详情: `docs/PIPELINE.md` 配置: `docs/SPEC-PIPELINE.md`
-
-**核心模块** (待实现):
-
-```
-src/paper_rag/
-└── orchestrator.py  # Pipeline 引擎 ← Phase 2 核心
-```
-
-**pipeline/ 目录结构**:
-
-```
-pipeline/
-├── pipeline.yaml
-├── pre-review/           # .py / .md 批量执行
-├── review-pipeline/      # .py / .md 逐篇 Agent 步骤
-└── post-review/          # .py / .md 批量执行
-```
-
-**关键设计点**:
-
-- Step 形态: `.py` (Python runtime 直接执行) 或 `.md` (pi agent 调用)
-- Agent 步骤: `subprocess.run(["pi", "-m", resolved_prompt])` 调用 pi
-- 中间产物: `{output_dir}/intermediates/{subject}/{step}/output.json`
-- Agent 前缀: 框架不可修改地生成（前序步骤 + 输出约束）
-- 模板变量: `.md` 中用 `{subject.name}`, `{intermediates.XX.data.YY}` 等
-- 错误策略: pipeline.yaml 定义重试次数 + skip/abort
-- CLI: `paper-rag review <path>` 统一入口
+前置条件：`PYTHONPATH=src pip install -e .`

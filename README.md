@@ -1,8 +1,8 @@
-# nano-paper-review (paper-rag)
+# nano-paper-review
 
-本地论文检索服务 —— 专为中文技术论文的离线混合检索设计。
+离线技术论文自动评审工具 —— 对一批待审论文，自动检索历史相似文章、逐维度比对打分，产出结构化评审报告。
 
-基于 BM25 (FTS5) + FAISS 向量检索 + RRF 融合 + Cross-Encoder 精排的混合检索管道。
+核心能力：**评审流水线**（Pre → Review → Post）靠本地混合检索引擎（BM25 + FAISS + Cross-Encoder 精排）驱动。
 
 ## 快速开始
 
@@ -10,144 +10,239 @@
 # 安装
 pip install -e .
 
-# 建索引
-python -m paper_rag.cli index --pdf-dir ./data/history
+# 1. 将历史论文建索引（评审前必须）
+paper-review index --pdf-dir ./data/history
 
-# 搜索
-python -m paper_rag.cli search "深度学习信用评估"
+# 2. 执行评审
+paper-review review ./papers/pending/   # 目录模式（批量）
+paper-review review ./papers/subject-001.pdf  # 单篇模式
 
-# 启动 HTTP 服务
-python -m paper_rag.cli serve --port 8765
+# 辅助命令
+paper-review search "深度学习信用评估"    # 快速检索
+paper-review status                      # 索引状态
+paper-review serve --port 8765           # HTTP API
 ```
 
-## 配置
+第一次使用？`paper-review --help` 查看所有命令，`paper-review <cmd> --help` 查看子命令用法。
 
-编辑 `config.yaml`，参考 `src/paper_rag/config.py` 查看所有可用字段。
+## 评审流水线
 
-环境变量覆盖（优先级高于 YAML）：
+这是项目的**核心功能**。
+
+```
+输入目录（待审 PDF）/ 单篇 PDF
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ Pre Phase (批量)                        │
+│ 格式归一化（doc → PDF）→ 建索引        │
+└──────────────┬──────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────┐
+│ Review Phase (逐篇)                     │
+│ 检索相似文章 → 提取关键词 →             │
+│ Agent 创新性/方法/实验维度评审 → 综合   │
+└──────────────┬──────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────┐
+│ Post Phase (批量)                       │
+│ 标签反写索引 → 报告归档（JSON + MD）    │
+└─────────────────────────────────────────┘
+```
+
+### 自定义评审规则
+
+在 `pipeline.yaml` 中声明阶段，在对应目录下放置 `.py`（脚本步骤）或 `.md`（Agent 评审提示词）：
+
+```
+pipeline/
+├── pipeline.yaml              # 编排定义
+├── pre-review/                # Pre Phase 步骤
+├── review-pipeline/           # Review Phase 步骤
+│   ├── 01-search.py           # 检索相似文章
+│   ├── 02-novelty.md          # 创新性评审（Agent）
+│   └── 03-synthesis.md        # 综合评审（Agent）
+└── post-review/               # Post Phase 步骤
+```
+
+`.md` 文件中可用模板变量引用前置步骤输出：
+
+```markdown
+## 待审论文
+{subject.text}
+
+## 检索到的相似文章
+{intermediates.01-search.data.references}
+
+请按以下维度评审...
+```
+
+详细设计参考 [`docs/PIPELINE.md`](docs/PIPELINE.md)。
+
+### 高级用法
 
 ```bash
-export PAPER_RAG_CHUNK_SIZE=256
-export PAPER_RAG_EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+# 仅运行某个阶段（调试评审提示词）
+paper-review review ./dir/ --phase review
+
+# 重跑单个步骤（需已有中间产物）
+paper-review review ./dir/ --step 02-novelty
+
+# 指定自定义管线
+paper-review review ./dir/ --pipeline ./custom/pipeline.yaml
 ```
 
-## 离线部署
+## 检索引擎
 
-对于无网络的 Debian Linux 目标机器（如 2CPU/4GB RAM），可通过以下步骤打包并部署。
+评审管线依赖的**混合检索**模块，也可独立使用。
 
-### 在线机器（有网络）：打包
+### 检索管道
+
+```
+query → BM25(FTS5, chunk级) → max聚合到论文分
+      → FAISS(文档级向量)     → cosine similarity
+      → RRF融合(k=60)        → Top-30候选
+      → Cross-Encoder精排    → Top-5结果
+      → pool 过滤             → 最终结果
+```
+
+### 命令行检索
 
 ```bash
-# Step 1: 下载模型权重
-python scripts/download_models.py --cache-dir ./models_cache
+# 论文级检索
+paper-review search "图神经网络欺诈检测" --limit 10
 
-# Step 2: 一键打包（pip wheels + 模型 + 源码）
-bash scripts/offline_pack.sh --cache-dir ./models_cache --output-dir ./dist/offline
+# 按池过滤
+paper-review search "深度学习" --pool history
 
-# 生成的文件位于 dist/paper-rag-offline-<timestamp>.tar.gz
-```
+# chunk 级检索（匹配片段）
+paper-review search "残差连接" --chunk-level
 
-也可以分步手动完成：
-
-```bash
-# 下载 pip 依赖
-pip download \
-    --platform manylinux2014_x86_64 \
-    --only-binary=:all: \
-    -d ./offline_packages \
-    -e .
-
-# 下载模型
-python scripts/download_models.py --cache-dir ./models_cache
-
-# 打包
-tar czf paper-rag-offline.tar.gz \
-    src/ pyproject.toml config.yaml \
-    offline_packages/ models_cache/
-```
-
-### 目标机器（离线）：部署
-
-```bash
-# Step 1: 解压
-tar xzf paper-rag-offline-<timestamp>.tar.gz
-cd paper-rag-offline-<timestamp>
-
-# Step 2: 安装依赖（无网络）
-pip install --no-index --find-links=./offline_packages -e .
-
-# Step 3: 修改配置指向本地模型路径
-# 编辑 config.yaml 设置 model_cache_dir: ./models
-
-# Step 4: 运行
-python -m paper_rag.cli index --pdf-dir ./data/history
-python -m paper_rag.cli search "检索内容"
-```
-
-**注意事项**：
-- Python 3.10+ 必须预安装在目标机器上，推荐 3.12.x
-- 如果目标机器 CPU 不支持 AVX2，FAISS 可能需要回退到 `faiss-cpu` 的无优化版本
-- 内存预算：embedding 模型 ~100MB + reranker ~1.1GB (fp16) + Python + FAISS ≈ 2-2.5GB
-- `sentence-transformers` 的部分依赖（如 `torch`）可能较大，建议使用 `--only-binary=:all:` 确保兼容性
-
-## 项目结构
-
-```
-paper-rag/
-├── pyproject.toml           # 项目元数据与依赖
-├── config.yaml              # 配置文件
-├── scripts/
-│   ├── download_models.py   # 模型下载工具（离线部署用）
-│   ├── offline_pack.sh      # 一键离线打包脚本
-│   └── _check_missing.py    # 打包辅助：检查缺失依赖
-├── src/paper_rag/
-│   ├── cli.py               # CLI 入口（Typer）
-│   ├── server.py            # HTTP API 入口（Flask）
-│   ├── config.py            # 配置加载（Pydantic）
-│   ├── store.py             # SQLite 持久化层
-│   ├── extractor.py         # PDF 文本提取（PyMuPDF）
-│   ├── chunker.py           # 分块
-│   ├── indexer.py           # 索引构建
-│   ├── retriever.py         # 检索管道
-│   ├── reranker.py          # Cross-Encoder 精排
-│   └── models.py            # 模型管理层
-└── tests/
-```
-
-## 接口
-
-### CLI
-
-```bash
-# 建索引
-python -m paper_rag.cli index --pdf-dir ./data/history
-
-# 搜索
-python -m paper_rag.cli search "深度学习信用评估"
-python -m paper_rag.cli search "深度学习信用评估" --pool history
-python -m paper_rag.cli search "图神经网络" --chunk-level
-
-# 服务模式
-python -m paper_rag.cli serve --port 8765
-
-# 查看状态
-python -m paper_rag.cli status
+# 跳过精排（更快但精度略降）
+paper-review search "信用评分" --no-rerank
 ```
 
 ### HTTP API
 
 ```bash
+paper-review serve --port 8765
+```
+
+```json
 POST /search
 {
   "query": "深度学习信用评估",
   "limit": 5,
   "pool_filter": "history",
-  "chunk_level": false,
-  "with_rerank": true
+  "with_rerank": true,
+  "chunk_level": false
 }
 → { "results": [...], "meta": {...} }
+```
 
-GET /status → { "papers": N, "chunks": N, ... }
+API 完整文档：[`docs/API.md`](docs/API.md)
+
+## 配置
+
+编辑 `config.yaml`：
+
+```yaml
+# 分块参数
+chunk_size: 512
+chunk_overlap: 128
+
+# 加权 Mean Pooling（文档向量权重）
+head_weight: 5.0
+body_weight: 2.0
+tail_weight: 4.0
+head_ratio: 0.15
+tail_ratio: 0.10
+
+# 检索参数
+recall_k: 50
+final_top_n: 5
+rrf_k: 60
+
+# 模型
+embedding_model: BAAI/bge-small-zh-v1.5
+reranker_model: BAAI/bge-reranker-v2-m3
+```
+
+环境变量覆盖（优先级 > YAML）：
+
+```bash
+export PAPER_RAG_CHUNK_SIZE=256
+```
+
+## 离线部署
+
+目标机器：2C/4G 无 GPU、Debian Linux、Python 3.12+。
+
+### 有网机器：打包
+
+```bash
+# 下载模型 + 打包依赖
+python scripts/download_models.py --cache-dir ./models_cache
+bash scripts/offline_pack.sh --cache-dir ./models_cache --output-dir ./dist/offline
+
+# 产物: dist/paper-rag-offline-<timestamp>.tar.gz
+```
+
+### 目标机器：部署
+
+```bash
+tar xzf paper-rag-offline-<timestamp>.tar.gz
+cd paper-rag-offline-<timestamp>
+pip install --no-index --find-links=./offline_packages -e .
+
+# 编辑 config.yaml 指向本地模型路径
+# model_cache_dir: ./models
+
+paper-review index --pdf-dir ./data/history
+paper-review review ./papers/pending/
+```
+
+内存预算：embedding ~100MB + reranker ~1.1GB (fp16) + Python + FAISS ≈ 2-2.5GB，在 4GB 限制内。
+
+详见 [`docs/DEPLOY.md`](docs/DEPLOY.md)。
+
+## 项目结构
+
+```
+nano-paper-review/
+├── pyproject.toml
+├── config.yaml
+├── CONTEXT.md                # 领域词汇表
+├── SPEC.md                   # 需求与设计决策规格
+├── docs/                     # 详细文档
+│   ├── ARCHITECTURE.md       # 数据流与架构
+│   ├── API.md                # HTTP API 参考
+│   ├── PIPELINE.md           # 评审管线设计
+│   ├── SPEC-PIPELINE.md      # 管线需求规格
+│   ├── STORE_SCHEMA.md       # SQLite schema
+│   ├── DEPLOY.md             # 离线部署指南
+│   └── adr/                  # 架构决策记录
+├── pipeline/                 # 管线步骤定义
+│   ├── pipeline.yaml
+│   ├── pre-review/
+│   ├── review-pipeline/
+│   └── post-review/
+├── src/paper_rag/
+│   ├── cli.py                # CLI 入口（Typer）
+│   ├── orchestrator.py       # 管线执行引擎
+│   ├── template_engine.py    # 模板变量引擎
+│   ├── server.py             # HTTP API（Flask）
+│   ├── config.py             # 配置加载（Pydantic）
+│   ├── store.py              # SQLite + FAISS 持久化
+│   ├── extractor.py          # PDF 提取（PyMuPDF）
+│   ├── chunker.py            # 分块
+│   ├── indexer.py            # 索引构建
+│   ├── retriever.py          # 检索管道
+│   ├── reranker.py           # Cross-Encoder 精排
+│   └── models.py             # Embedding 模型管理
+└── tests/
 ```
 
 ## 许可证
