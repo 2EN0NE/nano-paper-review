@@ -18,6 +18,8 @@ import typer
 
 from paper_rag.store import Store
 from paper_rag.server import create_app
+from paper_rag.orchestrator import run_pipeline
+from paper_rag.logging_config import setup_logging
 
 
 app = typer.Typer(help="paper-rag: 本地论文混合检索系统")
@@ -129,6 +131,79 @@ def serve(
     app = create_app(store)
     typer.echo(f"索引状态: {store.state_summary()}")
     app.run(host=host, port=port, debug=False)
+
+
+@app.command()
+def review(
+    path: Path = typer.Argument(
+        ...,
+        help="输入路径：单篇 PDF 或包含 PDF 的目录",
+        exists=True,
+    ),
+    log_level: Optional[str] = typer.Option(
+        None,
+        "--log-level",
+        help="日志级别: DEBUG / INFO / WARNING / ERROR",
+    ),
+    log_dir: Optional[Path] = typer.Option(
+        None,
+        "--log-dir",
+        help="日志输出目录",
+    ),
+    phase: Optional[str] = typer.Option(
+        None,
+        "--phase",
+        help="仅运行指定阶段: pre / review / post",
+    ),
+    step: Optional[str] = typer.Option(
+        None,
+        "--step",
+        "-s",
+        help="仅运行指定步骤（需已有中间产物）",
+    ),
+):
+    """
+    执行评审流水线。
+
+    在输入目录或单篇 PDF 上运行评审阶段。
+    如果输入目录下存在 review-pipeline/ 子目录，自动识别为步骤目录。
+    """
+    setup_logging(log_level=log_level, log_dir=str(log_dir) if log_dir else None)
+
+    pipe_path = path if path.is_dir() else path.parent
+    pipeline_yaml_path = pipe_path / "pipeline.yaml"
+
+    if pipeline_yaml_path.exists():
+        result = run_pipeline(
+            pipeline_yaml_path,
+            path,
+            target_phase=phase,
+            target_step=step,
+        )
+    else:
+        review_dir = pipe_path / "review-pipeline"
+        if review_dir.exists():
+            result = run_pipeline(
+                {
+                    "name": "auto",
+                    "output_dir": str(pipe_path / "output"),
+                    "review": {"directory": str(review_dir)},
+                },
+                path,
+                target_phase=phase,
+                target_step=step,
+            )
+        else:
+            typer.echo("错误：未找到 pipeline.yaml 或 review-pipeline/ 目录")
+            raise typer.Exit(1)
+
+    typer.echo(f"\nPipeline 完成: {result.subject}")
+    typer.echo(f"  状态: {'✅ 通过' if result.success else '❌ 有错误'}")
+    for sr in result.step_results:
+        icon = "✅" if sr.status == "ok" else "⚠️" if sr.status == "skipped" else "❌"
+        typer.echo(f"  {icon} {sr.step_name}: {sr.status}")
+        if sr.error:
+            typer.echo(f"     └─ {sr.error}")
 
 
 def main():

@@ -1,0 +1,52 @@
+# 日志配置文件
+# 优先级：此文件 < 环境变量 < 代码中显式参数
+#
+# 环境变量:
+#   PAPER_RAG_LOG_LEVEL=DEBUG  覆盖所有 logger 级别
+#   PAPER_RAG_LOG_DIR=/var/log  覆盖日志目录
+#
+# 轮转策略: 每日轮转, 保留 14 天
+
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  standard:
+    format: "[%(asctime)s] %(levelname)-8s %(name)s | %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+  brief:
+    format: "%(levelname)-8s %(name)s | %(message)s"
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: brief
+    stream: "ext://sys.stderr"
+  file:
+    class: logging.handlers.TimedRotatingFileHandler
+    level: INFO
+    formatter: standard
+    filename: logs/paper-rag.log
+    when: midnight
+    interval: 1
+    backupCount: 14
+    encoding: utf-8
+
+loggers:
+  paper_rag:
+    level: DEBUG
+    handlers: [console, file]
+    propagate: false
+  paper_rag.orchestrator:
+    level: DEBUG
+    handlers: [console, file]
+    propagate: false
+  paper_rag.retriever:
+    level: INFO
+    handlers: [console, file]
+    propagate: false
+
+root:
+  level: WARNING
+  handlers: [console]

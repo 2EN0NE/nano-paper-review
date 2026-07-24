@@ -1,0 +1,25 @@
+# 示例评审管线配置
+name: "标准论文评审管线"
+version: "1.0"
+output_dir: ./output
+
+pre:
+  directory: pre-review/
+  retry:
+    max_attempts: 2
+    on_failure: skip
+
+review:
+  directory: review-pipeline/
+  retry:
+    max_attempts: 1
+    on_failure: skip
+  subject_order:
+    sort_by: name
+    direction: asc
+
+post:
+  directory: post-review/
+  retry:
+    max_attempts: 2
+    on_failure: skip

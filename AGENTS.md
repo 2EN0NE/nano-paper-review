@@ -56,3 +56,36 @@ query → BM25(FTS5, chunk级) → max聚合到论文分
 - 添加新功能时优先在 Store 中加方法，而非绕过 Store 直接操作 SQLite。
 - config 读取在 `config.py`，默认值在 `store.py` 顶层常量。
 - 向量序列化用 `struct.pack("f" * dim, *vec)` 写入 BLOB。
+
+## 评审流水线（Phase 2）
+
+上层评审管线：Pre Phase（批量归一化）→ Review Phase（逐篇 Agent 评审）→ Post Phase（批量持久化）。
+
+编排定义: `pipeline.yaml` > 文件名前缀 > OS 排序。详情: `docs/PIPELINE.md` 配置: `docs/SPEC-PIPELINE.md`
+
+**核心模块** (待实现):
+
+```
+src/paper_rag/
+└── orchestrator.py  # Pipeline 引擎 ← Phase 2 核心
+```
+
+**pipeline/ 目录结构**:
+
+```
+pipeline/
+├── pipeline.yaml
+├── pre-review/           # .py / .md 批量执行
+├── review-pipeline/      # .py / .md 逐篇 Agent 步骤
+└── post-review/          # .py / .md 批量执行
+```
+
+**关键设计点**:
+
+- Step 形态: `.py` (Python runtime 直接执行) 或 `.md` (pi agent 调用)
+- Agent 步骤: `subprocess.run(["pi", "-m", resolved_prompt])` 调用 pi
+- 中间产物: `{output_dir}/intermediates/{subject}/{step}/output.json`
+- Agent 前缀: 框架不可修改地生成（前序步骤 + 输出约束）
+- 模板变量: `.md` 中用 `{subject.name}`, `{intermediates.XX.data.YY}` 等
+- 错误策略: pipeline.yaml 定义重试次数 + skip/abort
+- CLI: `paper-rag review <path>` 统一入口
