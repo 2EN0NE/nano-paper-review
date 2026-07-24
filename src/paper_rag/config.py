@@ -49,8 +49,12 @@ class Config(BaseModel):
     vector_dim: int = 512
 
     def fingerprint(self) -> str:
-        """当前配置的嵌入指纹，用于检测配置变更"""
-        model_name = Path(self.embedding_model).name
+        """当前配置的嵌入指纹，用于检测配置变更
+
+        使用 ``replace("/", "--")`` 将 HuggingFace 模型 ID 转为文件系统安全格式，
+        与 ``OnnxEmbedder.embed_fingerprint`` 保持一致。
+        """
+        model_name = self.embedding_model.replace("/", "--")
         return (
             f"{model_name}/dim={self.vector_dim}/"
             f"head={self.head_weight}_body={self.body_weight}_tail={self.tail_weight}"

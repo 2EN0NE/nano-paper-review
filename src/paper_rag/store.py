@@ -458,8 +458,7 @@ class Store:
             self._faiss_paper_rev_map[paper_id] = faiss_id
             self._next_faiss_paper_id += 1
 
-        # 重建 chunk 索引
-        if self._faiss_chunks is not None:
+            # 重建 chunk 索引
             for chunk_id, cv in self.chunk_vectors.items():
                 chunk_vec = np.array([cv.vector], dtype=np.float32)
                 faiss_id = self._next_faiss_chunk_id
@@ -487,7 +486,7 @@ class Store:
                 year=row["year"],
                 author_hint=row["author_hint"],
                 arxiv_id=row["arxiv_id"],
-                tags=eval(row["tags"]) if row["tags"] else [],
+                tags=json.loads(row["tags"]) if row["tags"] else [],
             )
             self.papers[pid] = Paper(
                 paper_id=pid,
@@ -597,7 +596,7 @@ class Store:
                         paper.meta.year,
                         paper.meta.author_hint,
                         paper.meta.arxiv_id,
-                        str(paper.meta.tags),
+                        json.dumps(paper.meta.tags, ensure_ascii=False),
                         paper.pool,
                         paper.raw_text,
                         paper.pages,
@@ -654,7 +653,7 @@ class Store:
                     paper.meta.year,
                     paper.meta.author_hint,
                     paper.meta.arxiv_id,
-                    str(paper.meta.tags),
+                    json.dumps(paper.meta.tags, ensure_ascii=False),
                     paper.pool,
                     paper.raw_text,
                     paper.pages,

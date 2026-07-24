@@ -19,8 +19,14 @@ def main():
     subject = os.environ.get("PIPELINE_SUBJECT", "")
     step_dir = os.environ.get("PIPELINE_STEP_DIR", ".")
 
-    # 打开索引
-    store = Store()
+    # 打开持久化索引（通过 PAPER_RAG_INDEX_DIR 环境变量或默认路径）
+    db_path = os.environ.get(
+        "PAPER_RAG_INDEX_DIR",
+        os.path.join(os.path.dirname(__file__), "..", "..", "data", "index", "index.sqlite"),
+    )
+    if os.path.isdir(db_path):
+        db_path = os.path.join(db_path, "index.sqlite")
+    store = Store(db_path=db_path)
     store.load_all()
 
     # 用 subject 名称作为 query

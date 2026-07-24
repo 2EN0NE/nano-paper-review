@@ -39,14 +39,12 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*.py" = ["S108"] # allow temp paths in tests
+"tests/*.py" = ["S108"]               # allow temp paths in tests
 "src/paper_rag/config.py" = ["UP045"] # pre-existing: Optional[X] style
 # (models.py and reranker.py no longer use lazy type imports)
 "src/paper_rag/orchestrator.py" = [
   "S603",
 ] # pre-existing: intended subprocess use
-"src/paper_rag/store.py" = ["S307"] # pre-existing: eval with DB data
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

@@ -10,6 +10,7 @@ CLI 入口 —— 论文检索服务的命令行接口
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -18,18 +19,24 @@ import typer
 from paper_rag.logging_config import setup_logging
 from paper_rag.orchestrator import run_pipeline
 from paper_rag.server import create_app
-from paper_rag.store import Store
+from paper_rag.store import (
+    Paper,
+    PaperMeta,
+    Store,
+)
 
 app = typer.Typer(help="paper-rag: 本地论文混合检索系统")
 
 
 def _open_store() -> Store:
-    """打开默认索引（支持环境变量覆盖目录）"""
+    """打开默认索引（支持环境变量覆盖目录），含 FAISS 初始化。"""
     index_dir = Path(__file__).parent.parent.parent / "data" / "index"
     index_dir.mkdir(parents=True, exist_ok=True)
     db_path = str(index_dir / "index.sqlite")
     store = Store(db_path)
     store.load_all()
+    if not store.load_faiss():
+        store.init_faiss()
     return store
 
 
@@ -51,8 +58,62 @@ def index(
     遍历 pdf_dir 下的所有 PDF 文件，提取文本 → 分块 → 建索引。
     """
     typer.echo(f"索引目录: {pdf_dir} [pool={pool}]")
-    # ... (索引逻辑在后续 ticket 实现)
-    typer.echo("索引完成")
+
+    from paper_rag.extractor import count_pages, extract_meta, extract_pdf
+    from paper_rag.indexer import build_index
+    from paper_rag.models import EmbeddingModelManager
+
+    # 初始化模型（无 ONNX 时降级确定性哈希）
+    model = EmbeddingModelManager()
+    model.load()
+    if model._embedder is None:
+        typer.echo("  ⚠ 未找到 ONNX 模型，使用确定性哈希向量（仅用于测试）")
+
+    store = _open_store()
+    pdf_files = sorted(pdf_dir.glob("*.pdf"))
+    if not pdf_files:
+        typer.echo("  ✗ 未找到 PDF 文件")
+        raise typer.Exit(1)
+
+    success = 0
+    for pdf_file in pdf_files:
+        try:
+            raw_text = extract_pdf(str(pdf_file))
+            if not raw_text.strip():
+                typer.echo(f"  ⚠ 跳过空内容: {pdf_file.name}")
+                continue
+
+            meta = extract_meta(pdf_file.name)
+            paper_id = hashlib.sha256(str(pdf_file).encode()).hexdigest()[:12]
+            pages = count_pages(str(pdf_file))
+
+            paper = Paper(
+                paper_id=paper_id,
+                filepath=str(pdf_file),
+                meta=PaperMeta(
+                    filename=pdf_file.name,
+                    title_hint=meta.title_hint,
+                    author_hint=meta.author_hint,
+                    year=meta.year,
+                    arxiv_id=meta.arxiv_id,
+                ),
+                raw_text=raw_text,
+                pages=pages,
+                pool=pool,
+            )
+
+            chunks, chunk_vecs, doc_vec = build_index(paper, model)
+            store.add_paper(paper, chunk_vecs, doc_vec)
+            typer.echo(f"  ✓ {pdf_file.name}  ({len(chunks)} chunks)")
+            success += 1
+
+        except Exception as e:
+            typer.echo(f"  ✗ {pdf_file.name}: {e}")
+
+    store.save_faiss()
+    s = store.state_summary()
+    typer.echo(f"索引完成: {success} 篇成功, 共 {s['papers']} 篇论文")
+    typer.echo(f"  Chunks: {s['chunks']}")
 
 
 @app.command()

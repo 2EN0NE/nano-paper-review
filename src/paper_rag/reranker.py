@@ -80,8 +80,6 @@ class CrossEncoderReranker:
         onnx_dir = model_cache_dir / self._model_name.replace("/", "--")
 
         if (onnx_dir / "model.onnx").exists():
-            from paper_rag.reranker import OnnxReranker  # local to avoid confusion
-
             self._reranker = _OnnxRerankerWrapper(
                 OnnxReranker(model_dir=str(onnx_dir), max_length=RERANK_MAX_SEQ_LEN),
             )

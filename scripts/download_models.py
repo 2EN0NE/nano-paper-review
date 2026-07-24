@@ -63,7 +63,14 @@ def main() -> None:
     # Export embedding model
     logger.info("Exporting embedding model: %s", EMBEDDING_MODEL)
     result = subprocess.run(
-        [sys.executable, str(export_script), "--model", EMBEDDING_MODEL, "--cache-dir", str(cache_dir)],
+        [
+            sys.executable,
+            str(export_script),
+            "--model",
+            EMBEDDING_MODEL,
+            "--cache-dir",
+            str(cache_dir),
+        ],
         capture_output=True,
         text=True,
     )
@@ -75,7 +82,14 @@ def main() -> None:
     # Export reranker model
     logger.info("Exporting reranker model: %s", RERANKER_MODEL)
     result = subprocess.run(
-        [sys.executable, str(export_script), "--model", RERANKER_MODEL, "--cache-dir", str(cache_dir)],
+        [
+            sys.executable,
+            str(export_script),
+            "--model",
+            RERANKER_MODEL,
+            "--cache-dir",
+            str(cache_dir),
+        ],
         capture_output=True,
         text=True,
     )
