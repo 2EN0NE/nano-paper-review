@@ -46,8 +46,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--cache-dir",
-        default=str(Path.home() / ".cache" / "paper-rag" / "models"),
-        help="Directory to store ONNX models (default: ~/.cache/paper-rag/models)",
+        default=str(Path.home() / ".cache" / "paper-review" / "models"),
+        help="Directory to store ONNX models (default: ~/.cache/paper-review/models)",
     )
     args = parser.parse_args()
 

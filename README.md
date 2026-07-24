@@ -153,6 +153,62 @@ POST /search
 
 API 完整文档：[`docs/API.md`](docs/API.md)
 
+## 数据目录（.paper-review/）
+
+本项目将所有持久化数据集中存放在一个目录中，统称为 **data directory**。
+目录结构如下：
+
+```
+.paper-review/                  # 或 ~/.paper-review/
+├── config.yaml                 # CLI 配置文件（自动搜索）
+├── index/
+│   ├── index.sqlite            # SQLite 数据库（FTS5 BM25 + 元数据）
+│   ├── papers.index            # 文档级 FAISS 向量索引
+│   └── chunks.index            # Chunk 级 FAISS 向量索引
+├── pdfs/                       # PDF 源文件
+├── output/
+│   ├── intermediates/          # 管线中间产物
+│   │   ├── {subject}/{step}/output.json
+│   │   ├── pre/{step}/output.json
+│   │   └── post/{step}/output.json
+│   └── reports/{subject}/      # 最终报告
+└── logs/
+    └── paper-rag.log           # 运行时日志
+```
+
+### 解析优先级
+
+```
+1. --data-dir <path>  显式指定（优先级最高）
+2. ./.paper-review/   当前目录存在时自动使用
+3. ~/.paper-review/   兜底（自动创建、无需手动操作）
+```
+
+> **模型缓存**：ONNX 模型（~1.5GB）始终在 `~/.cache/paper-review/models/`，
+> 不随 data_dir 变化。这是 XDG 规范，跨项目共享模型免去重复下载。
+
+### 用法
+
+```bash
+# 1. 全局模式（数据在 ~/.paper-review/）
+paper-review index --pdf-dir ~/my-papers
+paper-review search "transformer"
+
+# 2. 项目模式（创建 ./.paper-review 后自动使用）
+mkdir .paper-review
+paper-review status               # 自动用 ./.paper-review/
+
+# 3. 显式指定
+paper-review --data-dir /custom/data status
+paper-review --data-dir /custom/data search "测试"
+
+# 4. 环境变量
+PAPER_RAG_DATA_DIR=/custom/data paper-review status
+```
+
+所有 `config.yaml` 中的路径字段（`index_dir`、`pdf_dir`）留空即自动从 data_dir 推导。
+配置文件中显式设置的路径优先于自动推导。
+
 ## 配置
 
 编辑 `config.yaml`：

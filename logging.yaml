@@ -6,6 +6,8 @@
 #   PAPER_RAG_LOG_DIR=/var/log  覆盖日志目录
 #
 # 轮转策略: 每日轮转, 保留 14 天
+#
+# 当未指定 --log-dir 时，日志默认写入 {data_dir}/logs/paper-rag.log
 
 version: 1
 disable_existing_loggers: false
@@ -27,7 +29,7 @@ handlers:
     class: logging.handlers.TimedRotatingFileHandler
     level: INFO
     formatter: standard
-    filename: logs/paper-rag.log
+    filename: logs/paper-rag.log # 会被 data_dir 覆盖为 {data_dir}/logs/paper-rag.log
     when: midnight
     interval: 1
     backupCount: 14

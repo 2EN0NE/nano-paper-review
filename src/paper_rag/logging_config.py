@@ -69,10 +69,16 @@ _DEFAULT_LOG_CONFIG: dict = {
 # 可用的日志配置路径
 # ============================================================================
 
-_LOG_CONFIG_CANDIDATES = [
-    "logging.yaml",
-    str(Path.cwd() / "logging.yaml"),
-]
+_LOG_CONFIG_CANDIDATES: list[str] = []  # 由 set_log_config_search_paths 初始化
+
+
+def set_log_config_search_paths(data_dir: Path) -> None:
+    """根据 data_dir 设置日志配置文件搜索路径。"""
+    global _LOG_CONFIG_CANDIDATES
+    _LOG_CONFIG_CANDIDATES = [
+        str(data_dir / "logging.yaml"),
+        str(Path.cwd() / "logging.yaml"),
+    ]
 
 
 def _resolve_log_dir(cfg: dict) -> Path:
@@ -109,6 +115,7 @@ def setup_logging(
     config_path: str | None = None,
     log_level: str | None = None,
     log_dir: str | None = None,
+    data_dir: str | None = None,
 ) -> logging.Logger:
     """初始化日志系统。
 
@@ -116,10 +123,17 @@ def setup_logging(
         config_path: logging.yaml 的显式路径。为 None 时自动搜索默认位置。
         log_level: 覆盖日志级别（DEBUG / INFO / WARNING / ERROR）。
         log_dir: 覆盖日志目录路径。
+        data_dir: 数据目录（未指定 log_dir 时默认日志到 {data_dir}/logs/）。
 
     Returns:
         paper_rag 根 logger。
     """
+    # --- 初始化搜索路径（优先搜索 data_dir） ---
+    from paper_rag.config import resolve_data_dir
+
+    if not _LOG_CONFIG_CANDIDATES:
+        set_log_config_search_paths(resolve_data_dir(data_dir or None))
+
     # --- 加载配置 ---
     if config_path is None:
         for candidate in _LOG_CONFIG_CANDIDATES:

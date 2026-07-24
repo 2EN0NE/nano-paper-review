@@ -18,12 +18,17 @@ class Config(BaseModel):
 
     所有字段均有默认值，可通过 config.yaml 或环境变量覆盖。
     环境变量使用 PAPER_RAG_ 前缀 + 大写字段名，例如 PAPER_RAG_CHUNK_SIZE=256。
+
+    data_dir 决定所有数据存放位置（优先级：--data-dir > ./.paper-review/ > ~/.paper-review/）。
+    index_dir / pdf_dir 为空字符串时自动从 data_dir 推导。
+    model_cache_dir 固定受 data_dir 影响（XDG 规范，跨项目共享）。
     """
 
     # --- 目录配置 ---
-    index_dir: str = str(Path(__file__).parent.parent.parent / "data" / "index")
-    pdf_dir: str = str(Path(__file__).parent.parent.parent / "data" / "history")
-    model_cache_dir: str = str(Path.home() / ".cache" / "paper-rag" / "models")
+    data_dir: str = ""  # 空字符串 = 自动解析（见 resolve_data_dir()）
+    index_dir: str = ""  # 空 = 自动推导为 {data_dir}/index
+    pdf_dir: str = ""  # 空 = 自动推导为 {data_dir}/pdfs
+    model_cache_dir: str = str(Path.home() / ".cache" / "paper-review" / "models")
 
     # --- 分块参数 ---
     chunk_size: int = 512
@@ -60,6 +65,24 @@ class Config(BaseModel):
             f"head={self.head_weight}_body={self.body_weight}_tail={self.tail_weight}"
         )
 
+    def resolve(self, data_dir_override: str | None = None) -> Config:
+        """根据 data_dir 解析所有目录路径，返回新实例。
+
+        Args:
+            data_dir_override: 强制指定 data_dir（来自 CLI --data-dir）
+
+        Returns:
+            解析路径后的新 Config 实例（不修改原对象）。
+        """
+        dd = resolve_data_dir(data_dir_override or self.data_dir or None)
+
+        resolved = self.model_copy()
+        if not resolved.index_dir:
+            resolved.index_dir = str(dd / "index")
+        if not resolved.pdf_dir:
+            resolved.pdf_dir = str(dd / "pdfs")
+        return resolved
+
     def weight_config_str(self) -> str:
         """权重配置的紧凑字符串表示"""
         return (
@@ -69,27 +92,73 @@ class Config(BaseModel):
 
 
 # ============================================================================
+# data_dir 解析
+# ============================================================================
+
+
+def resolve_data_dir(explicit_path: str | None = None) -> Path:
+    """解析数据目录路径。
+
+    优先级（高→低）：
+    1. explicit_path（来自 CLI --data-dir）
+    2. ``./.paper-review/``（存在于当前目录时）
+    3. ``~/.paper-review/``（自动创建）
+
+    Returns:
+        解析后的绝对 Path。
+    """
+    if explicit_path:
+        return Path(explicit_path).resolve()
+
+    cwd_dot = Path.cwd() / ".paper-review"
+    if cwd_dot.exists():
+        return cwd_dot
+
+    fallback = Path.home() / ".paper-review"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+# ============================================================================
 # 配置加载函数
 # ============================================================================
 
-_CONFIG_PATH_CANDIDATES = [
-    "config.yaml",
-    str(Path.cwd() / "config.yaml"),
-]
+_CONFIG_PATH_CANDIDATES: list[str] = []  # 由 set_config_search_paths 初始化
 
 
-def load_config(path: str | None = None) -> Config:
+def set_config_search_paths(data_dir: Path) -> None:
+    """根据 data_dir 设置配置文件搜索路径。
+
+    搜索顺序：{data_dir}/config.yaml > cwd/config.yaml > 无配置
+    """
+    global _CONFIG_PATH_CANDIDATES
+    _CONFIG_PATH_CANDIDATES = [
+        str(data_dir / "config.yaml"),
+        str(Path.cwd() / "config.yaml"),
+    ]
+
+
+def load_config(
+    path: str | None = None,
+    data_dir: str | None = None,
+) -> Config:
     """加载配置
 
     优先级（低→高）：
     1. Config 默认值
     2. YAML 文件（如果存在）
     3. 环境变量 PAPER_RAG_XXX
+    4. data_dir 参数（CLI --data-dir）
 
     Args:
         path: YAML 配置文件的显式路径；为 None 时自动搜索默认位置。
+        data_dir: 强制指定 data_dir（取代自动解析）。
     """
     config = Config()
+
+    # --- 解析 data_dir（在 YAML 前，使 config.yaml 搜索路径生效） ---
+    dd = resolve_data_dir(data_dir or None)
+    set_config_search_paths(dd)
 
     # --- YAML 文件加载 ---
     if path is None:
@@ -128,5 +197,8 @@ def load_config(path: str | None = None) -> Config:
 
     if env_overrides:
         config = config.model_copy(update=env_overrides)
+
+    # --- 最后一步：解析路径（YAML/env 中未显式设置的路径从 data_dir 推导） ---
+    config = config.resolve(data_dir_override=data_dir)
 
     return config

@@ -267,7 +267,7 @@ CREATE TABLE embed_fingerprint (
 
 ```bash
 # 建索引
-python -m paper_rag.cli index --pdf-dir ./data/history
+python -m paper_rag.cli index --pdf-dir ./pdfs
 
 # 搜索
 python -m paper_rag.cli search "深度学习信用评估"

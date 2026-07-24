@@ -619,6 +619,7 @@ def run_pipeline(
     input_path: Path,
     pipeline_dir: Path | None = None,
     output_dir: Path | None = None,
+    data_dir: str | None = None,
     target_phase: str | None = None,
     target_step: str | None = None,
 ) -> PipelineResult:
@@ -629,6 +630,7 @@ def run_pipeline(
         input_path: 输入 PDF 路径（单篇）或目录（多篇）。
         pipeline_dir: pipeline 定义目录的根。为 None 时从 pipeline_yaml 推断。
         output_dir: 覆盖配置中的 output_dir。
+        data_dir: 数据目录（用于默认 output_dir 解析）。
         target_phase: 仅运行指定阶段（'pre' / 'review' / 'post'）。
         target_step: 仅运行指定步骤名（需已有中间产物）。
 
@@ -664,6 +666,12 @@ def run_pipeline(
     config = PipelineConfig.from_dict(raw)
     if output_dir:
         config.output_dir = output_dir
+    elif data_dir:
+        # 从 data_dir 推导默认 output_dir
+        from paper_rag.config import resolve_data_dir
+
+        dd = resolve_data_dir(data_dir)
+        config.output_dir = dd / "output"
     if pipeline_dir is None:
         pipeline_dir = Path.cwd()
 

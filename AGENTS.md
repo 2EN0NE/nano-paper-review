@@ -18,6 +18,67 @@
 
 离线技术论文评审工具。核心是**评审流水线**（批量格式归一化 → 逐篇 Agent 评审 → 批量化持久化），依赖本地混合检索引擎（BM25 + FAISS + Cross-Encoder 精排）驱动相似文章匹配。
 
+## 数据目录（.paper-review/）
+
+所有持久化数据集中在 data directory 中，解析优先级：
+
+```
+1. --data-dir <path>  显式指定（优先级最高）
+2. ./.paper-review/   当前目录存在时自动使用
+3. ~/.paper-review/   兜底（自动创建）
+```
+
+### 目录结构
+
+```
+.paper-review/                  # 或 ~/.paper-review/
+├── config.yaml                 # CLI 配置文件（自动搜索）
+├── index/
+│   ├── index.sqlite            # SQLite 数据库（FTS5 BM25 + 元数据）
+│   ├── papers.index            # 文档级 FAISS 向量索引
+│   └── chunks.index            # Chunk 级 FAISS 向量索引
+├── pdfs/                       # PDF 源文件
+├── output/                     # 管线输出
+│   ├── intermediates/          #  中间产物
+│   │   ├── {subject}/{step}/output.json
+│   │   ├── pre/{step}/output.json
+│   │   └── post/{step}/output.json
+│   └── reports/{subject}/      #  最终报告
+└── logs/
+    └── paper-rag.log           # 运行时日志
+```
+
+### 关键路径对照
+
+| 内容 | 位置 |
+|---|---|
+| SQLite + FAISS 索引 | `{data_dir}/index/` |
+| PDF 源文件 | `{data_dir}/pdfs/` |
+| 管线中间产物 | `{data_dir}/output/intermediates/` |
+| 最终报告 | `{data_dir}/output/reports/` |
+| 运行时日志 | `{data_dir}/logs/` |
+| ONNX 模型缓存 | `~/.cache/paper-review/models/`（不受 data_dir 影响） |
+| CLI 命令行 | `--data-dir` 或 `PAPER_RAG_DATA_DIR` 环境变量 |
+
+> 模型缓存独立于 data_dir 的原因：每个 ONNX 模型约 400MB-1GB，跨项目共享免重复下载。
+
+### config.yaml
+
+配置文件搜索顺序：`{data_dir}/config.yaml` > `cwd/config.yaml`。
+所有路径字段 (`index_dir`, `pdf_dir`) 留空即自动从 `{data_dir}` 推导。
+显式设置的值优先于自动推导。
+
+```bash
+# 手动创建项目级数据目录
+mkdir .paper-review
+
+# 显式指定
+paper-review --data-dir /custom/data status
+
+# 环境变量
+PAPER_RAG_DATA_DIR=/custom/data paper-review index --pdf-dir ~/papers
+```
+
 ## 架构速览
 
 ```

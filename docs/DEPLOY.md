@@ -40,7 +40,7 @@ pip install --no-index \
 # 编辑 config.yaml，设置 model_cache_dir = ./models
 
 # 4. 建索引
-python -m paper_rag.cli index --pdf-dir ./data/history
+python -m paper_rag.cli index --pdf-dir ./pdfs
 
 # 5. 启动服务
 python -m paper_rag.cli serve --port 8765
@@ -49,7 +49,7 @@ python -m paper_rag.cli serve --port 8765
 ## 配置 config.yaml
 
 ```yaml
-index_dir: ./data/index
+# index_dir:（留空自动推导为 {data_dir}/index）
 pdf_dir: ./data/raw_pdfs
 model_cache_dir: ./models
 

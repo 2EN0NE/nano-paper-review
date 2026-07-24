@@ -104,4 +104,5 @@ _Avoid_: Pipeline runner, executor, engine
 统一入口命令：`paper-rag review <path>`。path 可以是单篇 PDF 或 PDF 目录。Orchestrator 自动检测并选择单篇/目录模式。
 
 **Output Root**:
-`pipeline.yaml` 中的 `output_dir` 字段，指定评审产出的根目录。所有 intermediates、reports、日志均在此目录下按 Subject 名称组织。
+评审产出的根目录。由 `data_dir` 推导为 `{data_dir}/output/`，也可通过 `pipeline.yaml` 的 `output_dir` 字段覆盖（优先级更高）。
+所有 intermediates、reports、日志均在此目录下按 Subject 名称组织。

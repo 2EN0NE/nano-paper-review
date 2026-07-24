@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Optional
 
 import typer
 
+from paper_rag.config import resolve_data_dir
 from paper_rag.logging_config import setup_logging
 from paper_rag.orchestrator import run_pipeline
 from paper_rag.server import create_app
@@ -28,18 +30,40 @@ app = typer.Typer(help="paper-review: 离线论文评审工具")
 
 
 @app.callback(invoke_without_command=True)
-def _show_help_on_no_command(ctx: typer.Context):
-    """无子命令时显示帮助信息，而非报错退出。"""
+def _main_callback(
+    ctx: typer.Context,
+    data_dir: Optional[str] = typer.Option(  # noqa: UP007 — Python 3.9 compat
+        None,
+        "--data-dir",
+        help="数据目录（默认: ./.paper-review/ 存在则用，否则 ~/.paper-review/）",
+        envvar="PAPER_RAG_DATA_DIR",
+    ),
+):
+    """全局选项。"""
+    ctx.obj = ctx.obj or {}
+    if data_dir:
+        ctx.obj["data_dir"] = data_dir
+
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
         raise typer.Exit()
 
 
-def _open_store() -> Store:
-    """打开默认索引（支持环境变量覆盖目录），含 FAISS 初始化。"""
-    index_dir = Path(__file__).parent.parent.parent / "data" / "index"
+def _resolve_db_path(data_dir_str: Optional[str] = None) -> str:
+    """根据 data_dir 解析 SQLite 数据库路径。"""
+    dd = resolve_data_dir(data_dir_str or None)
+    index_dir = dd / "index"
     index_dir.mkdir(parents=True, exist_ok=True)
-    db_path = str(index_dir / "index.sqlite")
+    return str(index_dir / "index.sqlite")
+
+
+def _open_store(data_dir: Optional[str] = None) -> Store:
+    """打开索引（数据目录含 FAISS 初始化）。
+
+    Args:
+        data_dir: 数据目录路径（None = 自动解析）。
+    """
+    db_path = _resolve_db_path(data_dir)
     store = Store(db_path)
     store.load_all()
     if not store.load_faiss():
@@ -47,8 +71,16 @@ def _open_store() -> Store:
     return store
 
 
+def _get_data_dir(ctx: typer.Context) -> Optional[str]:
+    """从 Typer context 中提取 data_dir。"""
+    if ctx.obj:
+        return ctx.obj.get("data_dir")
+    return None
+
+
 @app.command()
 def index(
+    ctx: typer.Context,
     pdf_dir: Path = typer.Option(
         ...,
         "--pdf-dir",
@@ -76,7 +108,7 @@ def index(
     if model._embedder is None:
         typer.echo("  ⚠ 未找到 ONNX 模型，使用确定性哈希向量（仅用于测试）")
 
-    store = _open_store()
+    store = _open_store(data_dir=_get_data_dir(ctx))
     pdf_files = sorted(pdf_dir.glob("*.pdf"))
     if not pdf_files:
         typer.echo("  ✗ 未找到 PDF 文件")
@@ -125,8 +157,9 @@ def index(
 
 @app.command()
 def search(
+    ctx: typer.Context,
     query: str = typer.Argument(..., help="检索查询"),
-    pool_filter: str | None = typer.Option(
+    pool_filter: Optional[str] = typer.Option(
         None, "--pool", "-p", help="限定搜索池: history / pending"
     ),
     limit: int = typer.Option(5, "--limit", "-n", help="返回条数"),
@@ -138,7 +171,7 @@ def search(
     ),
 ):
     """执行混合检索（BM25 + 向量 + RRF + 精排）"""
-    store = _open_store()
+    store = _open_store(data_dir=_get_data_dir(ctx))
     results = store.search(query, pool_filter=pool_filter, with_rerank=not no_rerank)
 
     if not results:
@@ -161,9 +194,9 @@ def search(
 
 
 @app.command()
-def status():
+def status(ctx: typer.Context):
     """查看索引状态"""
-    store = _open_store()
+    store = _open_store(data_dir=_get_data_dir(ctx))
     s = store.state_summary()
     typer.echo("\n论文检索索引状态")
     typer.echo("─" * 40)
@@ -175,26 +208,27 @@ def status():
 
 
 @app.command()
-def rebuild_vectors():
+def rebuild_vectors(ctx: typer.Context):
     """
     使用当前配置的加权策略重新计算所有文档向量。
 
     当分块权重配置变更后执行，确保文档级向量反映最新的加权策略。
     """
     typer.echo("重新计算文档向量...")
-    store = _open_store()
+    store = _open_store(data_dir=_get_data_dir(ctx))
     store.rebuild_doc_vectors()
     typer.echo("文档向量重建完成")
 
 
 @app.command()
 def serve(
+    ctx: typer.Context,
     port: int = typer.Option(8765, "--port", "-p", help="监听端口"),
     host: str = typer.Option("localhost", "--host", help="绑定地址"),
 ):
     """启动 HTTP API 服务（Flask）"""
     typer.echo(f"启动 HTTP 服务: http://{host}:{port}")
-    store = _open_store()
+    store = _open_store(data_dir=_get_data_dir(ctx))
     app = create_app(store)
     typer.echo(f"索引状态: {store.state_summary()}")
     app.run(host=host, port=port, debug=False)
@@ -202,27 +236,28 @@ def serve(
 
 @app.command()
 def review(
+    ctx: typer.Context,
     path: Path = typer.Argument(
         ...,
         help="输入路径：单篇 PDF 或包含 PDF 的目录",
         exists=True,
     ),
-    log_level: str | None = typer.Option(
+    log_level: Optional[str] = typer.Option(
         None,
         "--log-level",
         help="日志级别: DEBUG / INFO / WARNING / ERROR",
     ),
-    log_dir: Path | None = typer.Option(
+    log_dir: Optional[Path] = typer.Option(
         None,
         "--log-dir",
         help="日志输出目录",
     ),
-    phase: str | None = typer.Option(
+    phase: Optional[str] = typer.Option(
         None,
         "--phase",
         help="仅运行指定阶段: pre / review / post",
     ),
-    step: str | None = typer.Option(
+    step: Optional[str] = typer.Option(
         None,
         "--step",
         "-s",
@@ -235,15 +270,26 @@ def review(
     在输入目录或单篇 PDF 上运行评审阶段。
     如果输入目录下存在 review-pipeline/ 子目录，自动识别为步骤目录。
     """
-    setup_logging(log_level=log_level, log_dir=str(log_dir) if log_dir else None)
+    data_dir_str = _get_data_dir(ctx)
+    dd = resolve_data_dir(data_dir_str)
+
+    setup_logging(
+        log_level=log_level,
+        log_dir=str(log_dir) if log_dir else str(dd / "logs"),
+        data_dir=str(dd),
+    )
 
     pipe_path = path if path.is_dir() else path.parent
     pipeline_yaml_path = pipe_path / "pipeline.yaml"
+
+    default_output = dd / "output"
 
     if pipeline_yaml_path.exists():
         result = run_pipeline(
             pipeline_yaml_path,
             path,
+            output_dir=default_output,
+            data_dir=str(dd),
             target_phase=phase,
             target_step=step,
         )
@@ -253,10 +299,12 @@ def review(
             result = run_pipeline(
                 {
                     "name": "auto",
-                    "output_dir": str(pipe_path / "output"),
+                    "output_dir": str(default_output),
                     "review": {"directory": str(review_dir)},
                 },
                 path,
+                output_dir=default_output,
+                data_dir=str(dd),
                 target_phase=phase,
                 target_step=step,
             )

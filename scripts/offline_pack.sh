@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ---- defaults ----
-CACHE_DIR="${CACHE_DIR:-$HOME/.cache/paper-rag/models}"
+CACHE_DIR="${CACHE_DIR:-$HOME/.cache/paper-review/models}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/dist/offline}"
 VERBOSE="${VERBOSE:-false}"
 

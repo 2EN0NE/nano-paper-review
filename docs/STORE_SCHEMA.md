@@ -1,6 +1,6 @@
 # SQLite Schema
 
-论文检索服务使用单一 SQLite 文件作为持久化存储。文件路径: `data/index/index.sqlite`
+论文检索服务使用单一 SQLite 文件作为持久化存储。文件路径: `{data_dir}/index/index.sqlite`（见 README.md 数据目录章节）
 
 ## 表完整定义
 
