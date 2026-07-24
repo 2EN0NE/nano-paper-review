@@ -540,7 +540,7 @@ class Store:
         if self.embed_fingerprint and self.embed_fingerprint != current_fp:
             logger.warning(
                 "Embedding fingerprint mismatch: stored=%r current=%r. "
-                "Run `paper-rag rebuild-vectors` to recompute doc vectors.",
+                "Run `paper-review rebuild-vectors` to recompute doc vectors.",
                 self.embed_fingerprint,
                 current_fp,
             )

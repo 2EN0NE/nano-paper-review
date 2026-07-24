@@ -29,17 +29,41 @@ VERBOSE="${VERBOSE:-false}"
 
 # ---- arg parsing ----
 while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --cache-dir)   CACHE_DIR="$2";   shift 2 ;;
-        --output-dir)  OUTPUT_DIR="$2";  shift 2 ;;
-        --verbose|-v)  VERBOSE=true;     shift   ;;
-        --help|-h)     sed -n '2,15p' "$0"; exit 0 ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
+	case "$1" in
+	--cache-dir)
+		CACHE_DIR="$2"
+		shift 2
+		;;
+	--output-dir)
+		OUTPUT_DIR="$2"
+		shift 2
+		;;
+	--verbose | -v)
+		VERBOSE=true
+		shift
+		;;
+	--help | -h)
+		sed -n '2,15p' "$0"
+		exit 0
+		;;
+	*)
+		echo "Unknown option: $1"
+		exit 1
+		;;
+	esac
 done
 
 QUIET_FLAG=""
 $VERBOSE || QUIET_FLAG="-q"
+
+# ---- detect uv - fallback to plain pip ----
+if command -v uv >/dev/null 2>&1; then
+	PIP_CMD="uv pip"
+	echo "  [detect] uv found → using uv pip"
+else
+	PIP_CMD="pip"
+	echo "  [detect] uv not found → using plain pip"
+fi
 
 mkdir -p "$OUTPUT_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -51,22 +75,22 @@ echo "  Output:     $OUTPUT_DIR"
 echo "  Cache:      $CACHE_DIR"
 echo ""
 
-# ---- Step 1: pip download wheels ----
-echo "[1/4] Downloading pip wheels..."
-pip download \
-    --platform manylinux2014_x86_64 \
-    --only-binary=:all: \
-    --dest "$OUTPUT_DIR/offline_packages" \
-    $QUIET_FLAG \
-    -e "$PROJECT_DIR" \
-    --no-deps 2>/dev/null || true
+# ---- Step 1: download wheels ----
+echo "[1/4] Downloading wheels..."
+$PIP_CMD download \
+	--platform manylinux2014_x86_64 \
+	--only-binary=:all: \
+	--dest "$OUTPUT_DIR/offline_packages" \
+	$QUIET_FLAG \
+	-e "$PROJECT_DIR" \
+	--no-deps 2>/dev/null || true
 
-pip download \
-    --platform manylinux2014_x86_64 \
-    --only-binary=:all: \
-    --dest "$OUTPUT_DIR/offline_packages" \
-    $QUIET_FLAG \
-    -r /dev/stdin <<< "$(python -c "
+$PIP_CMD download \
+	--platform manylinux2014_x86_64 \
+	--only-binary=:all: \
+	--dest "$OUTPUT_DIR/offline_packages" \
+	$QUIET_FLAG \
+	-r /dev/stdin <<<"$(python -c "
 import tomllib
 with open('$PROJECT_DIR/pyproject.toml','rb') as f:
     deps = tomllib.load(f)['project']['dependencies']
@@ -76,12 +100,12 @@ for d in deps: print(d)
 # If some packages fail binary-only, retry with source builds allowed
 echo "  -> Checking for missing packages..."
 python "$SCRIPT_DIR/_check_missing.py" "$OUTPUT_DIR/offline_packages" "$PROJECT_DIR/pyproject.toml" || {
-    echo "  -> Retrying missing packages with source..."
-    pip download \
-        --platform manylinux2014_x86_64 \
-        --dest "$OUTPUT_DIR/offline_packages" \
-        $QUIET_FLAG \
-        -r /dev/stdin <<< "$(python "$SCRIPT_DIR/_check_missing.py" --list-missing "$OUTPUT_DIR/offline_packages" "$PROJECT_DIR/pyproject.toml")"
+	echo "  -> Retrying missing packages with source..."
+	$PIP_CMD download \
+		--platform manylinux2014_x86_64 \
+		--dest "$OUTPUT_DIR/offline_packages" \
+		$QUIET_FLAG \
+		-r /dev/stdin <<<"$(python "$SCRIPT_DIR/_check_missing.py" --list-missing "$OUTPUT_DIR/offline_packages" "$PROJECT_DIR/pyproject.toml")"
 }
 
 echo "  Done. $(ls "$OUTPUT_DIR/offline_packages/"*.whl 2>/dev/null | wc -l) wheel files"
@@ -109,9 +133,9 @@ echo ""
 echo "[4/4] Creating tarball..."
 cd "$OUTPUT_DIR"
 tar czf "../$TARBALL_NAME" \
-    --exclude="__pycache__" \
-    --exclude="*.pyc" \
-    .
+	--exclude="__pycache__" \
+	--exclude="*.pyc" \
+	.
 cd "$PROJECT_DIR"
 echo "  Created: dist/$TARBALL_NAME"
 echo ""
@@ -124,6 +148,8 @@ echo ""
 echo "Deploy on target machine:"
 echo "  tar xzf $TARBALL_NAME"
 echo "  cd ${TARBALL_NAME%.tar.gz}"
-echo "  pip install --no-index --find-links=./offline_packages -e ."
+echo "  # uv recommended (faster); falls back to pip if uv not found"
+echo "  uv pip install --no-index --find-links=./offline_packages -e ."
+echo "  # or: pip install --no-index --find-links=./offline_packages -e ."
 echo "  # Then set config.yaml model_cache_dir to ./models"
 echo ""

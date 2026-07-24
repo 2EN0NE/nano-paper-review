@@ -8,7 +8,10 @@
 
 ```bash
 # 安装（零 PyTorch / CUDA，仅 ~30MB 推理依赖）
-pip install -e .
+# 推荐：有 uv 用 uv（更快），没有则降级为 pip
+uv pip install -e .
+# 或：pip install -e .
+# 或：make install（自动检测 uv）
 
 # 0. 导出模型为 ONNX 格式（开发机执行一次，需要 PyTorch）
 python scripts/export_onnx.py
@@ -205,7 +208,10 @@ bash scripts/offline_pack.sh --cache-dir ./models_cache --output-dir ./dist/offl
 ```bash
 tar xzf paper-rag-offline-<timestamp>.tar.gz
 cd paper-rag-offline-<timestamp>
-pip install --no-index --find-links=./offline_packages -e .
+
+# 安装依赖（有 uv 用 uv，没有则降级为 pip）
+uv pip install --no-index --find-links=./offline_packages -e .
+# 或：pip install --no-index --find-links=./offline_packages -e .
 
 # 编辑 config.yaml 指向本地模型路径
 # model_cache_dir: ./models

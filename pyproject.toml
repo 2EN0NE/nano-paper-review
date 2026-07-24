@@ -19,6 +19,9 @@ dependencies = [
   "pyyaml>=6.0",
 ]
 
+[project.scripts]
+paper-review = "paper_rag.cli:app"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -40,6 +43,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["S108"]               # allow temp paths in tests
+"tests/e2e/*.py" = ["S603", "S607"]   # subprocess calls for CLI smoke test
 "src/paper_rag/config.py" = ["UP045"] # pre-existing: Optional[X] style
 # (models.py and reranker.py no longer use lazy type imports)
 "src/paper_rag/orchestrator.py" = [
@@ -47,6 +51,9 @@ ignore = [
 ] # pre-existing: intended subprocess use
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# E2E tests require the installed package (not PYTHONPATH=src).
+# Run via: make test-e2e  or  python -m pytest tests/e2e/ -v
 markers = [
   "integration: tests that span multiple components (HTTP, filesystem, FAISS persistence)",
+  "e2e: end-to-end tests that run against the installed package (CLI entry point, smoke)",
 ]

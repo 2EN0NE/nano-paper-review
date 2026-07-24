@@ -1,7 +1,7 @@
-.PHONY: test clean install fmt fmt-check test-unit test-integration setup-hooks
+.PHONY: test clean install fmt fmt-check test-unit test-integration test-e2e smoke setup-hooks
 
 install:
-	pip install -e .
+	if command -v uv >/dev/null 2>&1; then uv pip install -e .; else pip install -e .; fi
 
 # ─── 质量门禁 ──────────────────────────────────────────
 
@@ -24,6 +24,11 @@ test:                                          # 全部测试
 
 test-one:                                      # 单个测试文件: make test-one t=test_store
 	PYTHONPATH=src python3 -m pytest tests/$(t) -v
+
+test-e2e:                                      # E2E smoke 测试（需要先 make install）
+	python3 -m pytest tests/e2e/ -v -m e2e
+
+smoke: test-e2e                                # 别名
 
 # ─── Git Hooks ────────────────────────────────────────
 

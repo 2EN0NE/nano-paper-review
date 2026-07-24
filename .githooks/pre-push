@@ -17,4 +17,7 @@ PYTHONPATH=src python3 -m pytest tests/ -q -m "not integration"
 echo "=== [pre-push] 集成测试（全量）==="
 PYTHONPATH=src python3 -m pytest tests/ -q -m "integration"
 
+echo "=== [pre-push] E2E smoke（入口点验证）==="
+python3 -m pytest tests/e2e/ -q -m e2e
+
 echo "=== [pre-push] ✅ 全部通过 ==="

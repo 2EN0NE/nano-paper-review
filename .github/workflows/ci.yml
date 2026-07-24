@@ -69,3 +69,28 @@ jobs:
 
       - name: Run integration tests
         run: PYTHONPATH=src python -m pytest tests/ -q -m "integration"
+
+  e2e-smoke:
+    name: "E2E Smoke (CLI)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install with uv
+        run: |
+          pip install uv
+          uv pip install -e .
+
+      - name: Verify CLI entry point
+        run: paper-review --help
+
+      - name: Verify python -m module
+        run: python -m paper_rag --help
+
+      - name: Run e2e smoke tests
+        run: python -m pytest tests/e2e/ -v -m e2e

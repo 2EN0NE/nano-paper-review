@@ -11,7 +11,6 @@ CLI 入口 —— 论文检索服务的命令行接口
 from __future__ import annotations
 
 import hashlib
-import sys
 from pathlib import Path
 
 import typer
@@ -25,7 +24,15 @@ from paper_rag.store import (
     Store,
 )
 
-app = typer.Typer(help="paper-rag: 本地论文混合检索系统")
+app = typer.Typer(help="paper-review: 离线论文评审工具")
+
+
+@app.callback(invoke_without_command=True)
+def _show_help_on_no_command(ctx: typer.Context):
+    """无子命令时显示帮助信息，而非报错退出。"""
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit()
 
 
 def _open_store() -> Store:
@@ -266,10 +273,6 @@ def review(
 
 
 def main():
-    if len(sys.argv) == 1:
-        typer.echo(app.get_help())
-        typer.echo("\n可用命令: index, search, status, serve")
-        return
     app()
 
 
