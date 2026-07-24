@@ -21,13 +21,11 @@ import os
 import re
 import sqlite3
 import struct
+from dataclasses import dataclass, field
 
 import numpy as np
-from dataclasses import dataclass, field
-from typing import Optional
 
 from paper_rag.config import Config, load_config
-
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +175,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         # FAISS 索引路径（持久化模式下用）
-        self.index_dir: Optional[str] = None
+        self.index_dir: str | None = None
         if db_path != ":memory:":
             from pathlib import Path
 
@@ -387,15 +385,11 @@ class Store:
             self._faiss_papers = faiss.read_index(papers_path)
             self._faiss_dim = self._faiss_papers.d
             if os.path.exists(papers_map_path):
-                with open(papers_map_path, "r", encoding="utf-8") as f:
+                with open(papers_map_path, encoding="utf-8") as f:
                     raw = json.load(f)
                 self._faiss_paper_id_map = {int(k): v for k, v in raw.items()}
-                self._faiss_paper_rev_map = {
-                    v: k for k, v in self._faiss_paper_id_map.items()
-                }
-                self._next_faiss_paper_id = (
-                    max(self._faiss_paper_id_map.keys(), default=0) + 1
-                )
+                self._faiss_paper_rev_map = {v: k for k, v in self._faiss_paper_id_map.items()}
+                self._next_faiss_paper_id = max(self._faiss_paper_id_map.keys(), default=0) + 1
             self.log(f"FAISS load: papers.index ({self._faiss_papers.ntotal} vecs)")
             loaded_any = True
 
@@ -405,15 +399,11 @@ class Store:
         if os.path.exists(chunks_path):
             self._faiss_chunks = faiss.read_index(chunks_path)
             if os.path.exists(chunks_map_path):
-                with open(chunks_map_path, "r", encoding="utf-8") as f:
+                with open(chunks_map_path, encoding="utf-8") as f:
                     raw = json.load(f)
                 self._faiss_chunk_id_map = {int(k): v for k, v in raw.items()}
-                self._faiss_chunk_rev_map = {
-                    v: k for k, v in self._faiss_chunk_id_map.items()
-                }
-                self._next_faiss_chunk_id = (
-                    max(self._faiss_chunk_id_map.keys(), default=0) + 1
-                )
+                self._faiss_chunk_rev_map = {v: k for k, v in self._faiss_chunk_id_map.items()}
+                self._next_faiss_chunk_id = max(self._faiss_chunk_id_map.keys(), default=0) + 1
             self.log(f"FAISS load: chunks.index ({self._faiss_chunks.ntotal} vecs)")
             loaded_any = True
 
@@ -421,9 +411,7 @@ class Store:
 
     # --- FAISS 内部辅助 ---
 
-    def _add_to_faiss(
-        self, paper: Paper, chunk_vecs: list[ChunkVector], doc_vec: DocVector
-    ):
+    def _add_to_faiss(self, paper: Paper, chunk_vecs: list[ChunkVector], doc_vec: DocVector):
         """将论文的向量添加到 FAISS 索引。"""
         if self._faiss_papers is None:
             return
@@ -431,18 +419,14 @@ class Store:
         # 论文级向量
         paper_vec = np.array([doc_vec.vector], dtype=np.float32)
         paper_faiss_id = self._next_faiss_paper_id
-        self._faiss_papers.add_with_ids(
-            paper_vec, np.array([paper_faiss_id], dtype=np.int64)
-        )
+        self._faiss_papers.add_with_ids(paper_vec, np.array([paper_faiss_id], dtype=np.int64))
         self._faiss_paper_id_map[paper_faiss_id] = paper.paper_id
         self._faiss_paper_rev_map[paper.paper_id] = paper_faiss_id
         self._next_faiss_paper_id += 1
 
         # Chunk 级向量
         if self._faiss_chunks is not None and chunk_vecs:
-            chunk_vec_array = np.array(
-                [cv.vector for cv in chunk_vecs], dtype=np.float32
-            )
+            chunk_vec_array = np.array([cv.vector for cv in chunk_vecs], dtype=np.float32)
             chunk_ids = []
             for cv in chunk_vecs:
                 cid = self._next_faiss_chunk_id
@@ -469,9 +453,7 @@ class Store:
                 continue
             paper_vec = np.array([dv.vector], dtype=np.float32)
             faiss_id = self._next_faiss_paper_id
-            self._faiss_papers.add_with_ids(
-                paper_vec, np.array([faiss_id], dtype=np.int64)
-            )
+            self._faiss_papers.add_with_ids(paper_vec, np.array([faiss_id], dtype=np.int64))
             self._faiss_paper_id_map[faiss_id] = paper_id
             self._faiss_paper_rev_map[paper_id] = faiss_id
             self._next_faiss_paper_id += 1
@@ -481,9 +463,7 @@ class Store:
             for chunk_id, cv in self.chunk_vectors.items():
                 chunk_vec = np.array([cv.vector], dtype=np.float32)
                 faiss_id = self._next_faiss_chunk_id
-                self._faiss_chunks.add_with_ids(
-                    chunk_vec, np.array([faiss_id], dtype=np.int64)
-                )
+                self._faiss_chunks.add_with_ids(chunk_vec, np.array([faiss_id], dtype=np.int64))
                 self._faiss_chunk_id_map[faiss_id] = chunk_id
                 self._faiss_chunk_rev_map[chunk_id] = faiss_id
                 self._next_faiss_chunk_id += 1
@@ -552,9 +532,7 @@ class Store:
         for row in db.execute("SELECT * FROM content_dedup"):
             self.content_hashes[row["sha256"]] = row["paper_id"]
 
-        row = db.execute(
-            "SELECT value FROM embed_fingerprint WHERE key='embed_model'"
-        ).fetchone()
+        row = db.execute("SELECT value FROM embed_fingerprint WHERE key='embed_model'").fetchone()
         if row:
             self.embed_fingerprint = row["value"]
 
@@ -567,10 +545,7 @@ class Store:
                 self.embed_fingerprint,
                 current_fp,
             )
-            self.log(
-                f"FINGERPRINT MISMATCH: stored={self.embed_fingerprint} "
-                f"current={current_fp}"
-            )
+            self.log(f"FINGERPRINT MISMATCH: stored={self.embed_fingerprint} current={current_fp}")
 
     # --- 索引操作 ---
 
@@ -606,9 +581,7 @@ class Store:
         if not force_reindex and content_hash in self.content_hashes:
             existing_pid = self.content_hashes[content_hash]
             if existing_pid in self.papers:
-                self.log(
-                    f"  DEDUP: content matches {existing_pid}, storing metadata only"
-                )
+                self.log(f"  DEDUP: content matches {existing_pid}, storing metadata only")
                 # 存储元数据和 chunks（FTS 可检索）,
                 # 但跳过向量编码和 FAISS 索引
                 db.execute(
@@ -841,9 +814,7 @@ class Store:
             if r is not None and r["score"] is not None
         ]
 
-    def bm25_aggregate_to_papers(
-        self, chunk_results: list[tuple[str, float]]
-    ) -> dict[str, float]:
+    def bm25_aggregate_to_papers(self, chunk_results: list[tuple[str, float]]) -> dict[str, float]:
         """Chunk 级 BM25 → max 聚合 → 论文分"""
         paper_scores: dict[str, float] = {}
         for chunk_id, score in chunk_results:
@@ -895,17 +866,13 @@ class Store:
         vec_results = self._vector_search(query_vec)
 
         # 3. RRF 融合
-        bm25_ranked = sorted(
-            bm25_paper_scores.items(), key=lambda x: x[1], reverse=True
-        )[:RECALL_K]
+        bm25_ranked = sorted(bm25_paper_scores.items(), key=lambda x: x[1], reverse=True)[:RECALL_K]
         fused = rrf_fuse(bm25_ranked, vec_results)
         candidate_ids = [pid for pid, _ in fused[:RECALL_K]]
 
         # 4. (可选) Cross-Encoder 精排
         if with_rerank and reranker is not None and reranker.is_loaded:
-            candidate_papers = [
-                self.papers[pid] for pid in candidate_ids if pid in self.papers
-            ]
+            candidate_papers = [self.papers[pid] for pid in candidate_ids if pid in self.papers]
             reranked_papers = reranker.rerank(
                 query,
                 candidate_papers,
@@ -1027,8 +994,7 @@ class Store:
 
         # 回退：内存暴力搜索
         scored = [
-            (pid, cosine_similarity(query_vec, dv.vector))
-            for pid, dv in self.doc_vectors.items()
+            (pid, cosine_similarity(query_vec, dv.vector)) for pid, dv in self.doc_vectors.items()
         ]
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:top_k]

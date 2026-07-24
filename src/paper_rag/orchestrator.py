@@ -13,7 +13,6 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import yaml
 
@@ -43,7 +42,7 @@ class SubjectOrderPriority:
 class SubjectOrderConfig:
     sort_by: str = "name"  # 'name' | 'regex'
     direction: str = "asc"  # 'asc' | 'desc'
-    priority: Optional[SubjectOrderPriority] = None
+    priority: SubjectOrderPriority | None = None
 
     def __post_init__(self):
         if isinstance(self.priority, dict):
@@ -96,9 +95,7 @@ class PipelineConfig:
             subject_order=SubjectOrderConfig(
                 sort_by=review_data.get("subject_order", {}).get("sort_by", "name"),
                 direction=review_data.get("subject_order", {}).get("direction", "asc"),
-                priority=SubjectOrderPriority(**priority_data)
-                if priority_data
-                else None,
+                priority=SubjectOrderPriority(**priority_data) if priority_data else None,
             ),
         )
 
@@ -135,7 +132,7 @@ class StepFile:
 class StepResult:
     step_name: str
     status: str  # 'ok' | 'error' | 'skipped'
-    error: Optional[str] = None
+    error: str | None = None
     subject: str = ""
     data: dict = field(default_factory=dict)
     attempt: int = 1
@@ -146,7 +143,7 @@ class PipelineResult:
     subject: str = ""
     success: bool = True
     step_results: list[StepResult] = field(default_factory=list)
-    report_dir: Optional[Path] = None
+    report_dir: Path | None = None
 
 
 # ============================================================================
@@ -165,9 +162,7 @@ def discover_steps(phase_dir: Path) -> list[StepFile]:
     if not phase_dir.exists():
         return []
 
-    files = [
-        f for f in phase_dir.iterdir() if f.is_file() and f.suffix in _VALID_EXTENSIONS
-    ]
+    files = [f for f in phase_dir.iterdir() if f.is_file() and f.suffix in _VALID_EXTENSIONS]
 
     def sort_key(f: Path) -> tuple:
         stem = f.stem
@@ -249,7 +244,7 @@ def _run_py_step(step: StepFile, step_dir: Path, env: dict) -> StepResult:
                     error=error_msg,
                     data=data.get("data", {}),
                 )
-            except (json.JSONDecodeError, IOError):
+            except (OSError, json.JSONDecodeError):
                 pass
 
         return StepResult(
@@ -265,7 +260,7 @@ def _run_py_step(step: StepFile, step_dir: Path, env: dict) -> StepResult:
         try:
             with open(output_file) as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
+        except (OSError, json.JSONDecodeError) as e:
             logger.warning("Failed to parse output.json for %s: %s", step.stem, e)
 
     step_status = data.get("status", "ok")
@@ -489,7 +484,7 @@ def _run_phase_steps(
             }
 
             # 重试循环
-            result: Optional[StepResult] = None
+            result: StepResult | None = None
             for attempt in range(1, phase_config.retry.max_attempts + 1):
                 logger.debug(
                     "  [%s] attempt %d/%d",
@@ -512,14 +507,10 @@ def _run_phase_steps(
                     if result.status in ("ok", "skipped"):
                         break  # 不需要重试
 
-                    logger.warning(
-                        "  [%s] attempt %d failed: %s", subject, attempt, result.error
-                    )
+                    logger.warning("  [%s] attempt %d failed: %s", subject, attempt, result.error)
 
                 except Exception as e:
-                    logger.error(
-                        "  [%s] attempt %d raised exception: %s", subject, attempt, e
-                    )
+                    logger.error("  [%s] attempt %d raised exception: %s", subject, attempt, e)
                     result = StepResult(
                         step_name=step.stem,
                         status="error",
@@ -539,9 +530,7 @@ def _run_phase_steps(
             all_results[subject].append(result)
 
             if result.status == "error" and phase_config.retry.on_failure == "abort":
-                logger.error(
-                    "Aborting pipeline due to %s failure on %s", step.stem, subject
-                )
+                logger.error("Aborting pipeline due to %s failure on %s", step.stem, subject)
                 return all_results
 
     return all_results
@@ -628,10 +617,10 @@ def validate_step_output(data: dict, step_name: str) -> dict:
 def run_pipeline(
     pipeline_yaml: dict | str | Path,
     input_path: Path,
-    pipeline_dir: Optional[Path] = None,
-    output_dir: Optional[Path] = None,
-    target_phase: Optional[str] = None,
-    target_step: Optional[str] = None,
+    pipeline_dir: Path | None = None,
+    output_dir: Path | None = None,
+    target_phase: str | None = None,
+    target_step: str | None = None,
 ) -> PipelineResult:
     """执行一条完整的 pipeline（三段式：Pre → Review → Post）。
 
@@ -734,9 +723,7 @@ def run_pipeline(
         if target_step:
             steps = [s for s in steps if s.stem == target_step]
             if not steps:
-                logger.warning(
-                    "Step '%s' not found in phase '%s'", target_step, phase_name
-                )
+                logger.warning("Step '%s' not found in phase '%s'", target_step, phase_name)
                 continue
 
         # 确定 subjects（pre/post 为批量模式：一个虚拟 subject）

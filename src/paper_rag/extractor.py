@@ -10,15 +10,12 @@ import re
 
 from paper_rag.store import PaperMeta
 
-
 # ============================================================================
 # 文件名模式
 # ============================================================================
 
 # 01.提案表-基于深度学习-张三.pdf（用户实际命名格式）
-PAT_USER = re.compile(
-    r"^\d+(?:\.)\s*[^\-]+\-([^\-]+)\-([^\-]+?)(?:\-(\d{4}))?(?:\.pdf)?$"
-)
+PAT_USER = re.compile(r"^\d+(?:\.)\s*[^\-]+\-([^\-]+)\-([^\-]+?)(?:\-(\d{4}))?(?:\.pdf)?$")
 # 2023_张三_深度学习.pdf
 PAT_YEAR_AUTHOR_TITLE = re.compile(r"(\d{4})[_-]([^_\-]+)[_-](.+?)(?:\.pdf)?$")
 # 张三_深度学习_2023.pdf
@@ -122,8 +119,7 @@ def extract_pdf(pdf_path: str) -> str:
     """
     if not HAS_PYMUPDF:
         raise ImportError(
-            "PyMuPDF (fitz) is required for PDF extraction. "
-            "Install with: pip install pymupdf"
+            "PyMuPDF (fitz) is required for PDF extraction. Install with: pip install pymupdf"
         )
 
     doc = fitz.open(pdf_path)
@@ -145,9 +141,7 @@ def extract_pdf(pdf_path: str) -> str:
             # 页眉页脚过滤：短文本 + 位于页面顶部/底部
             y0 = b[1]
             y1 = b[3]
-            is_margin = (
-                y0 < HEADER_FOOTER_MARGIN or y1 > page_height - HEADER_FOOTER_MARGIN
-            )
+            is_margin = y0 < HEADER_FOOTER_MARGIN or y1 > page_height - HEADER_FOOTER_MARGIN
             if is_margin and len(txt) < SHORT_TEXT_THRESHOLD:
                 continue
 

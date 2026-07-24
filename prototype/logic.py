@@ -9,13 +9,12 @@
 可被 TUI 驱动，也可被未来真实代码替换。
 """
 
-from dataclasses import dataclass, field
 import hashlib
-import re
 import math
+import re
 import sqlite3
 import struct
-
+from dataclasses import dataclass, field
 
 # ============================================================================
 # 配置常量
@@ -304,9 +303,7 @@ class Store:
             self.content_hashes[row["sha256"]] = row["paper_id"]
 
         # 加载 embedding 指纹
-        row = db.execute(
-            "SELECT value FROM embed_fingerprint WHERE key='embed_model'"
-        ).fetchone()
+        row = db.execute("SELECT value FROM embed_fingerprint WHERE key='embed_model'").fetchone()
         if row:
             self.embed_fingerprint = row["value"]
 
@@ -465,8 +462,7 @@ class Store:
                 self.embed_fingerprint = current_fp
 
             self.log(
-                f"  CHUNKS: {len(chunks)}, vecs: {len(chunk_vecs)}, "
-                f"total papers={len(self.papers)}"
+                f"  CHUNKS: {len(chunks)}, vecs: {len(chunk_vecs)}, total papers={len(self.papers)}"
             )
         except Exception:
             db.rollback()
@@ -591,13 +587,9 @@ class Store:
                 (fts_query, top_k),
             ).fetchall()
 
-        return [
-            (r["chunk_id"], abs(r["score"])) for r in rows if r["score"] is not None
-        ]
+        return [(r["chunk_id"], abs(r["score"])) for r in rows if r["score"] is not None]
 
-    def bm25_aggregate_to_papers(
-        self, chunk_results: list[tuple[str, float]]
-    ) -> dict[str, float]:
+    def bm25_aggregate_to_papers(self, chunk_results: list[tuple[str, float]]) -> dict[str, float]:
         """Chunk 级 BM25 → max 聚合 → 论文分"""
         paper_scores: dict[str, float] = {}
         for chunk_id, score in chunk_results:
@@ -626,17 +618,12 @@ class Store:
             self.log("SEARCH: empty index")
             return []
 
-        self.log(
-            f"SEARCH: query='{query}', pool_filter={pool_filter}, rerank={with_rerank}"
-        )
+        self.log(f"SEARCH: query='{query}', pool_filter={pool_filter}, rerank={with_rerank}")
 
         # 1. BM25（FTS5）
         bm25_chunk_results = self.bm25_search(query, pool_filter=pool_filter)
         bm25_paper_scores = self.bm25_aggregate_to_papers(bm25_chunk_results)
-        self.log(
-            f"  BM25: {len(bm25_chunk_results)} chunk hits → "
-            f"{len(bm25_paper_scores)} papers"
-        )
+        self.log(f"  BM25: {len(bm25_chunk_results)} chunk hits → {len(bm25_paper_scores)} papers")
 
         # 2. FAISS 文档级
         query_vec = _deterministic_hash_vector(query)
@@ -647,9 +634,7 @@ class Store:
         self.log(f"  VEC: {len(vec_results)} doc matches")
 
         # 3. RRF 融合
-        bm25_ranked = sorted(
-            bm25_paper_scores.items(), key=lambda x: x[1], reverse=True
-        )[:RECALL_K]
+        bm25_ranked = sorted(bm25_paper_scores.items(), key=lambda x: x[1], reverse=True)[:RECALL_K]
         fused = rrf_fuse(bm25_ranked, vec_results)
         self.log(f"  RRF: {len(fused)} fused results")
 
@@ -960,8 +945,7 @@ def _deterministic_hash_vector(text: str, dim: int = VECTOR_DIM) -> list[float]:
 
 def embed_chunks(chunks: list[Chunk]) -> list[ChunkVector]:
     return [
-        ChunkVector(chunk_id=c.chunk_id, vector=_deterministic_hash_vector(c.text))
-        for c in chunks
+        ChunkVector(chunk_id=c.chunk_id, vector=_deterministic_hash_vector(c.text)) for c in chunks
     ]
 
 

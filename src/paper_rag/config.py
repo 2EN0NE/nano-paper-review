@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class Config(BaseModel):
@@ -74,7 +74,7 @@ _CONFIG_PATH_CANDIDATES = [
 ]
 
 
-def load_config(path: Optional[str] = None) -> Config:
+def load_config(path: str | None = None) -> Config:
     """加载配置
 
     优先级（低→高）：
@@ -96,6 +96,7 @@ def load_config(path: Optional[str] = None) -> Config:
 
     if path and Path(path).exists():
         import yaml
+
         with open(path) as f:
             data = yaml.safe_load(f) or {}
         # 只取 Config 模型已知的字段

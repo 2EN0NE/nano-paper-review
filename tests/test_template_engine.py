@@ -5,16 +5,14 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-
+from paper_rag.orchestrator import StepResult, run_pipeline
 from paper_rag.template_engine import (
     TemplateContext,
-    resolve_variables,
     build_agent_prefix,
+    resolve_variables,
 )
-from paper_rag.orchestrator import run_pipeline, StepResult
-
 
 # ============================================================================
 # 模板变量替换

@@ -1,0 +1,20 @@
+#!/bin/bash
+# Pre-commit hook: 格式化（自动修复）+ 单元测试
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+echo "=== [pre-commit] ruff format（自动修复）==="
+ruff format .
+
+echo "=== [pre-commit] ruff check --fix（辅助修复，不阻塞）==="
+ruff check --fix --exit-zero .
+
+# 把格式化后的变更重新 stage
+git add -u
+
+echo "=== [pre-commit] 单元测试（全量） ==="
+PYTHONPATH=src python3 -m pytest tests/ -q -m "not integration"
+
+echo "=== [pre-commit] ✅ 全部通过 ==="

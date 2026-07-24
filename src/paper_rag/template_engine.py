@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 _VARIABLE_PATTERN = re.compile(r"\{([a-zA-Z_0-9][\w.-]*)\}")
 
@@ -22,7 +22,7 @@ class PriorStepOutput:
     step_name: str
     status: str
     data: dict = field(default_factory=dict)
-    error: Optional[str] = None
+    error: str | None = None
 
 
 @dataclass
@@ -57,9 +57,7 @@ def resolve_variables(template: str, ctx: TemplateContext) -> str:
     """
 
     def _replacer(m: re.Match) -> str:
-        var_path = m.group(
-            1
-        )  # e.g. "subject.name" or "intermediates.01-search.data.refs"
+        var_path = m.group(1)  # e.g. "subject.name" or "intermediates.01-search.data.refs"
         parts = var_path.split(".")
 
         # Subject 变量
@@ -173,9 +171,7 @@ def build_agent_prefix(
         )
         parts.append("")
         for r in prior_results:
-            status_icon = (
-                "✅" if r.status == "ok" else "⚠️" if r.status == "skipped" else "❌"
-            )
+            status_icon = "✅" if r.status == "ok" else "⚠️" if r.status == "skipped" else "❌"
             parts.append(f"- **{r.step_name}** {status_icon} status=`{r.status}`")
             if r.data:
                 snippet = json.dumps(r.data, ensure_ascii=False)
@@ -194,12 +190,8 @@ def build_agent_prefix(
         + '", "status": "ok|error|skipped", "error": null|"原因", "data": {...}}'
     )
     parts.append("  ```")
-    parts.append(
-        "- `status` 字段：`ok`（成功）、`error`（执行失败）、`skipped`（跳过）"
-    )
-    parts.append(
-        "- 如果信息不足以完成评审，将 status 设为 `skipped` 并在 error 中写明原因。"
-    )
+    parts.append("- `status` 字段：`ok`（成功）、`error`（执行失败）、`skipped`（跳过）")
+    parts.append("- 如果信息不足以完成评审，将 status 设为 `skipped` 并在 error 中写明原因。")
     parts.append("")
 
     parts.append("---")

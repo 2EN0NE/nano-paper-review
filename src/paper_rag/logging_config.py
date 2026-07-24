@@ -12,7 +12,6 @@ import logging
 import logging.config
 import os
 from pathlib import Path
-from typing import Optional
 
 # ============================================================================
 # 默认日志配置（硬编码 fallback）
@@ -107,9 +106,9 @@ def _apply_env_overrides(cfg: dict) -> dict:
 
 
 def setup_logging(
-    config_path: Optional[str] = None,
-    log_level: Optional[str] = None,
-    log_dir: Optional[str] = None,
+    config_path: str | None = None,
+    log_level: str | None = None,
+    log_dir: str | None = None,
 ) -> logging.Logger:
     """初始化日志系统。
 

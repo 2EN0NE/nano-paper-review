@@ -13,11 +13,9 @@ import json
 import logging
 import time
 
-import flask
 from flask import Flask, jsonify, request
 
 from paper_rag.store import Store
-
 
 logger = logging.getLogger(__name__)
 
@@ -108,29 +106,33 @@ def create_app(store: Store) -> Flask:
         # --- 响应组装 ---
         results_data = []
         for r in results:
-            results_data.append({
-                "paper_id": r.paper_id,
-                "filename": r.filename,
-                "pool": r.pool,
-                "score": r.score,
-                "title_hint": r.title_hint,
-                "year": r.year,
-                "author_hint": r.author_hint,
-                "arxiv_id": r.arxiv_id,
-                "pages": r.pages,
-                "match_chunk_snippet": r.match_chunk_snippet,
-                "tags": r.tags,
-            })
+            results_data.append(
+                {
+                    "paper_id": r.paper_id,
+                    "filename": r.filename,
+                    "pool": r.pool,
+                    "score": r.score,
+                    "title_hint": r.title_hint,
+                    "year": r.year,
+                    "author_hint": r.author_hint,
+                    "arxiv_id": r.arxiv_id,
+                    "pages": r.pages,
+                    "match_chunk_snippet": r.match_chunk_snippet,
+                    "tags": r.tags,
+                }
+            )
 
-        return jsonify({
-            "results": results_data,
-            "meta": {
-                "query": query,
-                "total_results": len(results_data),
-                "pool_filter": pool_filter,
-                "took_ms": took_ms,
-            },
-        })
+        return jsonify(
+            {
+                "results": results_data,
+                "meta": {
+                    "query": query,
+                    "total_results": len(results_data),
+                    "pool_filter": pool_filter,
+                    "took_ms": took_ms,
+                },
+            }
+        )
 
     # ========================================================================
     # 错误处理

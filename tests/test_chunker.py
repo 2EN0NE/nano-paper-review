@@ -1,8 +1,9 @@
 """分块逻辑测试"""
 
 import pytest
+
 from paper_rag.chunker import chunk_paper
-from paper_rag.store import PaperMeta, Paper
+from paper_rag.store import Paper, PaperMeta
 
 
 @pytest.fixture
@@ -25,8 +26,7 @@ def sample_paper():
             "其中特征提取采用了自注意力机制。",
             "",
             "3  实验",
-            "在三个公开数据集上，我们的方法相比基线提升了 5.7%。"
-            "消融实验验证了每个模块的有效性。",
+            "在三个公开数据集上，我们的方法相比基线提升了 5.7%。消融实验验证了每个模块的有效性。",
             "",
             "4  结论",
             "本文提出了面向信用评估的深度学习方法。未来工作将探索跨领域迁移。",

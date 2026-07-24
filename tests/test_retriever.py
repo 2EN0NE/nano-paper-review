@@ -1,37 +1,51 @@
 """
 T3: Hybrid Search + Reranker — tests for RRF fusion, pool filter semantics,
 and the full hybrid search pipeline.
-"""
-import math
-import tempfile
-import os
 
-from paper_rag.store import (
-    Store, PaperMeta, Paper, Chunk, DocVector, ChunkVector,
-    SearchResult, RRF_K, RECALL_K,
-)
+@pytest.mark.integration: 跨组件（BM25 + vector + RRF）混合检索集成测试
+"""
+
+import math
+
+import pytest
+
 from paper_rag.chunker import chunk_paper
 from paper_rag.retriever import rrf_fuse
+from paper_rag.store import (
+    Chunk,
+    ChunkVector,
+    DocVector,
+    Paper,
+    PaperMeta,
+    SearchResult,
+    Store,
+)
 
+pytestmark = pytest.mark.integration
 
 # ============================================================================
 # 测试 Helpers
 # ============================================================================
 
+
 def _make_sample_paper(fid: str, pool: str = "history") -> Paper:
     filename = f"2023_张三_{fid}.pdf"
-    text = "\n\n".join([
-        f"标题：{fid}方法研究",
-        "摘  要",
-        f"本文提出了一种{fid}方法，结合了深度学习和传统模型。",
-        f"实验结果表明，{fid}方法在多个数据集上表现优异。",
-        "",
-        "1  引言",
-        f"近年来，{fid}领域取得了显著进展。",
-        "参考文献",
-    ])
+    text = "\n\n".join(
+        [
+            f"标题：{fid}方法研究",
+            "摘  要",
+            f"本文提出了一种{fid}方法，结合了深度学习和传统模型。",
+            f"实验结果表明，{fid}方法在多个数据集上表现优异。",
+            "",
+            "1  引言",
+            f"近年来，{fid}领域取得了显著进展。",
+            "参考文献",
+        ]
+    )
     meta = PaperMeta(
-        filename=filename, title_hint=fid, year=2023,
+        filename=filename,
+        title_hint=fid,
+        year=2023,
         author_hint="张三",
     )
     return Paper(
@@ -44,8 +58,7 @@ def _make_sample_paper(fid: str, pool: str = "history") -> Paper:
     )
 
 
-def _make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4
-                           ) -> tuple[list[ChunkVector], DocVector]:
+def _make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> tuple[list[ChunkVector], DocVector]:
     import hashlib
 
     def _hash_vec(text: str) -> list[float]:
@@ -94,6 +107,7 @@ def _setup_store_with_papers(paper_defs: list[tuple[str, str]]) -> Store:
 # ============================================================================
 # RRF 融合数学测试
 # ============================================================================
+
 
 class TestRrfFuse:
     """RRF 融合的正确性验证"""
@@ -160,12 +174,8 @@ class TestRrfFuse:
     def test_rrf_fuse_large_k_smoother(self):
         """k 值越大，排名之间的分数差异越小"""
         a = [("p1", 1.0), ("p2", 0.8)]
-        diff_small_k = abs(
-            1.0 / (1 + 0 + 1) - 1.0 / (1 + 1 + 1)
-        )
-        diff_large_k = abs(
-            1.0 / (100 + 0 + 1) - 1.0 / (100 + 1 + 1)
-        )
+        diff_small_k = abs(1.0 / (1 + 0 + 1) - 1.0 / (1 + 1 + 1))
+        diff_large_k = abs(1.0 / (100 + 0 + 1) - 1.0 / (100 + 1 + 1))
         assert diff_large_k < diff_small_k
 
 
@@ -173,15 +183,18 @@ class TestRrfFuse:
 # Pool Filter 语义测试（post-filter vs pre-filter）
 # ============================================================================
 
+
 class TestPoolFilterSemantics:
     """pool_filter 应该是 post-filter（全库搜索后过滤）而非 pre-filter"""
 
     def test_pool_filter_history_returns_only_history(self):
         """pool_filter=history 只返回 history 池结果"""
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "pending"),
-        ])
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "pending"),
+            ]
+        )
         results = store.search("方法", pool_filter="history", with_rerank=False)
         assert len(results) > 0
         for r in results:
@@ -189,20 +202,24 @@ class TestPoolFilterSemantics:
 
     def test_pool_filter_pending_returns_only_pending(self):
         """pool_filter=pending 只返回 pending 池结果"""
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "pending"),
-        ])
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "pending"),
+            ]
+        )
         results = store.search("方法", pool_filter="pending", with_rerank=False)
         for r in results:
             assert r.pool == "pending"
 
     def test_pool_filter_no_filter_returns_both(self):
         """无 pool_filter 时返回两个池的结果"""
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "pending"),
-        ])
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "pending"),
+            ]
+        )
         results = store.search("方法", with_rerank=False)
         pools = {r.pool for r in results}
         assert "history" in pools
@@ -211,23 +228,23 @@ class TestPoolFilterSemantics:
     def test_pool_filter_is_post_filter_include_cross_pool_match(self):
         """
         验证 pool_filter 是 post-filter: 跨池匹配后只保留指定池。
-        
+
         即使最匹配的论文在 pending 池，history 过滤也不应影响 BM25/FAISS 的召回，
         只是最终结果被过滤掉。
         """
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "pending"),  # query "图神经网络" 应最佳匹配这项
-        ])
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "pending"),  # query "图神经网络" 应最佳匹配这项
+            ]
+        )
         # pending 过滤，应找到图神经网络
-        results_pending = store.search("图神经网络", pool_filter="pending",
-                                       with_rerank=False)
+        results_pending = store.search("图神经网络", pool_filter="pending", with_rerank=False)
         pending_ids = {r.paper_id for r in results_pending}
         assert "test_图神经网络" in pending_ids
 
         # history 过滤不应包含 pending 的结果
-        results_history = store.search("图神经网络", pool_filter="history",
-                                       with_rerank=False)
+        results_history = store.search("图神经网络", pool_filter="history", with_rerank=False)
         history_ids = {r.paper_id for r in results_history}
         assert "test_图神经网络" not in history_ids
 
@@ -235,6 +252,7 @@ class TestPoolFilterSemantics:
 # ============================================================================
 # 完整的 Hybrid Search 测试
 # ============================================================================
+
 
 class TestHybridSearch:
     """完整的混合搜索流程"""
@@ -257,26 +275,30 @@ class TestHybridSearch:
 
     def test_search_returns_searchresult_objects(self):
         """search 方法返回 SearchResult 列表"""
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "history"),
-        ])
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "history"),
+            ]
+        )
         results = store.search("方法", with_rerank=False)
         assert len(results) > 0
         for r in results:
             assert isinstance(r, SearchResult)
-            assert hasattr(r, 'paper_id')
-            assert hasattr(r, 'score')
-            assert hasattr(r, 'pool')
-            assert hasattr(r, 'filename')
-            assert hasattr(r, 'match_chunk_snippet')
+            assert hasattr(r, "paper_id")
+            assert hasattr(r, "score")
+            assert hasattr(r, "pool")
+            assert hasattr(r, "filename")
+            assert hasattr(r, "match_chunk_snippet")
 
     def test_search_score_in_0_1_range(self):
         """RRF 融合后分数归一化到 [0, 1] 范围"""
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "history"),
-        ])
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "history"),
+            ]
+        )
         results = store.search("方法", with_rerank=False)
         for r in results:
             assert 0.0 <= r.score <= 1.0
@@ -284,15 +306,18 @@ class TestHybridSearch:
     def test_search_returns_top_n_at_most(self):
         """结果不超过 FINAL_TOP_N 条"""
         from paper_rag.store import FINAL_TOP_N
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "history"),
-            ("系统调度", "history"),
-            ("图像识别", "history"),
-            ("语音识别", "history"),
-            ("目标检测", "history"),
-            ("强化学习", "history"),
-        ])
+
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "history"),
+                ("系统调度", "history"),
+                ("图像识别", "history"),
+                ("语音识别", "history"),
+                ("目标检测", "history"),
+                ("强化学习", "history"),
+            ]
+        )
         results = store.search("方法", with_rerank=False)
         assert len(results) <= FINAL_TOP_N
 
@@ -300,6 +325,7 @@ class TestHybridSearch:
 # ============================================================================
 # Reranker 集成测试
 # ============================================================================
+
 
 class TestRerankerIntegration:
     """CrossEncoder 精排集成（使用 mock reranker，不加载真实模型）"""
@@ -309,14 +335,17 @@ class TestRerankerIntegration:
         启用 reranker 后，结果排序可能不同于纯 RRF。
         （使用模拟 reranker 验证集成路径正常）
         """
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "history"),
-        ])
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "history"),
+            ]
+        )
 
         # 用一个简单的模拟 reranker：按论文标题排序（为了可测试性）
         class MockReranker:
             is_loaded = True
+
             def rerank(self, query, candidates, top_n=5):
                 # 倒序排列以验证排序变更
                 scored = [(p, len(p.meta.title_hint)) for p in candidates]
@@ -324,9 +353,7 @@ class TestRerankerIntegration:
                 return [p for p, _ in scored[:top_n]]
 
         results_no_rerank = store.search("方法", with_rerank=False)
-        results_rerank = store.search(
-            "方法", with_rerank=True, reranker=MockReranker()
-        )
+        results_rerank = store.search("方法", with_rerank=True, reranker=MockReranker())
 
         # 结果应都返回
         assert len(results_no_rerank) > 0
@@ -334,18 +361,20 @@ class TestRerankerIntegration:
 
     def test_search_with_reranker_returns_same_papers(self):
         """reranker 不改变候选集，只改变排序"""
-        store = _setup_store_with_papers([
-            ("信用评估", "history"),
-            ("图神经网络", "history"),
-        ])
+        store = _setup_store_with_papers(
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "history"),
+            ]
+        )
 
         class IdentityReranker:
             is_loaded = True
+
             def rerank(self, query, candidates, top_n=5):
                 return candidates[:top_n]
 
-        results = store.search("方法", with_rerank=True,
-                               reranker=IdentityReranker())
+        results = store.search("方法", with_rerank=True, reranker=IdentityReranker())
         assert len(results) > 0
 
     def test_search_rerank_skip_when_false(self):
@@ -359,6 +388,7 @@ class TestRerankerIntegration:
 # ============================================================================
 # CLI 集成测试
 # ============================================================================
+
 
 class TestCliIntegration:
     """CLI --no-rerank 命令兼容性"""

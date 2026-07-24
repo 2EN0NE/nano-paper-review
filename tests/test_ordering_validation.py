@@ -4,14 +4,12 @@
 
 from __future__ import annotations
 
-
 from paper_rag.orchestrator import (
+    SubjectOrderConfig,
+    _order_subjects,
     run_pipeline,
     validate_step_output,
-    _order_subjects,
-    SubjectOrderConfig,
 )
-
 
 # ============================================================================
 # Subject 排序
@@ -37,9 +35,7 @@ class TestSubjectOrdering:
             sort_by="regex",
             priority={"first": [".*urgent.*"], "last": []},
         )
-        result = _order_subjects(
-            ["normal-1", "urgent-001", "normal-2", "urgent-002"], cfg
-        )
+        result = _order_subjects(["normal-1", "urgent-001", "normal-2", "urgent-002"], cfg)
         assert result[0].startswith("urgent")
         assert result[1].startswith("urgent")
 
@@ -151,15 +147,9 @@ class TestMultiPhaseExecution:
         result = run_pipeline(pipeline_dir, input_pdf)
 
         # 检查各阶段 intermediates
-        assert (
-            output_dir / "intermediates" / "pre" / "01-pre" / "output.json"
-        ).exists()
-        assert (
-            output_dir / "intermediates" / "subject" / "01-review" / "output.json"
-        ).exists()
-        assert (
-            output_dir / "intermediates" / "post" / "01-post" / "output.json"
-        ).exists()
+        assert (output_dir / "intermediates" / "pre" / "01-pre" / "output.json").exists()
+        assert (output_dir / "intermediates" / "subject" / "01-review" / "output.json").exists()
+        assert (output_dir / "intermediates" / "post" / "01-post" / "output.json").exists()
         assert result.success
 
     def test_target_phase_only_runs_that_phase(self, tmp_path):
@@ -196,9 +186,5 @@ class TestMultiPhaseExecution:
 
         # target_phase='review' → pre 不执行
         result = run_pipeline(pipeline_dir, input_pdf, target_phase="review")
-        assert not (
-            output_dir / "intermediates" / "pre" / "01-pre" / "output.json"
-        ).exists()
-        assert (
-            output_dir / "intermediates" / "subject" / "01-review" / "output.json"
-        ).exists()
+        assert not (output_dir / "intermediates" / "pre" / "01-pre" / "output.json").exists()
+        assert (output_dir / "intermediates" / "subject" / "01-review" / "output.json").exists()

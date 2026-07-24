@@ -14,8 +14,9 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 
 def parse_dep_name(spec: str) -> str:
@@ -50,8 +51,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("wheel_dir", help="Directory containing downloaded wheels")
     parser.add_argument("pyproject", help="Path to pyproject.toml")
-    parser.add_argument("--list-missing", action="store_true",
-                        help="Print missing package specs (one per line) instead of exit code")
+    parser.add_argument(
+        "--list-missing",
+        action="store_true",
+        help="Print missing package specs (one per line) instead of exit code",
+    )
     args = parser.parse_args()
 
     with open(args.pyproject, "rb") as f:

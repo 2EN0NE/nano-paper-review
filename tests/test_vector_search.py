@@ -1,30 +1,46 @@
-"""FAISS 向量检索测试（TDD）"""
+"""FAISS 向量检索测试（TDD）
+
+@pytest.mark.integration: FAISS 持久化 + 向量检索集成测试
+"""
+
 import math
 import os
 import tempfile
 
-from paper_rag.store import (
-    Store, PaperMeta, Paper, Chunk, DocVector, ChunkVector,
-    cosine_similarity,
-)
+import pytest
+
 from paper_rag.chunker import chunk_paper
+from paper_rag.store import (
+    Chunk,
+    ChunkVector,
+    DocVector,
+    Paper,
+    PaperMeta,
+    Store,
+)
+
+pytestmark = pytest.mark.integration
 
 
 def _make_sample_paper(fid: str, pool: str = "history") -> Paper:
     """构造一个含确定性内容的测试 Paper（与 test_store.py 行为一致）"""
     filename = f"2023_张三_{fid}.pdf"
-    text = "\n\n".join([
-        f"标题：{fid}方法研究",
-        "摘  要",
-        f"本文提出了一种{fid}方法，结合了深度学习和传统模型。",
-        f"实验结果表明，{fid}方法在多个数据集上表现优异。",
-        "",
-        "1  引言",
-        f"近年来，{fid}领域取得了显著进展。",
-        "参考文献",
-    ])
+    text = "\n\n".join(
+        [
+            f"标题：{fid}方法研究",
+            "摘  要",
+            f"本文提出了一种{fid}方法，结合了深度学习和传统模型。",
+            f"实验结果表明，{fid}方法在多个数据集上表现优异。",
+            "",
+            "1  引言",
+            f"近年来，{fid}领域取得了显著进展。",
+            "参考文献",
+        ]
+    )
     meta = PaperMeta(
-        filename=filename, title_hint=fid, year=2023,
+        filename=filename,
+        title_hint=fid,
+        year=2023,
         author_hint="张三",
     )
     return Paper(
@@ -37,8 +53,7 @@ def _make_sample_paper(fid: str, pool: str = "history") -> Paper:
     )
 
 
-def _make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4
-                           ) -> tuple[list[ChunkVector], DocVector]:
+def _make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> tuple[list[ChunkVector], DocVector]:
     """构造模拟向量（确定性浮点数序列）"""
     import hashlib
 
@@ -96,6 +111,7 @@ class TestFaissInit:
         store = Store(":memory:")
         store.init_faiss()
         from paper_rag.store import VECTOR_DIM
+
         assert store._faiss_dim == VECTOR_DIM
         store.close()
 
@@ -258,6 +274,7 @@ class TestFaissIntegration:
     def test_faiss_save_id_map_format(self):
         """id_map.json 的 key 是整数（faiss 索引位置）"""
         import json
+
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.sqlite")
             store = Store(db_path)

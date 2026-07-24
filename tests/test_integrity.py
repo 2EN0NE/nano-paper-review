@@ -1,37 +1,49 @@
 """
 T5: 索引完整性测试 —— 内容去重、配置加载、向量重建
+
+@pytest.mark.integration: 跨组件（store + config + chunker）集成测试
 """
+
 import hashlib
 import math
 
-from paper_rag.store import (
-    Store, PaperMeta, Paper, Chunk, DocVector, ChunkVector,
-    mean_pool_chunks, VECTOR_DIM,
-)
-from paper_rag.chunker import chunk_paper
-from paper_rag.config import Config, load_config
+import pytest
 
+from paper_rag.chunker import chunk_paper
+from paper_rag.config import Config
+from paper_rag.store import (
+    Chunk,
+    ChunkVector,
+    DocVector,
+    Paper,
+    PaperMeta,
+    Store,
+)
+
+pytestmark = pytest.mark.integration
 
 # ============================================================================
 # 辅助函数
 # ============================================================================
 
+
 def _make_fake_content(seed: str) -> str:
     """生成确定性文本内容"""
-    return "\n\n".join([
-        f"标题：{seed}方法研究",
-        "摘  要",
-        f"本文提出了一种{seed}方法，结合了深度学习和传统模型。",
-        f"实验结果表明，{seed}方法在多个数据集上表现优异。",
-        "",
-        "1  引言",
-        f"近年来，{seed}领域取得了显著进展。",
-        "参考文献",
-    ])
+    return "\n\n".join(
+        [
+            f"标题：{seed}方法研究",
+            "摘  要",
+            f"本文提出了一种{seed}方法，结合了深度学习和传统模型。",
+            f"实验结果表明，{seed}方法在多个数据集上表现优异。",
+            "",
+            "1  引言",
+            f"近年来，{seed}领域取得了显著进展。",
+            "参考文献",
+        ]
+    )
 
 
-def _make_paper(pid: str, filename: str, seed: str,
-                pool: str = "history") -> Paper:
+def _make_paper(pid: str, filename: str, seed: str, pool: str = "history") -> Paper:
     content = _make_fake_content(seed)
     meta = PaperMeta(
         filename=filename,
@@ -49,8 +61,7 @@ def _make_paper(pid: str, filename: str, seed: str,
     )
 
 
-def _make_mock_chunk_vecs(chunks: list[Chunk],
-                          dim: int = 4) -> tuple[list[ChunkVector], DocVector]:
+def _make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> tuple[list[ChunkVector], DocVector]:
     """为 chunk 列表生成确定性模拟向量（小维度，用于测试）"""
 
     def _hash_vec(text: str) -> list[float]:
@@ -92,6 +103,7 @@ def _make_mock_chunk_vecs(chunks: list[Chunk],
 # 测试类
 # ============================================================================
 
+
 class TestContentDedup:
     """T5: 相同内容不同文件名的去重"""
 
@@ -100,12 +112,24 @@ class TestContentDedup:
         store = Store(":memory:")
         content = _make_fake_content("深度学习")
         meta1 = PaperMeta(filename="v1.pdf", title_hint="深度学习", year=2023, author_hint="张三")
-        paper1 = Paper(paper_id="p1", filepath="data/v1.pdf", meta=meta1,
-                       raw_text=content, pages=2, pool="history")
+        paper1 = Paper(
+            paper_id="p1",
+            filepath="data/v1.pdf",
+            meta=meta1,
+            raw_text=content,
+            pages=2,
+            pool="history",
+        )
 
         meta2 = PaperMeta(filename="v2.pdf", title_hint="深度学习", year=2023, author_hint="张三")
-        paper2 = Paper(paper_id="p2", filepath="data/v2.pdf", meta=meta2,
-                       raw_text=content, pages=2, pool="history")
+        paper2 = Paper(
+            paper_id="p2",
+            filepath="data/v2.pdf",
+            meta=meta2,
+            raw_text=content,
+            pages=2,
+            pool="history",
+        )
 
         # 先加载相同的 chunker 分块
         chunks1 = chunk_paper(paper1)
@@ -299,8 +323,14 @@ class TestRebuildDocVectors:
     def _add_long_paper(store: Store, seed: str, pid: str, filename: str):
         content = TestRebuildDocVectors._make_long_content(seed)
         meta = PaperMeta(filename=filename, title_hint=seed, year=2023, author_hint="张三")
-        paper = Paper(paper_id=pid, filepath=f"data/{filename}", meta=meta,
-                      raw_text=content, pages=2, pool="history")
+        paper = Paper(
+            paper_id=pid,
+            filepath=f"data/{filename}",
+            meta=meta,
+            raw_text=content,
+            pages=2,
+            pool="history",
+        )
         chunks = chunk_paper(paper)
         cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
         store.add_paper(paper, cvs, dv)
@@ -344,7 +374,8 @@ class TestRebuildDocVectors:
 
         # 分数应该有变化（至少有一个 paper 的分数不同）
         changes = [
-            pid for pid in score_map_before
+            pid
+            for pid in score_map_before
             if abs(score_map_before.get(pid, 0) - score_map_after.get(pid, 0)) > 1e-6
         ]
         assert len(changes) > 0, "权重变化后分数应不同"
@@ -392,8 +423,8 @@ class TestLoadAllFingerprint:
 
     def test_load_all_fingerprint_match(self):
         """指纹一致时不产生警告日志"""
-        import tempfile
         import os
+        import tempfile
 
         with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
             db_path = f.name
@@ -409,8 +440,7 @@ class TestLoadAllFingerprint:
             store2.load_all()
             # 指纹应一致
             assert store2.embed_fingerprint == store2._current_fingerprint()
-            warn_msgs = [m for m in store2.ops_log
-                        if "FINGERPRINT MISMATCH" in m]
+            warn_msgs = [m for m in store2.ops_log if "FINGERPRINT MISMATCH" in m]
             assert len(warn_msgs) == 0, "指纹一致不应有警告"
             store2.close()
         finally:
@@ -419,8 +449,8 @@ class TestLoadAllFingerprint:
 
     def test_load_all_fingerprint_mismatch(self):
         """指纹不匹配时产生警告"""
-        import tempfile
         import os
+        import tempfile
 
         with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
             db_path = f.name
@@ -436,8 +466,7 @@ class TestLoadAllFingerprint:
             cfg2 = Config(head_weight=1.0, body_weight=1.0, tail_weight=1.0)
             store2 = Store(db_path, config=cfg2)
             store2.load_all()
-            warn_msgs = [m for m in store2.ops_log
-                        if "FINGERPRINT MISMATCH" in m]
+            warn_msgs = [m for m in store2.ops_log if "FINGERPRINT MISMATCH" in m]
             assert len(warn_msgs) > 0, "指纹不同应有警告"
             store2.close()
         finally:

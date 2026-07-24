@@ -16,7 +16,7 @@ Usage::
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from paper_rag.config import Config, load_config
 
@@ -36,10 +36,9 @@ class CrossEncoderReranker:
     fp16 加载约 1.1GB 内存，fp32 约 2.27GB。
     """
 
-    def __init__(self, model_name: str = RERANKER_MODEL_NAME,
-                 config: Optional[Config] = None):
+    def __init__(self, model_name: str = RERANKER_MODEL_NAME, config: Config | None = None):
         self._model_name = model_name
-        self._model: Optional["CrossEncoder"] = None
+        self._model: CrossEncoder | None = None
         self._config = config or load_config()
         self.device: str = "cpu"
 
@@ -60,8 +59,7 @@ class CrossEncoderReranker:
         if self._model is not None:
             return self._model
 
-        logger.info("Loading reranker model: %s (device=%s)",
-                    self._model_name, self.device)
+        logger.info("Loading reranker model: %s (device=%s)", self._model_name, self.device)
         from sentence_transformers import CrossEncoder
 
         self._model = CrossEncoder(
@@ -74,8 +72,7 @@ class CrossEncoderReranker:
 
     # ---- reranking ----
 
-    def rerank(self, query: str, candidates: list[Paper],
-               top_n: int = 5) -> list[Paper]:
+    def rerank(self, query: str, candidates: list[Paper], top_n: int = 5) -> list[Paper]:
         """对候选论文按 query 相关性精排
 
         Args:
@@ -92,10 +89,7 @@ class CrossEncoderReranker:
         model = self.load()
 
         # 构造 (query, doc_text) 对 — 取文档前 512 字符作为 doc 侧
-        pairs = [
-            [query, p.raw_text[:RERANK_MAX_SEQ_LEN]]
-            for p in candidates
-        ]
+        pairs = [[query, p.raw_text[:RERANK_MAX_SEQ_LEN]] for p in candidates]
 
         # 模型预测相关性分数
         scores = model.predict(pairs)

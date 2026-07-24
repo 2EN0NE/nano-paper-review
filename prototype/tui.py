@@ -20,14 +20,15 @@
 """
 
 import readline  # noqa: F401
+
 from prototype.logic import (
+    BODY_WEIGHT,
+    HEAD_WEIGHT,
+    TAIL_WEIGHT,
     Store,
-    extract_meta,
     build_index,
     create_paper,
-    HEAD_WEIGHT,
-    BODY_WEIGHT,
-    TAIL_WEIGHT,
+    extract_meta,
 )
 
 # ============================================================================
@@ -96,9 +97,7 @@ def action_search():
     if not query:
         print(f"\n{RED}  ✗ 查询为空{RESET}")
         return
-    pool_filter = (
-        input(f"  {BOLD}池过滤 (history/pending/留空=全部):{RESET} ").strip() or None
-    )
+    pool_filter = input(f"  {BOLD}池过滤 (history/pending/留空=全部):{RESET} ").strip() or None
 
     results = STORE.search(query, pool_filter=pool_filter, with_rerank=True)
 
@@ -157,9 +156,7 @@ def action_status():
     section("Mean Pooling 模式")
     field(
         "加权",
-        "开启 (head=5.0, body=2.0, tail=4.0)"
-        if USE_WEIGHTED_POOLING
-        else "关闭 (等权)",
+        "开启 (head=5.0, body=2.0, tail=4.0)" if USE_WEIGHTED_POOLING else "关闭 (等权)",
     )
     section("持久化")
     field("存储", "SQLite FTS5 (prototype_index.sqlite)")
@@ -267,10 +264,7 @@ def action_preload_samples():
         STORE.add_paper(paper, chunk_vecs, doc_vec)
         print(f"  {GREEN}✓{RESET} [{pool}] {filename}  ({len(chunks)} chunks)")
 
-    print(
-        f"\n{GREEN}预加载完成: {len(STORE.papers)} 篇论文, "
-        f"{len(STORE.chunks)} chunks{RESET}"
-    )
+    print(f"\n{GREEN}预加载完成: {len(STORE.papers)} 篇论文, {len(STORE.chunks)} chunks{RESET}")
     print(f"  {DIM}BM25 通过 SQLite FTS5 管理，零重建开销{RESET}")
 
 
@@ -318,12 +312,8 @@ def render():
 
 def main():
     print(f"\n{BOLD}欢迎使用论文检索原型 (SQLite FTS5 版){RESET}")
-    print(
-        f"{DIM}提示: 先按 [x] 预加载 10 篇样本 → [s] 搜索 → [w] 切换权重测试重嵌入{RESET}"
-    )
-    print(
-        f"{DIM}BM25 通过 FTS5 增量写入，不再全量重建 | chunk向量持久化支持权重重嵌入{RESET}\n"
-    )
+    print(f"{DIM}提示: 先按 [x] 预加载 10 篇样本 → [s] 搜索 → [w] 切换权重测试重嵌入{RESET}")
+    print(f"{DIM}BM25 通过 FTS5 增量写入，不再全量重建 | chunk向量持久化支持权重重嵌入{RESET}\n")
 
     try:
         while True:

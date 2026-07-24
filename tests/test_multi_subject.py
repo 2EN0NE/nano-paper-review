@@ -9,10 +9,9 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-
 from paper_rag.orchestrator import (
-    run_pipeline,
     PipelineConfig,
+    run_pipeline,
 )
 
 

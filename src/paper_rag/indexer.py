@@ -10,25 +10,26 @@ This module is the seam between the chunker, the embedding model, and the store.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from paper_rag.store import (
+    BODY_WEIGHT,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    HEAD_RATIO,
+    HEAD_WEIGHT,
+    TAIL_RATIO,
+    TAIL_WEIGHT,
     Chunk,
     ChunkVector,
     DocVector,
     Paper,
-    CHUNK_SIZE,
-    CHUNK_OVERLAP,
-    HEAD_WEIGHT,
-    BODY_WEIGHT,
-    TAIL_WEIGHT,
-    HEAD_RATIO,
-    TAIL_RATIO,
     mean_pool_chunks,
 )
 
 if TYPE_CHECKING:
     import numpy as np
+
     from paper_rag.models import EmbeddingModelManager
 
 
@@ -71,10 +72,14 @@ def build_index(
     if not chunks:
         # Return empty result for papers with no extractable text
         dim = getattr(model, "dim", 512)
-        return [], [], DocVector(
-            paper_id=paper.paper_id,
-            vector=[0.0] * dim,
-            dim=dim,
+        return (
+            [],
+            [],
+            DocVector(
+                paper_id=paper.paper_id,
+                vector=[0.0] * dim,
+                dim=dim,
+            ),
         )
 
     # Encode chunk texts

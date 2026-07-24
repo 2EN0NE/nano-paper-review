@@ -11,9 +11,7 @@ import os
 import tempfile
 from pathlib import Path
 
-
-from paper_rag.logging_config import setup_logging, get_logger
-
+from paper_rag.logging_config import get_logger, setup_logging
 
 # ============================================================================
 # get_logger 基础

@@ -10,15 +10,13 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-
+from unittest.mock import MagicMock, patch
 
 from paper_rag.orchestrator import (
     PipelineConfig,
     discover_steps,
     run_pipeline,
 )
-
 
 # ============================================================================
 # pipeline.yaml 解析
@@ -254,9 +252,7 @@ with open(os.path.join(step_dir, 'output.json'), 'w') as f:
         )
 
         # 检查 output.json
-        expected = (
-            output_dir / "intermediates" / "subject-01" / "01-test" / "output.json"
-        )
+        expected = output_dir / "intermediates" / "subject-01" / "01-test" / "output.json"
         assert expected.exists()
         with open(expected) as f:
             data = json.load(f)

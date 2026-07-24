@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 
-from paper_rag.store import Paper, Chunk
+from paper_rag.store import Chunk, Paper
 
 # ============================================================================
 # 配置常量

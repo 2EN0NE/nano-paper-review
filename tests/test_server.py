@@ -5,31 +5,40 @@ HTTP API 服务测试 —— Flask test client
 - 使用 Store(":memory:") 构造纯内存 Store 实例
 - 通过 create_app(store) 注入到 Flask 应用中
 - 使用 Flask test_client 进行 HTTP 测试
+
+@pytest.mark.integration: 跨组件 HTTP 全链路测试
 """
 
 import json
+
 import pytest
 
-from paper_rag.store import Store, PaperMeta, Paper, DocVector, ChunkVector
 from paper_rag.chunker import chunk_paper
 from paper_rag.server import create_app
+from paper_rag.store import ChunkVector, DocVector, Paper, PaperMeta, Store
+
+pytestmark = pytest.mark.integration
 
 
 def _make_sample_paper(fid: str, pool: str = "history") -> Paper:
     """构造测试用 Paper（与 test_store.py 一致）"""
     filename = f"2023_张三_{fid}.pdf"
-    text = "\n\n".join([
-        f"标题：{fid}方法研究",
-        "摘  要",
-        f"本文提出了一种{fid}方法，结合了深度学习和传统模型。",
-        f"实验结果表明，{fid}方法在多个数据集上表现优异。",
-        "",
-        "1  引言",
-        f"近年来，{fid}领域取得了显著进展。",
-        "参考文献",
-    ])
+    text = "\n\n".join(
+        [
+            f"标题：{fid}方法研究",
+            "摘  要",
+            f"本文提出了一种{fid}方法，结合了深度学习和传统模型。",
+            f"实验结果表明，{fid}方法在多个数据集上表现优异。",
+            "",
+            "1  引言",
+            f"近年来，{fid}领域取得了显著进展。",
+            "参考文献",
+        ]
+    )
     meta = PaperMeta(
-        filename=filename, title_hint=fid, year=2023,
+        filename=filename,
+        title_hint=fid,
+        year=2023,
         author_hint="张三",
     )
     return Paper(
@@ -208,11 +217,14 @@ class TestSearchEndpoint:
 
     def test_search_with_pool_filter(self):
         store = Store(":memory:")
-        _populate_store(store, [
-            ("信用评估", "history"),
-            ("图神经网络", "pending"),
-            ("系统调度", "history"),
-        ])
+        _populate_store(
+            store,
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "pending"),
+                ("系统调度", "history"),
+            ],
+        )
         app = create_app(store)
         client = app.test_client()
 
@@ -229,11 +241,14 @@ class TestSearchEndpoint:
 
     def test_search_with_limit(self):
         store = Store(":memory:")
-        _populate_store(store, [
-            ("信用评估", "history"),
-            ("图神经网络", "pending"),
-            ("系统调度", "history"),
-        ])
+        _populate_store(
+            store,
+            [
+                ("信用评估", "history"),
+                ("图神经网络", "pending"),
+                ("系统调度", "history"),
+            ],
+        )
         app = create_app(store)
         client = app.test_client()
 

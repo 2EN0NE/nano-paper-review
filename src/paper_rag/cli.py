@@ -12,15 +12,13 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
 
 import typer
 
-from paper_rag.store import Store
-from paper_rag.server import create_app
-from paper_rag.orchestrator import run_pipeline
 from paper_rag.logging_config import setup_logging
-
+from paper_rag.orchestrator import run_pipeline
+from paper_rag.server import create_app
+from paper_rag.store import Store
 
 app = typer.Typer(help="paper-rag: 本地论文混合检索系统")
 
@@ -60,7 +58,7 @@ def index(
 @app.command()
 def search(
     query: str = typer.Argument(..., help="检索查询"),
-    pool_filter: Optional[str] = typer.Option(
+    pool_filter: str | None = typer.Option(
         None, "--pool", "-p", help="限定搜索池: history / pending"
     ),
     limit: int = typer.Option(5, "--limit", "-n", help="返回条数"),
@@ -140,22 +138,22 @@ def review(
         help="输入路径：单篇 PDF 或包含 PDF 的目录",
         exists=True,
     ),
-    log_level: Optional[str] = typer.Option(
+    log_level: str | None = typer.Option(
         None,
         "--log-level",
         help="日志级别: DEBUG / INFO / WARNING / ERROR",
     ),
-    log_dir: Optional[Path] = typer.Option(
+    log_dir: Path | None = typer.Option(
         None,
         "--log-dir",
         help="日志输出目录",
     ),
-    phase: Optional[str] = typer.Option(
+    phase: str | None = typer.Option(
         None,
         "--phase",
         help="仅运行指定阶段: pre / review / post",
     ),
-    step: Optional[str] = typer.Option(
+    step: str | None = typer.Option(
         None,
         "--step",
         "-s",

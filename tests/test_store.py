@@ -1,7 +1,7 @@
 """Store/SQLite 持久化层测试"""
 
-from paper_rag.store import Store, PaperMeta, Paper, Chunk, DocVector, ChunkVector
 from paper_rag.chunker import chunk_paper
+from paper_rag.store import Chunk, ChunkVector, DocVector, Paper, PaperMeta, Store
 
 
 def _make_sample_paper(fid: str, pool: str = "history") -> Paper:
@@ -145,8 +145,8 @@ class TestStore:
 
     def test_load_all_reopened(self):
         """持久化写入后重开 Store 能正确加载"""
-        import tempfile
         import os
+        import tempfile
 
         with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
             db_path = f.name

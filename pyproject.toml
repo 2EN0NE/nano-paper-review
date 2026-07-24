@@ -20,3 +20,39 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+exclude = ["prototype/", "scripts/", "pipeline/"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "N", "UP", "S"]
+ignore = [
+  "E501", # line-too-long: handled by formatter
+  "S101", # allow assert in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["S108"] # allow temp paths in tests
+"src/paper_rag/config.py" = ["UP045"] # pre-existing: Optional[X] style
+"src/paper_rag/models.py" = [
+  "F821",
+] # pre-existing: lazy import in type annotation
+"src/paper_rag/reranker.py" = [
+  "F821",
+] # pre-existing: lazy import in type annotation
+"src/paper_rag/orchestrator.py" = [
+  "S603",
+] # pre-existing: intended subprocess use
+"src/paper_rag/store.py" = ["S307"] # pre-existing: eval with DB data
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: tests that span multiple components (HTTP, filesystem, FAISS persistence)",
+]
