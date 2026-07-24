@@ -3,89 +3,16 @@
 @pytest.mark.integration: FAISS 持久化 + 向量检索集成测试
 """
 
-import math
 import os
 import tempfile
 
 import pytest
 
+from helpers import make_mock_chunk_vecs, make_sample_paper
 from paper_rag.chunker import chunk_paper
-from paper_rag.store import (
-    Chunk,
-    ChunkVector,
-    DocVector,
-    Paper,
-    PaperMeta,
-    Store,
-)
+from paper_rag.store import Store
 
 pytestmark = pytest.mark.integration
-
-
-def _make_sample_paper(fid: str, pool: str = "history") -> Paper:
-    """构造一个含确定性内容的测试 Paper（与 test_store.py 行为一致）"""
-    filename = f"2023_张三_{fid}.pdf"
-    text = "\n\n".join(
-        [
-            f"标题：{fid}方法研究",
-            "摘  要",
-            f"本文提出了一种{fid}方法，结合了深度学习和传统模型。",
-            f"实验结果表明，{fid}方法在多个数据集上表现优异。",
-            "",
-            "1  引言",
-            f"近年来，{fid}领域取得了显著进展。",
-            "参考文献",
-        ]
-    )
-    meta = PaperMeta(
-        filename=filename,
-        title_hint=fid,
-        year=2023,
-        author_hint="张三",
-    )
-    return Paper(
-        paper_id=f"test_{fid.lower()}",
-        filepath=f"data/history/{filename}",
-        meta=meta,
-        raw_text=text,
-        pages=2,
-        pool=pool,
-    )
-
-
-def _make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> tuple[list[ChunkVector], DocVector]:
-    """构造模拟向量（确定性浮点数序列）"""
-    import hashlib
-
-    def _hash_vec(text: str) -> list[float]:
-        h = hashlib.sha256(text.encode()).digest()
-        vec = []
-        for i in range(dim):
-            v = (h[i % 32] / 255.0) * 2 - 1
-            vec.append(v)
-        norm = math.sqrt(sum(x * x for x in vec))
-        return [x / (norm + 1e-8) for x in vec]
-
-    cvs = []
-    total_weight = 0.0
-    weighted = [0.0] * dim
-    for c in chunks:
-        v = _hash_vec(c.text)
-        cvs.append(ChunkVector(chunk_id=c.chunk_id, vector=v, dim=dim))
-        for i in range(dim):
-            weighted[i] += v[i] * c.position_weight
-        total_weight += c.position_weight
-
-    doc_vec = [v / total_weight for v in weighted]
-    norm = math.sqrt(sum(x * x for x in doc_vec))
-    doc_vec = [x / (norm + 1e-8) for x in doc_vec]
-
-    dv = DocVector(
-        paper_id=chunks[0].paper_id,
-        vector=doc_vec,
-        dim=dim,
-    )
-    return cvs, dv
 
 
 # ============================================================================
@@ -125,9 +52,9 @@ class TestFaissAddAndSearch:
         store.init_faiss(dim=4)
 
         for pid in paper_ids:
-            paper = _make_sample_paper(pid)
+            paper = make_sample_paper(pid)
             chunks = chunk_paper(paper)
-            cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+            cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
             store.add_paper(paper, cvs, dv)
 
         return store
@@ -182,9 +109,9 @@ class TestFaissAddAndSearch:
         store = self._setup_with_faiss(["信用评估"])
         assert store._faiss_papers.ntotal == 1
 
-        paper = _make_sample_paper("图神经网络")
+        paper = make_sample_paper("图神经网络")
         chunks = chunk_paper(paper)
-        cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+        cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
         store.add_paper(paper, cvs, dv)
 
         assert store._faiss_papers.ntotal == 2
@@ -202,9 +129,9 @@ class TestFaissPersistence:
             # 写入
             store = Store(db_path)
             store.init_faiss(dim=4)
-            paper = _make_sample_paper("信用评估")
+            paper = make_sample_paper("信用评估")
             chunks = chunk_paper(paper)
-            cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+            cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
             store.add_paper(paper, cvs, dv)
             store.save_faiss()
             store.close()
@@ -238,9 +165,9 @@ class TestFaissPersistence:
             db_path = os.path.join(tmpdir, "test.sqlite")
             store = Store(db_path)
             store.init_faiss(dim=4)
-            paper = _make_sample_paper("信用评估")
+            paper = make_sample_paper("信用评估")
             chunks = chunk_paper(paper)
-            cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+            cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
             store.add_paper(paper, cvs, dv)
             store.save_faiss()
             store.close()
@@ -259,9 +186,9 @@ class TestFaissIntegration:
         store.init_faiss(dim=4)
 
         for name in ["信用评估", "图神经网络", "系统调度"]:
-            paper = _make_sample_paper(name)
+            paper = make_sample_paper(name)
             chunks = chunk_paper(paper)
-            cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+            cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
             store.add_paper(paper, cvs, dv)
 
         assert store._faiss_papers.ntotal == 3
@@ -279,9 +206,9 @@ class TestFaissIntegration:
             db_path = os.path.join(tmpdir, "test.sqlite")
             store = Store(db_path)
             store.init_faiss(dim=4)
-            paper = _make_sample_paper("信用评估")
+            paper = make_sample_paper("信用评估")
             chunks = chunk_paper(paper)
-            cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+            cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
             store.add_paper(paper, cvs, dv)
             store.save_faiss()
             store.close()
@@ -298,9 +225,9 @@ class TestFaissIntegration:
     def test_vector_search_fallback_when_no_faiss(self):
         """无 FAISS 时 _vector_search 回退到暴力搜索"""
         store = Store(":memory:")
-        paper = _make_sample_paper("信用评估")
+        paper = make_sample_paper("信用评估")
         chunks = chunk_paper(paper)
-        cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+        cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
         store.add_paper(paper, cvs, dv)
 
         # FAISS 未初始化，应有暴力搜索的结果

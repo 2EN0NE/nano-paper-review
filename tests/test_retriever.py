@@ -5,91 +5,17 @@ and the full hybrid search pipeline.
 @pytest.mark.integration: 跨组件（BM25 + vector + RRF）混合检索集成测试
 """
 
-import math
-
 import pytest
 
+from helpers import make_mock_chunk_vecs, make_sample_paper
 from paper_rag.chunker import chunk_paper
 from paper_rag.retriever import rrf_fuse
 from paper_rag.store import (
-    Chunk,
-    ChunkVector,
-    DocVector,
-    Paper,
-    PaperMeta,
     SearchResult,
     Store,
 )
 
 pytestmark = pytest.mark.integration
-
-# ============================================================================
-# 测试 Helpers
-# ============================================================================
-
-
-def _make_sample_paper(fid: str, pool: str = "history") -> Paper:
-    filename = f"2023_张三_{fid}.pdf"
-    text = "\n\n".join(
-        [
-            f"标题：{fid}方法研究",
-            "摘  要",
-            f"本文提出了一种{fid}方法，结合了深度学习和传统模型。",
-            f"实验结果表明，{fid}方法在多个数据集上表现优异。",
-            "",
-            "1  引言",
-            f"近年来，{fid}领域取得了显著进展。",
-            "参考文献",
-        ]
-    )
-    meta = PaperMeta(
-        filename=filename,
-        title_hint=fid,
-        year=2023,
-        author_hint="张三",
-    )
-    return Paper(
-        paper_id=f"test_{fid.lower()}",
-        filepath=f"data/history/{filename}",
-        meta=meta,
-        raw_text=text,
-        pages=2,
-        pool=pool,
-    )
-
-
-def _make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> tuple[list[ChunkVector], DocVector]:
-    import hashlib
-
-    def _hash_vec(text: str) -> list[float]:
-        h = hashlib.sha256(text.encode()).digest()
-        vec = []
-        for i in range(dim):
-            v = (h[i % 32] / 255.0) * 2 - 1
-            vec.append(v)
-        norm = math.sqrt(sum(x * x for x in vec))
-        return [x / (norm + 1e-8) for x in vec]
-
-    cvs = []
-    total_weight = 0.0
-    weighted = [0.0] * dim
-    for c in chunks:
-        v = _hash_vec(c.text)
-        cvs.append(ChunkVector(chunk_id=c.chunk_id, vector=v, dim=dim))
-        for i in range(dim):
-            weighted[i] += v[i] * c.position_weight
-        total_weight += c.position_weight
-
-    doc_vec = [v / total_weight for v in weighted]
-    norm = math.sqrt(sum(x * x for x in doc_vec))
-    doc_vec = [x / (norm + 1e-8) for x in doc_vec]
-
-    dv = DocVector(
-        paper_id=chunks[0].paper_id,
-        vector=doc_vec,
-        dim=dim,
-    )
-    return cvs, dv
 
 
 def _setup_store_with_papers(paper_defs: list[tuple[str, str]]) -> Store:
@@ -97,9 +23,9 @@ def _setup_store_with_papers(paper_defs: list[tuple[str, str]]) -> Store:
     store = Store(":memory:")
     store.init_faiss(dim=4)
     for fid, pool in paper_defs:
-        paper = _make_sample_paper(fid, pool)
+        paper = make_sample_paper(fid, pool)
         chunks = chunk_paper(paper)
-        cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+        cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
         store.add_paper(paper, cvs, dv)
     return store
 

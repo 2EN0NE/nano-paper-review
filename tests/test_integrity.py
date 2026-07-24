@@ -5,98 +5,15 @@ T5: 索引完整性测试 —— 内容去重、配置加载、向量重建
 """
 
 import hashlib
-import math
 
 import pytest
 
+from helpers import make_fake_content, make_mock_chunk_vecs, make_paper
 from paper_rag.chunker import chunk_paper
 from paper_rag.config import Config
-from paper_rag.store import (
-    Chunk,
-    ChunkVector,
-    DocVector,
-    Paper,
-    PaperMeta,
-    Store,
-)
+from paper_rag.store import Paper, PaperMeta, Store
 
 pytestmark = pytest.mark.integration
-
-# ============================================================================
-# 辅助函数
-# ============================================================================
-
-
-def _make_fake_content(seed: str) -> str:
-    """生成确定性文本内容"""
-    return "\n\n".join(
-        [
-            f"标题：{seed}方法研究",
-            "摘  要",
-            f"本文提出了一种{seed}方法，结合了深度学习和传统模型。",
-            f"实验结果表明，{seed}方法在多个数据集上表现优异。",
-            "",
-            "1  引言",
-            f"近年来，{seed}领域取得了显著进展。",
-            "参考文献",
-        ]
-    )
-
-
-def _make_paper(pid: str, filename: str, seed: str, pool: str = "history") -> Paper:
-    content = _make_fake_content(seed)
-    meta = PaperMeta(
-        filename=filename,
-        title_hint=seed,
-        year=2023,
-        author_hint="张三",
-    )
-    return Paper(
-        paper_id=pid,
-        filepath=f"data/history/{filename}",
-        meta=meta,
-        raw_text=content,
-        pages=2,
-        pool=pool,
-    )
-
-
-def _make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> tuple[list[ChunkVector], DocVector]:
-    """为 chunk 列表生成确定性模拟向量（小维度，用于测试）"""
-
-    def _hash_vec(text: str) -> list[float]:
-        h = hashlib.sha256(text.encode()).digest()
-        vec = []
-        for i in range(dim):
-            v = (h[i % 32] / 255.0) * 2 - 1
-            vec.append(v)
-        norm = math.sqrt(sum(x * x for x in vec))
-        return [x / (norm + 1e-8) for x in vec]
-
-    cvs = []
-    total_weight = 0.0
-    weighted = [0.0] * dim
-    for c in chunks:
-        v = _hash_vec(c.text)
-        cvs.append(ChunkVector(chunk_id=c.chunk_id, vector=v, dim=dim))
-        for i in range(dim):
-            weighted[i] += v[i] * c.position_weight
-        total_weight += c.position_weight
-
-    if total_weight > 0:
-        doc_vec = [v / total_weight for v in weighted]
-    else:
-        doc_vec = weighted[:]
-    norm = math.sqrt(sum(x * x for x in doc_vec))
-    if norm > 1e-8:
-        doc_vec = [x / norm for x in doc_vec]
-
-    dv = DocVector(
-        paper_id=chunks[0].paper_id,
-        vector=doc_vec,
-        dim=dim,
-    )
-    return cvs, dv
 
 
 # ============================================================================
@@ -110,7 +27,7 @@ class TestContentDedup:
     def test_same_content_different_filename(self):
         """同一篇内容以不同文件名入库 → 仅存元数据，跳过向量"""
         store = Store(":memory:")
-        content = _make_fake_content("深度学习")
+        content = make_fake_content("深度学习")
         meta1 = PaperMeta(filename="v1.pdf", title_hint="深度学习", year=2023, author_hint="张三")
         paper1 = Paper(
             paper_id="p1",
@@ -133,7 +50,7 @@ class TestContentDedup:
 
         # 先加载相同的 chunker 分块
         chunks1 = chunk_paper(paper1)
-        cvs1, dv1 = _make_mock_chunk_vecs(chunks1)
+        cvs1, dv1 = make_mock_chunk_vecs(chunks1)
         store.add_paper(paper1, cvs1, dv1)
 
         # 记录去重前的计数
@@ -143,7 +60,7 @@ class TestContentDedup:
 
         # 相同内容的不同文件
         chunks2 = chunk_paper(paper2)
-        cvs2, dv2 = _make_mock_chunk_vecs(chunks2)
+        cvs2, dv2 = make_mock_chunk_vecs(chunks2)
         store.add_paper(paper2, cvs2, dv2)
 
         # 验证：论文元数据增加，向量条目不变
@@ -161,14 +78,14 @@ class TestContentDedup:
     def test_dedup_skips_doc_vector_faiss(self):
         """去重后 paper 可被 BM25 搜索到（元数据+chunks 已存）但不进入向量索引"""
         store = Store(":memory:")
-        content = _make_fake_content("图神经网络")
+        content = make_fake_content("图神经网络")
 
-        paper1 = _make_paper("p1", "gnn_v1.pdf", "图神经网络")
-        paper2 = _make_paper("p2", "gnn_v2.pdf", "图神经网络")
+        paper1 = make_paper("p1", "gnn_v1.pdf", "图神经网络")
+        paper2 = make_paper("p2", "gnn_v2.pdf", "图神经网络")
 
         for p in [paper1, paper2]:
             chunks = chunk_paper(p)
-            cvs, dv = _make_mock_chunk_vecs(chunks)
+            cvs, dv = make_mock_chunk_vecs(chunks)
             store.add_paper(p, cvs, dv)
 
         # BM25 应该能搜到两个文件名
@@ -193,12 +110,12 @@ class TestContentDedup:
     def test_dedup_content_hash_stored(self):
         """内容去重表记录正确的哈希值"""
         store = Store(":memory:")
-        content = _make_fake_content("系统调度")
+        content = make_fake_content("系统调度")
         expected_hash = hashlib.sha256(content.encode()).hexdigest()
 
-        paper = _make_paper("p1", "sched.pdf", "系统调度")
+        paper = make_paper("p1", "sched.pdf", "系统调度")
         chunks = chunk_paper(paper)
-        cvs, dv = _make_mock_chunk_vecs(chunks)
+        cvs, dv = make_mock_chunk_vecs(chunks)
         store.add_paper(paper, cvs, dv)
 
         assert expected_hash in store.content_hashes
@@ -209,16 +126,16 @@ class TestContentDedup:
     def test_force_reindex_bypasses_dedup(self):
         """force_reindex=True 时跳过去重检测，正常建立完整索引"""
         store = Store(":memory:")
-        content = _make_fake_content("信用评估")
+        content = make_fake_content("信用评估")
 
-        paper1 = _make_paper("p1", "credit_v1.pdf", "信用评估")
+        paper1 = make_paper("p1", "credit_v1.pdf", "信用评估")
         chunks1 = chunk_paper(paper1)
-        cvs1, dv1 = _make_mock_chunk_vecs(chunks1)
+        cvs1, dv1 = make_mock_chunk_vecs(chunks1)
         store.add_paper(paper1, cvs1, dv1)
 
-        paper2 = _make_paper("p2", "credit_v2.pdf", "信用评估")
+        paper2 = make_paper("p2", "credit_v2.pdf", "信用评估")
         chunks2 = chunk_paper(paper2)
-        cvs2, dv2 = _make_mock_chunk_vecs(chunks2)
+        cvs2, dv2 = make_mock_chunk_vecs(chunks2)
         store.add_paper(paper2, cvs2, dv2, force_reindex=True)
 
         # force_reindex 下应该建立完整索引（包括向量）
@@ -332,7 +249,7 @@ class TestRebuildDocVectors:
             pool="history",
         )
         chunks = chunk_paper(paper)
-        cvs, dv = _make_mock_chunk_vecs(chunks, dim=4)
+        cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
         store.add_paper(paper, cvs, dv)
 
     def test_rebuild_empty_store(self):
@@ -404,7 +321,7 @@ class TestRebuildDocVectors:
     def test_rebuild_requires_chunk_vectors(self):
         """没有 chunk 向量的论文在重建时被跳过"""
         store = Store(":memory:")
-        paper = _make_paper("p1", "test.pdf", "测试")
+        paper = make_paper("p1", "test.pdf", "测试")
 
         # 手动添加 paper 和 chunks 但不加 chunk_vectors
         chunks = chunk_paper(paper)
@@ -430,9 +347,9 @@ class TestLoadAllFingerprint:
             db_path = f.name
         try:
             store = Store(db_path)
-            paper = _make_paper("p1", "test.pdf", "信用评估")
+            paper = make_paper("p1", "test.pdf", "信用评估")
             chunks = chunk_paper(paper)
-            cvs, dv = _make_mock_chunk_vecs(chunks)
+            cvs, dv = make_mock_chunk_vecs(chunks)
             store.add_paper(paper, cvs, dv)
             store.close()
 
@@ -456,9 +373,9 @@ class TestLoadAllFingerprint:
             db_path = f.name
         try:
             store = Store(db_path)
-            paper = _make_paper("p1", "test.pdf", "信用评估")
+            paper = make_paper("p1", "test.pdf", "信用评估")
             chunks = chunk_paper(paper)
-            cvs, dv = _make_mock_chunk_vecs(chunks)
+            cvs, dv = make_mock_chunk_vecs(chunks)
             store.add_paper(paper, cvs, dv)
             store.close()
 

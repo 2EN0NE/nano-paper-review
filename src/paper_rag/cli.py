@@ -145,8 +145,9 @@ def search(
         typer.echo("无匹配结果")
         return
 
-    typer.echo(f"\n找到 {len(results)} 条结果:\n")
-    for i, r in enumerate(results):
+    display = results[:limit]
+    typer.echo(f"\n找到 {len(display)} 条结果:\n")
+    for i, r in enumerate(display):
         typer.echo(f"  {i + 1}. [{r.pool}] {r.score:.4f}  {r.title_hint}")
         typer.echo(f"      文件: {r.filename}")
         if r.author_hint:
