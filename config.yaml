@@ -1,0 +1,33 @@
+# paper-rag 配置文件
+# 参考 src/paper_rag/config.py 中的 Config 模型查看所有可用字段
+# 环境变量覆盖：PAPER_RAG_XXX（优先级高于 YAML）
+
+# --- 数据目录 ---
+# 索引存储目录（SQLite + FAISS）
+index_dir: ./data/index
+
+# PDF 论文目录（供 index 命令扫描）
+pdf_dir: ./data/history
+
+# 模型缓存目录（离线部署时指向打包的 models/ 目录）
+model_cache_dir: ~/.cache/paper-rag/models
+
+# --- 分块参数 ---
+chunk_size: 512
+chunk_overlap: 128
+
+# --- 加权 Mean Pooling ---
+head_weight: 5.0
+body_weight: 2.0
+tail_weight: 4.0
+head_ratio: 0.15
+tail_ratio: 0.10
+
+# --- 检索参数 ---
+recall_k: 50          # RRF 融合后的候选数
+final_top_n: 5        # Reranker 精排后的最终返回数
+rrf_k: 60             # RRF 融合常量
+
+# --- 模型选择 ---
+# embedding_model: BAAI/bge-small-zh-v1.5
+# reranker_model: BAAI/bge-reranker-v2-m3

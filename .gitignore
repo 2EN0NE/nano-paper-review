@@ -206,6 +206,11 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Offline deployment artifacts
+models_cache/
+offline_packages/
+dist/
+
 # PyPI configuration file
 .pypirc
 
@@ -214,5 +219,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+data/index/*.sqlite
+prototype_index.sqlite
+
 # Streamlit
 .streamlit/secrets.toml
+
+# Agent
+.pi/
