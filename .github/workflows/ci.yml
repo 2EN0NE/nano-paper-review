@@ -83,17 +83,11 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install with uv
+      - name: Install with uv & run e2e smoke tests
         run: |
           pip install uv
-          uv pip install pytest
-          uv pip install -e .
-
-      - name: Verify CLI entry point
-        run: paper-review --help
-
-      - name: Verify python -m module
-        run: python -m paper_rag --help
-
-      - name: Run e2e smoke tests
-        run: python -m pytest tests/e2e/ -v -m e2e
+          uv pip install --system pytest
+          uv pip install --system -e .
+          paper-review --help
+          python -m paper_rag --help
+          python -m pytest tests/e2e/ -v -m e2e
