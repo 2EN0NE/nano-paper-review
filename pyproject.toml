@@ -5,14 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "paper-rag"
 version = "0.1.0"
-description = "Local paper retrieval service - hybrid BM25 + vector search for review pipelines"
+description = "Offline paper review pipeline — BM25 + FAISS hybrid search + ONNX reranker"
 requires-python = ">=3.10"
 dependencies = [
   "pymupdf>=1.23.0",
   "typer>=0.9.0",
   "pydantic>=2.0.0",
   "faiss-cpu>=1.7.0",
-  "sentence-transformers>=2.2.0",
+  "onnxruntime>=1.15.0",
+  "tokenizers>=0.15.0",
   "rank-bm25>=0.2.0",
   "flask>=2.3.0",
   "pyyaml>=6.0",
@@ -40,12 +41,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["S108"] # allow temp paths in tests
 "src/paper_rag/config.py" = ["UP045"] # pre-existing: Optional[X] style
-"src/paper_rag/models.py" = [
-  "F821",
-] # pre-existing: lazy import in type annotation
-"src/paper_rag/reranker.py" = [
-  "F821",
-] # pre-existing: lazy import in type annotation
+# (models.py and reranker.py no longer use lazy type imports)
 "src/paper_rag/orchestrator.py" = [
   "S603",
 ] # pre-existing: intended subprocess use

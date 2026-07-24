@@ -30,7 +30,8 @@ src/paper_rag/
 ├── indexer.py          # build_index：分块 → embedding → Mean Pooling → FAISS
 ├── models.py           # bge-small-zh-v1.5 embedding 模型管理
 ├── retriever.py        # BM25 + Vector → RRF → (可选) Cross-Encoder 精排
-├── reranker.py         # bge-reranker-v2-m3 精排封装
+├── embedder.py          # ONNX Runtime 嵌入引擎（CPU-only）
+├── reranker.py         # ONNX Runtime 精排（CPU-only）
 ├── server.py           # Flask HTTP API
 ├── config.py           # Pydantic 配置加载
 └── cli.py              # paper-review CLI（Typer）
@@ -52,6 +53,10 @@ pipeline/
 - **CLI**：Typer 框架，`paper-review` 统一入口。新增子命令时，docstring 即为 `--help` 文案，必须写清用法和选项含义。
 
 ## 关键设计决策
+
+### CPU‑only 优先（无 GPU / 无 CUDA）
+
+本项目从诞生之初就面向 **2C/4G 无 GPU 的 Linux 机器**。所有模型推理使用 ONNX Runtime (CPU)，**零 PyTorch / CUDA 依赖**。embedding 和 reranker 模型需在开发机上通过 ``scripts/export_onnx.py``（需要 torch，只需执行一次）导出为 ONNX 格式，生产环境仅安装 ``onnxruntime`` + ``tokenizers``（~30MB 依赖，对比 PyTorch CUDA 的 ~2GB）。
 
 详细讨论见 `SPEC.md`，此处仅列要点：
 

@@ -7,8 +7,11 @@
 ## 快速开始
 
 ```bash
-# 安装
+# 安装（零 PyTorch / CUDA，仅 ~30MB 推理依赖）
 pip install -e .
+
+# 0. 导出模型为 ONNX 格式（开发机执行一次，需要 PyTorch）
+python scripts/export_onnx.py
 
 # 1. 将历史论文建索引（评审前必须）
 paper-review index --pdf-dir ./data/history
@@ -22,6 +25,9 @@ paper-review search "深度学习信用评估"    # 快速检索
 paper-review status                      # 索引状态
 paper-review serve --port 8765           # HTTP API
 ```
+
+> **CPU-only 设计**：所有模型推理使用 ONNX Runtime，无需 PyTorch / CUDA。
+> embedding 模型约 100MB，reranker 模型约 1.1GB（fp16 等效），总内存约 2-2.5GB。
 
 第一次使用？`paper-review --help` 查看所有命令，`paper-review <cmd> --help` 查看子命令用法。
 
@@ -180,10 +186,14 @@ export PAPER_RAG_CHUNK_SIZE=256
 
 目标机器：2C/4G 无 GPU、Debian Linux、Python 3.12+。
 
+本项目所有模型推理使用 **ONNX Runtime (CPU)**，无需 PyTorch / CUDA。
+ONNX 文件在开发机上通过 ``export_onnx.py`` 导出（需要 torch，只需执行一次），
+生产环境仅安装 ``onnxruntime`` + ``tokenizers``（~30MB 依赖）。
+
 ### 有网机器：打包
 
 ```bash
-# 下载模型 + 打包依赖
+# 1. 导出模型为 ONNX + 打包离线依赖
 python scripts/download_models.py --cache-dir ./models_cache
 bash scripts/offline_pack.sh --cache-dir ./models_cache --output-dir ./dist/offline
 
@@ -240,8 +250,9 @@ nano-paper-review/
 │   ├── chunker.py            # 分块
 │   ├── indexer.py            # 索引构建
 │   ├── retriever.py          # 检索管道
-│   ├── reranker.py           # Cross-Encoder 精排
-│   └── models.py             # Embedding 模型管理
+│   ├── embedder.py           # ONNX Runtime 嵌入引擎（CPU-only）
+│   ├── reranker.py           # ONNX Runtime 精排（CPU-only）
+│   └── models.py             # Embedding 模型管理层
 └── tests/
 ```
 

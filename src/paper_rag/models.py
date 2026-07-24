@@ -1,16 +1,33 @@
 """
-Embedding model management — lazy loading of sentence-transformers models.
+Embedding model management — CPU-only via ONNX Runtime.
 
-Provides EmbeddingModelManager for loading and using the bge-small-zh-v1.5 model.
-The model is only loaded when load() is first called, avoiding heavy dependencies
-at import time for components that don't need embeddings.
+Provides :class:`EmbeddingModelManager` for loading and using the
+bge-small-zh-v1.5 embedding model through ONNX Runtime.  No PyTorch
+or CUDA packages are required at runtime.
+
+The embedding model must be exported to ONNX format first via
+``scripts/export_onnx.py``.  When no ONNX model is available, the manager
+falls back to ``deterministic_hash_vector`` — a seeded hash-based
+pseudo-embedding suitable for development and testing only.
+
+Design
+------
+- **Production (CPU-only)**: Export ``BAAI/bge-small-zh-v1.5`` to ONNX
+  once (requires torch on dev machine).  The runtime loads the ONNX file
+  and tokenizer, runs inference via ``onnxruntime.InferenceSession``, and
+  does mean-pooling + L2 normalisation in numpy.
+- **Development / testing**: No model needed — deterministic hash provides
+  reproducible pseudo-embeddings for non-vector tests.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
+
+from paper_rag.config import Config, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -22,18 +39,26 @@ VECTOR_DIM = 512
 class EmbeddingModelManager:
     """Manages the embedding model lifecycle with lazy loading.
 
+    Uses ONNX Runtime when the exported model is available on disk.
+    Falls back to deterministic hash pseudo-embeddings otherwise.
+
     Usage::
 
-        mgr = EmbeddingModelManager()
-        mgr.load()                     # explicit load (returns model)
-        vecs = mgr.encode(["text1"])   # implicit load
-        print(mgr.embed_fingerprint)   # "BAAI/bge-small-zh-v1.5/dim=512"
+        mgr = EmbeddingModelManager(config=my_config)
+        mgr.load()
+        vecs = mgr.encode(["text1"])   # np.ndarray (1, 512)
+        print(mgr.embed_fingerprint)   # "bge-small-zh-v1.5/dim=512"
     """
 
-    def __init__(self, model_name: str = MODEL_NAME):
+    def __init__(
+        self,
+        model_name: str = MODEL_NAME,
+        config: Config | None = None,
+    ):
         self._model_name = model_name
-        self._model: SentenceTransformer | None = None
+        self._config = config or load_config()
         self._dim = VECTOR_DIM
+        self._embedder: _OnnxEmbedderWrapper | None = None
 
     # ---- properties ----
 
@@ -43,7 +68,7 @@ class EmbeddingModelManager:
 
     @property
     def embed_fingerprint(self) -> str:
-        """Return fingerprint string for compatibility checks."""
+        """Fingerprint string for compatibility checks."""
         return f"{self._model_name}/dim={self._dim}"
 
     @property
@@ -53,33 +78,87 @@ class EmbeddingModelManager:
     # ---- loading ----
 
     def load(self):
-        """Load the embedding model (lazy, cached). Returns the model instance."""
-        if self._model is not None:
-            return self._model
+        """Load the embedding model (lazy, cached).
 
-        logger.info("Loading embedding model: %s", self._model_name)
-        from sentence_transformers import SentenceTransformer
+        Tries to load the ONNX Runtime embedder from the configured
+        ``model_cache_dir``.  If the ONNX model is not available, a
+        warning is logged and subsequent ``encode()`` calls use
+        deterministic hash fallback.
+        """
+        if self._embedder is not None:
+            return True
 
-        self._model = SentenceTransformer(self._model_name)
-        self._dim = self._model.get_sentence_embedding_dimension()
-        logger.info("Model loaded: dim=%d", self._dim)
-        return self._model
+        model_cache_dir = Path(self._config.model_cache_dir)
+        onnx_dir = model_cache_dir / self._model_name.replace("/", "--")
+
+        if (onnx_dir / "model.onnx").exists():
+            from paper_rag.embedder import OnnxEmbedder
+
+            self._embedder = _OnnxEmbedderWrapper(
+                OnnxEmbedder(model_dir=onnx_dir),
+            )
+            self._embedder.load()
+            self._dim = self._embedder.dim
+            logger.info(
+                "Embedding model loaded via ONNX Runtime: %s (dim=%d)",
+                self._model_name,
+                self._dim,
+            )
+            return True
+
+        logger.warning(
+            "ONNX model not found at %s. "
+            "Run `python scripts/export_onnx.py --model %s` first. "
+            "Falling back to deterministic hash (dev/test only).",
+            onnx_dir,
+            self._model_name,
+        )
+        return True
 
     # ---- encoding ----
 
     def encode(self, texts: list[str]) -> np.ndarray:
-        """Encode texts into L2-normalized embeddings.
+        """Encode texts to L2-normalized embeddings.
 
         Args:
             texts: List of text strings to encode.
 
         Returns:
-            np.ndarray of shape (len(texts), dim), float32, L2-normalized.
+            np.ndarray of shape ``(len(texts), dim)``, float32, L2-normalized.
         """
-        model = self.load()
-        embeddings = model.encode(
-            texts,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        return np.asarray(embeddings, dtype=np.float32)
+        if self._embedder is not None and self._embedder.is_loaded:
+            return self._embedder.encode(texts)
+
+        # Fallback: deterministic hash
+        from paper_rag.store import deterministic_hash_vector
+
+        self.load()
+        return np.array([deterministic_hash_vector(t, self._dim) for t in texts], dtype=np.float32)
+
+
+# ============================================================================
+# Internal wrapper — keeps the interface clean while deferring to OnnxEmbedder
+# ============================================================================
+
+
+class _OnnxEmbedderWrapper:
+    """Thin wrapper around OnnxEmbedder to match the expected interface."""
+
+    def __init__(self, embedder):
+        self._embedder = embedder
+        self._loaded = False
+
+    def load(self):
+        self._embedder.load()
+        self._loaded = True
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    @property
+    def dim(self) -> int:
+        return self._embedder.dim
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        return self._embedder.encode(texts)
