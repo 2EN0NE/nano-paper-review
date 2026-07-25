@@ -11,7 +11,9 @@ import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -20,10 +22,122 @@ from paper_rag.logging_config import get_logger
 
 logger = get_logger("orchestrator")
 
+# Pool 配置的硬上限
+_POOL_WORKERS_MAX = 64
+
 
 # ============================================================================
 # 数据模型
 # ============================================================================
+
+
+@dataclass
+class PoolProgressEvent:
+    """单个进度事件。"""
+
+    event_type: str  # 'subject_start' | 'subject_complete' | 'subject_fail'
+    subject: str = ""
+    timestamp: str = ""
+    step_count: int = 0
+    error: str = ""
+
+
+class PoolProgress:
+    """Worker 池进度跟踪器。
+
+    收集 Subject 级别的事件（开始/完成/失败），
+    供 CLI 实时展示或测试验证。
+    """
+
+    def __init__(self):
+        self.events: list[PoolProgressEvent] = []
+
+    def on_subject_start(self, subject: str) -> None:
+        self.events.append(
+            PoolProgressEvent(
+                event_type="subject_start",
+                subject=subject,
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+            )
+        )
+
+    def on_subject_complete(self, subject: str, step_results: list) -> None:
+        self.events.append(
+            PoolProgressEvent(
+                event_type="subject_complete",
+                subject=subject,
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+                step_count=len(step_results),
+            )
+        )
+
+    def on_subject_fail(self, subject: str, status: str, error: str) -> None:
+        self.events.append(
+            PoolProgressEvent(
+                event_type="subject_fail",
+                subject=subject,
+                timestamp=datetime.now().isoformat(timespec="seconds"),
+                error=error,
+            )
+        )
+
+    @property
+    def total(self) -> int:
+        return len([e for e in self.events if e.event_type == "subject_start"])
+
+    @property
+    def completed(self) -> int:
+        return len([e for e in self.events if e.event_type == "subject_complete"])
+
+    @property
+    def failed(self) -> int:
+        return len([e for e in self.events if e.event_type == "subject_fail"])
+
+    @property
+    def pending(self) -> int:
+        return self.total - self.completed - self.failed
+
+    def summary(self) -> str:
+        return f"{self.total} total, {self.completed} \u2713, {self.failed} \u2717, {self.pending} pending"
+
+
+@dataclass
+class PoolConfig:
+    """Worker 池化配置——Review Phase 中多 Subject 并行处理。
+
+    Attributes:
+        workers: 最大并发 Worker 数。
+                  设为 0 自动根据 CPU 核数推导（上限 64）。
+                  设为 1 退化为顺序执行。
+        timeout: 单个 Subject 超时秒数（0 = 无超时）。
+        ordered: 是否按 Subject 原始顺序返回结果（默认 True）。
+    """
+
+    workers: int = 5
+    timeout: int = 0
+    ordered: bool = True
+
+    def __post_init__(self):
+        # 自动推导：workers=0 时根据 CPU 核数
+        if self.workers == 0:
+            cpus = os.cpu_count() or 1
+            self.workers = min(cpus, _POOL_WORKERS_MAX)
+            logger.info("Auto-detected pool.workers=%d (from %d CPU(s))", self.workers, cpus)
+
+        # 下限
+        if self.workers < 1:
+            logger.warning("pool.workers=%d is too low, clamping to 1", self.workers)
+            self.workers = 1
+
+        # 上限
+        if self.workers > _POOL_WORKERS_MAX:
+            logger.warning(
+                "pool.workers=%d exceeds max %d, clamping to %d",
+                self.workers,
+                _POOL_WORKERS_MAX,
+                _POOL_WORKERS_MAX,
+            )
+            self.workers = _POOL_WORKERS_MAX
 
 
 @dataclass
@@ -58,6 +172,7 @@ class PhaseConfig:
 @dataclass
 class ReviewPhaseConfig(PhaseConfig):
     subject_order: SubjectOrderConfig = field(default_factory=SubjectOrderConfig)
+    pool: PoolConfig = field(default_factory=PoolConfig)
 
 
 @dataclass
@@ -86,6 +201,7 @@ class PipelineConfig:
 
         review_data = data.get("review", {"directory": ""})
         priority_data = review_data.get("subject_order", {}).get("priority")
+        pool_data = review_data.get("pool", {})
         review = ReviewPhaseConfig(
             directory=review_data.get("directory", ""),
             retry=RetryConfig(
@@ -96,6 +212,11 @@ class PipelineConfig:
                 sort_by=review_data.get("subject_order", {}).get("sort_by", "name"),
                 direction=review_data.get("subject_order", {}).get("direction", "asc"),
                 priority=SubjectOrderPriority(**priority_data) if priority_data else None,
+            ),
+            pool=PoolConfig(
+                workers=pool_data.get("workers", 5),
+                timeout=pool_data.get("timeout", 0),
+                ordered=pool_data.get("ordered", True),
             ),
         )
 
@@ -437,6 +558,218 @@ def _run_step(
 # ============================================================================
 
 
+def _process_single_subject(
+    subject: str,
+    steps: list[StepFile],
+    phase_name: str,
+    phase_config: PhaseConfig,
+    output_dir: Path,
+    base_env: dict,
+    progress: PoolProgress | None = None,
+) -> tuple[str, list[StepResult]]:
+    """处理单个 Subject 的所有 Step（供顺序/池化模式共用）。
+
+    每个 Subject 顺序执行全部 Steps，共享 prior_results 链。
+
+    Returns:
+        (subject_name, [StepResult, ...])
+    """
+    if progress:
+        progress.on_subject_start(subject)
+
+    subject_results: list[StepResult] = []
+
+    for step in steps:
+        # 构建 intermediates 路径
+        if phase_name == "review":
+            step_dir = output_dir / "intermediates" / subject / step.stem
+        else:
+            step_dir = output_dir / "intermediates" / phase_name / step.stem
+
+        env = {
+            **base_env,
+            "PIPELINE_PHASE": phase_name,
+            "PIPELINE_SUBJECT": subject,
+            "PIPELINE_STEP_NAME": step.stem,
+            "PIPELINE_INTERMEDIATES": str(output_dir / "intermediates"),
+        }
+
+        # 重试循环
+        result: StepResult | None = None
+        for attempt in range(1, phase_config.retry.max_attempts + 1):
+            logger.debug(
+                "  [%s] step %s attempt %d/%d",
+                subject,
+                step.stem,
+                attempt,
+                phase_config.retry.max_attempts,
+            )
+
+            try:
+                result = _run_step(
+                    step,
+                    step_dir,
+                    env,
+                    prior_results=subject_results,
+                    subject_name=subject,
+                )
+                result.subject = subject
+                result.attempt = attempt
+
+                if result.status in ("ok", "skipped"):
+                    break  # 不需要重试
+
+                logger.warning(
+                    "  [%s] step %s attempt %d failed: %s",
+                    subject,
+                    step.stem,
+                    attempt,
+                    result.error,
+                )
+
+            except Exception as e:
+                logger.error(
+                    "  [%s] step %s attempt %d raised exception: %s",
+                    subject,
+                    step.stem,
+                    attempt,
+                    e,
+                )
+                result = StepResult(
+                    step_name=step.stem,
+                    status="error",
+                    error=str(e),
+                    subject=subject,
+                    attempt=attempt,
+                )
+
+        if result is None:
+            result = StepResult(
+                step_name=step.stem,
+                status="error",
+                error="All attempts exhausted (no result)",
+                subject=subject,
+            )
+
+        subject_results.append(result)
+
+        if result.status == "error" and phase_config.retry.on_failure == "abort":
+            logger.error("Aborting pipeline for %s due to %s failure", subject, step.stem)
+            break
+
+    if progress:
+        progress.on_subject_complete(subject, subject_results)
+
+    return subject, subject_results
+
+
+def _run_subjects_pooled(
+    steps: list[StepFile],
+    subjects: list[str],
+    phase_config: ReviewPhaseConfig,
+    output_dir: Path,
+    base_env: dict,
+    progress: PoolProgress | None = None,
+) -> dict[str, list[StepResult]]:
+    """使用 Worker 池并发处理多个 Subject。
+
+    每个 Worker 负责一个 Subject 的全部 Steps（顺序执行）。
+    支持超时取消和进度回调。
+    """
+    pool_cfg = phase_config.pool
+    actual_workers = min(pool_cfg.workers, len(subjects))
+
+    logger.info(
+        "Pool mode: %d worker(s) processing %d subject(s)",
+        actual_workers,
+        len(subjects),
+    )
+
+    all_results: dict[str, list[StepResult]] = {}
+    errors: list[str] = []
+
+    # 手动管理 executor——超时时用 shutdown(wait=False) 避免阻塞
+    executor = ThreadPoolExecutor(max_workers=actual_workers)
+    try:
+        future_map = {}
+        for s in subjects:
+            fut = executor.submit(
+                _process_single_subject,
+                s,
+                steps,
+                "review",
+                phase_config,
+                output_dir,
+                base_env,
+                progress,
+            )
+            future_map[fut] = s
+
+        # 使用 wait() 轮询——避免 as_completed 在超时后仍等待 running future
+        pending = set(future_map.keys())
+        while pending:
+            poll_timeout = pool_cfg.timeout if pool_cfg.timeout > 0 else None
+            done, pending = wait(pending, timeout=poll_timeout)
+
+            for future in done:
+                subject = future_map[future]
+                try:
+                    _, results = future.result()
+                    all_results[subject] = results
+                    logger.debug("  Subject '%s' completed (%d steps)", subject, len(results))
+                except Exception as e:
+                    logger.error("  Subject '%s' failed: %s", subject, e)
+                    errors.append(subject)
+                    if progress:
+                        progress.on_subject_fail(subject, "error", str(e))
+                    error_results: list[StepResult] = []
+                    for step in steps:
+                        error_results.append(
+                            StepResult(
+                                step_name=step.stem,
+                                status="error",
+                                error=f"Pool worker failed: {e}",
+                                subject=subject,
+                            )
+                        )
+                    all_results[subject] = error_results
+
+            # 超时后有 pending future → 标记为超时失败
+            if pending:
+                logger.error("  %d subject(s) timed out after %ds", len(pending), pool_cfg.timeout)
+                for future in pending:
+                    subject = future_map[future]
+                    errors.append(subject)
+                    future.cancel()
+                    if progress:
+                        progress.on_subject_fail(
+                            subject, "timeout", f"Timed out after {pool_cfg.timeout}s"
+                        )
+                    error_results: list[StepResult] = []
+                    for step in steps:
+                        error_results.append(
+                            StepResult(
+                                step_name=step.stem,
+                                status="error",
+                                error=f"Timed out after {pool_cfg.timeout}s",
+                                subject=subject,
+                            )
+                        )
+                    all_results[subject] = error_results
+                break  # 不再继续轮询
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # 按原始顺序返回（pool_cfg.ordered）
+    if pool_cfg.ordered:
+        all_results = {s: all_results[s] for s in subjects if s in all_results}
+
+    if errors:
+        logger.warning("Pool mode finished with %d failed subject(s): %s", len(errors), errors)
+
+    return all_results
+
+
 def _run_phase_steps(
     steps: list[StepFile],
     phase_name: str,
@@ -444,37 +777,55 @@ def _run_phase_steps(
     phase_config: PhaseConfig,
     output_dir: Path,
     base_env: dict,
+    progress: PoolProgress | None = None,
 ) -> dict[str, list[StepResult]]:
     """运行阶段内的所有步骤。
+
+    Review Phase 支持 Worker 池并发（当 subjects > 1 且 pool.workers > 1 时），
+    Pre/Post Phase 保持顺序逐 Step 执行。
 
     Args:
         steps: 本阶段的 Step 列表。
         phase_name: 'pre' | 'review' | 'post'。
         subjects: Subject 名称列表（review 阶段逐篇，pre/post 批量）。
-        phase_config: 阶段配置（含 retry）。
+        phase_config: 阶段配置（含 retry + pool）。
         output_dir: 输出根目录。
         base_env: 基础环境变量。
+        progress: 可选的 PoolProgress 回调（仅 review phase 有效）。
 
     Returns:
         {subject_name: [StepResult, ...]}
     """
+    # Review Phase 且多 Subject 时启用池化
+    use_pool = (
+        phase_name == "review"
+        and isinstance(phase_config, ReviewPhaseConfig)
+        and phase_config.pool.workers > 1
+        and len(subjects) > 1
+    )
+
+    if use_pool:
+        # isinstance guard above guarantees phase_config is ReviewPhaseConfig here
+        review_cfg: ReviewPhaseConfig = phase_config  # type: ignore[assignment]
+        return _run_subjects_pooled(
+            steps=steps,
+            subjects=subjects,
+            phase_config=review_cfg,
+            output_dir=output_dir,
+            base_env=base_env,
+            progress=progress,
+        )
+
+    # 顺序执行模式（Pre/Post 单 Subject，或 Review 单 Subject/workers=1）
     all_results: dict[str, list[StepResult]] = {s: [] for s in subjects}
 
     for step in steps:
-        logger.info(
-            "Phase %s / Step %s — processing %d subject(s)",
-            phase_name,
-            step.stem,
-            len(subjects),
-        )
-
         for subject in subjects:
-            # 构建 intermediates 路径
-            if phase_name == "review":
-                step_dir = output_dir / "intermediates" / subject / step.stem
-            else:
-                step_dir = output_dir / "intermediates" / phase_name / step.stem
-
+            step_dir = (
+                output_dir / "intermediates" / subject / step.stem
+                if phase_name == "review"
+                else output_dir / "intermediates" / phase_name / step.stem
+            )
             env = {
                 **base_env,
                 "PIPELINE_PHASE": phase_name,
@@ -483,16 +834,8 @@ def _run_phase_steps(
                 "PIPELINE_INTERMEDIATES": str(output_dir / "intermediates"),
             }
 
-            # 重试循环
             result: StepResult | None = None
             for attempt in range(1, phase_config.retry.max_attempts + 1):
-                logger.debug(
-                    "  [%s] attempt %d/%d",
-                    subject,
-                    attempt,
-                    phase_config.retry.max_attempts,
-                )
-
                 try:
                     result = _run_step(
                         step,
@@ -503,12 +846,9 @@ def _run_phase_steps(
                     )
                     result.subject = subject
                     result.attempt = attempt
-
                     if result.status in ("ok", "skipped"):
-                        break  # 不需要重试
-
+                        break
                     logger.warning("  [%s] attempt %d failed: %s", subject, attempt, result.error)
-
                 except Exception as e:
                     logger.error("  [%s] attempt %d raised exception: %s", subject, attempt, e)
                     result = StepResult(
@@ -542,9 +882,13 @@ def _run_phase_steps(
 
 
 def _load_yaml(path: Path) -> dict:
-    """加载 YAML 文件，返回 dict。"""
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
+    """加载 YAML 文件，返回 dict。文件不存在或解析失败时返回空 dict。"""
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        logger.warning("Failed to load YAML from %s: %s", path, e)
+        return {}
 
 
 # ============================================================================
@@ -622,6 +966,7 @@ def run_pipeline(
     data_dir: str | None = None,
     target_phase: str | None = None,
     target_step: str | None = None,
+    pool_progress: PoolProgress | None = None,
 ) -> PipelineResult:
     """执行一条完整的 pipeline（三段式：Pre → Review → Post）。
 
@@ -633,6 +978,7 @@ def run_pipeline(
         data_dir: 数据目录（用于默认 output_dir 解析）。
         target_phase: 仅运行指定阶段（'pre' / 'review' / 'post'）。
         target_step: 仅运行指定步骤名（需已有中间产物）。
+        pool_progress: 可选的 PoolProgress 实例，接收 Worker 池进度事件。
 
     Returns:
         PipelineResult
@@ -667,7 +1013,7 @@ def run_pipeline(
     if output_dir:
         config.output_dir = output_dir
     elif data_dir:
-        # 从 data_dir 推导默认 output_dir
+        # 从 data_dir 推导默认 output_dir（仅程序化调用走此分支；CLI 永远传 output_dir=...）
         from paper_rag.config import resolve_data_dir
 
         dd = resolve_data_dir(data_dir)
@@ -690,6 +1036,22 @@ def run_pipeline(
     # 应用 Subject 排序
     subjects = _order_subjects(raw_subjects, config.review.subject_order)
     primary_subject = subjects[0]
+
+    # 从全局配置（config.yaml / env var）覆盖 pool 默认值
+    if pool_progress is None:
+        # 从环境变量读取 pool 默认覆盖
+        env_workers = os.environ.get("PAPER_RAG_POOL_WORKERS")
+        env_timeout = os.environ.get("PAPER_RAG_POOL_TIMEOUT")
+        if env_workers is not None:
+            try:
+                config.review.pool.workers = int(env_workers)
+            except ValueError:
+                pass
+        if env_timeout is not None:
+            try:
+                config.review.pool.timeout = int(env_timeout)
+            except ValueError:
+                pass
 
     logger.info("Pipeline '%s' starting — %d subject(s)", config.name, len(subjects))
     config.output_dir.mkdir(parents=True, exist_ok=True)
@@ -754,6 +1116,7 @@ def run_pipeline(
             phase_config=phase_cfg,
             output_dir=config.output_dir,
             base_env=base_env,
+            progress=pool_progress,
         )
         all_phase_results[phase_name] = phase_results
 

@@ -144,12 +144,32 @@ The primary test seam is the step file directory itself. Tests create temporary 
 
 The existing test suite (96 tests) uses `Store(":memory:")` as the primary seam for SQLite tests and deterministic text fixtures for chunker/metadata tests. The orchestrator tests follow the same pattern: inject controlled inputs, verify external outputs.
 
+### Pooled Subject Execution
+
+Review Phase 支持 Worker 池并发处理多个 Subject。
+
+- **触发条件**：`pool.workers > 1` 且 `subjects > 1`；否则退化为顺序执行。
+- **执行模型**：每个 Worker 对一个 Subject 顺序执行全部 Steps（不跨 Subject 共享 Step）。
+- **线程安全**：每个 Subject 写入独立的 `intermediates/{subject}/` 目录，Worker 间无文件竞争。
+- **超时控制**：`pool.timeout` 可设置单个 Subject 的整体超时。
+- **结果顺序**：`pool.ordered: true` 时按原始 Subject 顺序返回结果。
+- **Pre/Post Phase**：保持原有的批处理顺序执行模式。
+
+配置示例：
+
+```yaml
+review:
+  pool:
+    workers: 5
+    timeout: 0
+    ordered: true
+```
+
 ## Out of Scope
 
 - **Real pi agent execution**: Tests use mocked subprocess. Integration tests with real pi are deferred to a separate integration test suite.
 - **Agent observability**: This spec does not cover logging/monitoring of agent calls beyond file-based logs.
 - **Template variable user-defined globals**: The `template_vars` feature in pipeline.yaml is deferred to a future version after real-world usage reveals which globals are needed.
-- **Parallel/concurrent step execution**: All steps are sequential in this version. .md files can combine parallel-friendly dimensions into one file.
 - **Pipeline versioning/migration**: pipeline.yaml version field exists for future use but no migration logic is implemented.
 - **Email/notification on completion**: Out of scope for v1.
 

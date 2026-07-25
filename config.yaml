@@ -33,9 +33,9 @@ head_ratio: 0.15
 tail_ratio: 0.10
 
 # --- 检索参数 ---
-recall_k: 50 # RRF 融合后的候选数
-final_top_n: 5 # Reranker 精排后的最终返回数
-rrf_k: 60 # RRF 融合常量
+recall_k: 50          # RRF 融合后的候选数
+final_top_n: 5        # Reranker 精排后的最终返回数
+rrf_k: 60             # RRF 融合常量
 
 
 # --- 模型选择 ---

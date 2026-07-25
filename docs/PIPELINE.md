@@ -42,6 +42,10 @@ review:
     priority:               # 可选
       first: []
       last: []
+  pool:                     # Worker 池化配置
+    workers: 5              # 最大并发 Worker 数（默认 5，设为 1 退化为顺序）
+    timeout: 0              # 单个 Subject 超时秒数（0 = 无超时）
+    ordered: true           # 是否按 Subject 原始顺序返回结果
 
 post:
   directory: post-review/
@@ -49,6 +53,10 @@ post:
     max_attempts: 2
     on_failure: skip
 ```
+
+> **Pool 模式说明**：Review Phase 中，每个 Worker 对一个 Subject 顺序执行全部 Step。
+> Worker 间无共享状态（每个 Subject 写入独立的 intermediates 目录），天然线程安全。
+> 单 Subject 或 workers=1 时退化为顺序执行，行为与之前完全一致。
 
 ## 步骤发现与排序
 

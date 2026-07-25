@@ -123,7 +123,7 @@ def setup_logging(
         config_path: logging.yaml 的显式路径。为 None 时自动搜索默认位置。
         log_level: 覆盖日志级别（DEBUG / INFO / WARNING / ERROR）。
         log_dir: 覆盖日志目录路径。
-        data_dir: 数据目录（未指定 log_dir 时默认日志到 {data_dir}/logs/）。
+        data_dir: 数据目录。用于初始化日志配置文件搜索路径（优先从 {data_dir}/logging.yaml 查找）。
 
     Returns:
         paper_rag 根 logger。
@@ -131,8 +131,8 @@ def setup_logging(
     # --- 初始化搜索路径（优先搜索 data_dir） ---
     from paper_rag.config import resolve_data_dir
 
-    if not _LOG_CONFIG_CANDIDATES:
-        set_log_config_search_paths(resolve_data_dir(data_dir or None))
+    # 每次重新设置搜索路径（支持不同调用传不同 data_dir）
+    set_log_config_search_paths(resolve_data_dir(data_dir or None))
 
     # --- 加载配置 ---
     if config_path is None:

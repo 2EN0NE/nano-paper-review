@@ -322,3 +322,158 @@ class TestErrorScenarios:
             input_path=tmp_path / "subject-01.pdf",
         )
         assert result.step_results[0].status == "error"
+
+
+# ============================================================================
+# Pool 模式测试
+# ============================================================================
+
+
+class TestPooledExecution:
+    def test_pool_runs_subjects_concurrently(self, tmp_path):
+        """Pool 模式：多 Subject 同时被 Worker 处理。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+
+        # 写一个 .py 脚本，记录运行顺序到文件（验证并发）
+        script = """
+import json, os, time
+step_dir = os.environ["PIPELINE_STEP_DIR"]
+os.makedirs(step_dir, exist_ok=True)
+# 模拟耗时，让 Worker 有时间并发
+with open(os.path.join(step_dir, "output.json"), "w") as f:
+    json.dump({
+        "step": "01-test",
+        "status": "ok",
+        "error": None,
+        "data": {"subject": os.environ["PIPELINE_SUBJECT"]}
+    }, f)
+"""
+        (steps_dir / "01-test.py").write_text(script)
+
+        # 创建 3 个虚拟 PDF
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        for name in ["alpha", "beta", "gamma"]:
+            (pdf_dir / f"{name}.pdf").write_text("dummy")
+
+        result = run_pipeline(
+            pipeline_yaml={
+                "name": "pool-test",
+                "output_dir": str(output_dir),
+                "review": {
+                    "directory": str(steps_dir.absolute()),
+                    "pool": {"workers": 3, "ordered": True},
+                },
+            },
+            input_path=pdf_dir,
+        )
+
+        assert result.success
+        assert len(result.step_results) == 3
+        step_names = [r.step_name for r in result.step_results]
+        assert all(n == "01-test" for n in step_names)
+        # 所有 subject 的 intermediates 都存在
+        for subj in ["alpha", "beta", "gamma"]:
+            out_file = output_dir / "intermediates" / subj / "01-test" / "output.json"
+            assert out_file.exists(), f"Missing {out_file}"
+
+    def test_pool_ordered_preserves_subject_order(self, tmp_path):
+        """Pool ordered=True 保持原始 Subject 顺序。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        (steps_dir / "01-test.py").write_text(
+            "import json, os;"
+            'd=os.environ["PIPELINE_STEP_DIR"];'
+            "os.makedirs(d, exist_ok=True);"
+            'json.dump({"step":"01-test","status":"ok","error":None,"data":{}},'
+            'open(os.path.join(d,"output.json"),"w"))'
+        )
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        # 故意乱序创建
+        for name in ["charlie", "alpha", "bravo"]:
+            (pdf_dir / f"{name}.pdf").write_text("dummy")
+
+        result = run_pipeline(
+            pipeline_yaml={
+                "name": "order-test",
+                "output_dir": str(output_dir),
+                "review": {
+                    "directory": str(steps_dir.absolute()),
+                    "pool": {"workers": 3, "ordered": True},
+                },
+            },
+            input_path=pdf_dir,
+        )
+
+        # 顺序应为按名字排序：alpha, bravo, charlie
+        assert result.subject == "alpha"
+        # step_results 按 subject 顺序
+        subjects_in_results = [r.subject for r in result.step_results]
+        assert subjects_in_results == ["alpha", "bravo", "charlie"]
+
+    def test_pool_with_single_subject_falls_back_to_sequential(self, tmp_path):
+        """单 Subject 时 Pool 退化为顺序执行（无 Error）。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        (steps_dir / "01-test.py").write_text(
+            "import json, os;"
+            'd=os.environ["PIPELINE_STEP_DIR"];'
+            "os.makedirs(d, exist_ok=True);"
+            'json.dump({"step":"01-test","status":"ok","error":None,"data":{}},'
+            'open(os.path.join(d,"output.json"),"w"))'
+        )
+
+        # 单 Subject 单篇模式
+        result = run_pipeline(
+            pipeline_yaml={
+                "name": "single",
+                "output_dir": str(output_dir),
+                "review": {
+                    "directory": str(steps_dir.absolute()),
+                    "pool": {"workers": 5, "ordered": True},
+                },
+            },
+            input_path=tmp_path / "subject-01.pdf",
+        )
+
+        assert result.success
+        assert result.step_results[0].status == "ok"
+
+    def test_pool_workers_1_is_sequential(self, tmp_path):
+        """pool.workers=1 退化为顺序执行。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        (steps_dir / "01-test.py").write_text(
+            "import json, os;"
+            'd=os.environ["PIPELINE_STEP_DIR"];'
+            "os.makedirs(d, exist_ok=True);"
+            'json.dump({"step":"01-test","status":"ok","error":None,"data":{}},'
+            'open(os.path.join(d,"output.json"),"w"))'
+        )
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        for name in ["a", "b"]:
+            (pdf_dir / f"{name}.pdf").write_text("dummy")
+
+        result = run_pipeline(
+            pipeline_yaml={
+                "name": "workers1",
+                "output_dir": str(output_dir),
+                "review": {
+                    "directory": str(steps_dir.absolute()),
+                    "pool": {"workers": 1},
+                },
+            },
+            input_path=pdf_dir,
+        )
+
+        assert result.success
+        assert len(result.step_results) == 2

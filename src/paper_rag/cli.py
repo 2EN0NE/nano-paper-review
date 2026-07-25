@@ -18,7 +18,7 @@ import typer
 
 from paper_rag.config import resolve_data_dir
 from paper_rag.logging_config import setup_logging
-from paper_rag.orchestrator import run_pipeline
+from paper_rag.orchestrator import PoolProgress, run_pipeline
 from paper_rag.server import create_app
 from paper_rag.store import (
     Paper,
@@ -284,6 +284,8 @@ def review(
 
     default_output = dd / "output"
 
+    progress = PoolProgress()
+
     if pipeline_yaml_path.exists():
         result = run_pipeline(
             pipeline_yaml_path,
@@ -292,6 +294,7 @@ def review(
             data_dir=str(dd),
             target_phase=phase,
             target_step=step,
+            pool_progress=progress,
         )
     else:
         review_dir = pipe_path / "review-pipeline"
@@ -307,12 +310,15 @@ def review(
                 data_dir=str(dd),
                 target_phase=phase,
                 target_step=step,
+                pool_progress=progress,
             )
         else:
             typer.echo("错误：未找到 pipeline.yaml 或 review-pipeline/ 目录")
             raise typer.Exit(1)
 
     typer.echo(f"\nPipeline 完成: {result.subject}")
+    if progress.total > 0:
+        typer.echo(f"  Pool进度: {progress.summary()}")
     typer.echo(f"  状态: {'✅ 通过' if result.success else '❌ 有错误'}")
     for sr in result.step_results:
         icon = "✅" if sr.status == "ok" else "⚠️" if sr.status == "skipped" else "❌"

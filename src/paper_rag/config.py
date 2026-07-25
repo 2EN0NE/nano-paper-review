@@ -53,6 +53,10 @@ class Config(BaseModel):
     # --- 向量维度 ---
     vector_dim: int = 512
 
+    # --- Worker 池默认配置（被 pipeline.yaml 中 review.pool 覆盖） ---
+    pool_workers: int = 5  # 默认 Worker 数，0=自动探测
+    pool_timeout: int = 0  # 默认单 Subject 超时秒数（0=无超时）
+
     def fingerprint(self) -> str:
         """当前配置的嵌入指纹，用于检测配置变更
 

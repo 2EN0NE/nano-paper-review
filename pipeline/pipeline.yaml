@@ -21,6 +21,11 @@ review:
   subject_order:
     sort_by: name
     direction: asc
+  # Worker 池配置——多 Subject 时并发处理
+  pool:
+    workers: 5 # 最大并发 Worker 数，设为 1 退化为顺序执行
+    timeout: 0 # 单个 Subject 超时秒数（0 = 无超时）
+    ordered: true # 是否按 Subject 原始顺序返回结果
 
 post:
   directory: post-review/
