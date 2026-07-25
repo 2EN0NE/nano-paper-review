@@ -167,3 +167,29 @@ class TestLoadConfigDataDir:
         assert cfg.index_dir == "/custom/from/yaml"
         # pdf_dir 空 → 自动推导
         assert cfg.pdf_dir == str(dd / "pdfs")
+
+    def test_load_config_yaml_data_dir_field_sets_derived_paths(self, tmp_path):
+        """YAML 中 data_dir 字段被 load_config() 读取，自动推导子路径。"""
+        from paper_rag.config import load_config
+
+        dd = tmp_path / "yaml-data-dir"
+        dd.mkdir(parents=True)
+        yaml_path = tmp_path / "my.yaml"
+        yaml_path.write_text(f"data_dir: {dd}\n")
+        cfg = load_config(path=str(yaml_path))
+        # index_dir/pdf_dir 应从 YAML 的 data_dir 推导
+        assert cfg.index_dir == str(dd / "index")
+        assert cfg.pdf_dir == str(dd / "pdfs")
+
+    def test_load_config_yaml_data_dir_with_explicit_index(self, tmp_path):
+        """YAML 中同时指定 data_dir 和 index_dir，index_dir 优先。"""
+        from paper_rag.config import load_config
+
+        dd = tmp_path / "base"
+        dd.mkdir(parents=True)
+        yaml_path = tmp_path / "mix.yaml"
+        yaml_path.write_text(f"data_dir: {dd}\nindex_dir: /custom/index\n")
+        cfg = load_config(path=str(yaml_path))
+        assert cfg.index_dir == "/custom/index"
+        # pdf_dir 应来自 data_dir 推导
+        assert cfg.pdf_dir == str(dd / "pdfs")
