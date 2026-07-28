@@ -2,8 +2,8 @@
 
 import pytest
 
-from paper_rag.chunker import chunk_paper
-from paper_rag.store import Paper, PaperMeta
+from paper_review.search.chunker import chunk_paper
+from paper_review.search.store import Paper, PaperMeta
 
 
 @pytest.fixture

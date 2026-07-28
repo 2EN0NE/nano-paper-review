@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from paper_rag.orchestrator import (
+from paper_review.orchestrator import (
     PipelineConfig,
     discover_steps,
     run_pipeline,
@@ -148,10 +148,8 @@ class TestPyStepExecution:
         step_file = steps_dir / "01-test.py"
         step_file.write_text("print('hello')")
 
-        inter_dir = output_dir / "intermediates" / "subject-01" / "01-test"
-
-        # 由于 we 实际 mock subprocess，验证参数
-        with patch("paper_rag.orchestrator.subprocess.run") as mock_run:
+        # 由于我们实际 mock subprocess，验证参数
+        with patch("paper_review.pipeline_steps.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
 
             run_pipeline(
@@ -179,7 +177,7 @@ class TestPyStepExecution:
             "import os; print(os.environ.get('PIPELINE_STEP_DIR'))"
         )
 
-        with patch("paper_rag.orchestrator.subprocess.run") as mock_run:
+        with patch("paper_review.pipeline_steps.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
 
             run_pipeline(
@@ -204,10 +202,14 @@ class TestPyStepExecution:
         steps_dir.mkdir(parents=True)
         (steps_dir / "01-test.py").write_text("")
 
-        with patch("paper_rag.orchestrator.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch("paper_review.pipeline_steps.subprocess.run") as mock_run:
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = ""
+            mock_proc.stderr = ""
+            mock_run.return_value = mock_proc
 
-            run_pipeline(
+            result = run_pipeline(
                 pipeline_yaml={
                     "name": "t1",
                     "output_dir": str(output_dir),
@@ -216,7 +218,7 @@ class TestPyStepExecution:
                 input_path=tmp_path / "subject-01.pdf",
             )
 
-            expected_dir = output_dir / "intermediates" / "subject-01" / "01-test"
+            expected_dir = result.task_dir / "intermediates" / "subject-01" / "01-test"
             assert expected_dir.exists()
 
 
@@ -252,7 +254,7 @@ with open(os.path.join(step_dir, 'output.json'), 'w') as f:
         )
 
         # 检查 output.json
-        expected = output_dir / "intermediates" / "subject-01" / "01-test" / "output.json"
+        expected = result.task_dir / "intermediates" / "subject-01" / "01-test" / "output.json"
         assert expected.exists()
         with open(expected) as f:
             data = json.load(f)
@@ -325,6 +327,44 @@ class TestErrorScenarios:
 
 
 # ============================================================================
+# .md 步骤降级测试（pi 二进制缺失时的 skipped 路径）
+# ============================================================================
+
+
+class TestMdStepFallback:
+    def test_pi_binary_not_found_marks_skipped(self, tmp_path):
+        """pi 不在 PATH 中时 .md 步骤标记为 skipped。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+
+        md_content = "# step content"
+        (steps_dir / "01-review.md").write_text(md_content)
+
+        # 用 PIPELINE_PI_BINARY 指向不存在的二进制
+        import os
+
+        env = os.environ.copy()
+        env["PIPELINE_PI_BINARY"] = "/nonexistent/pi-binary"
+
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"PIPELINE_PI_BINARY": "/nonexistent/pi-binary"}):
+            result = run_pipeline(
+                pipeline_yaml={
+                    "name": "pi-fallback",
+                    "output_dir": str(output_dir),
+                    "review": {"directory": str(steps_dir.absolute())},
+                },
+                input_path=tmp_path / "subject-01.pdf",
+            )
+
+        assert len(result.step_results) == 1
+        assert result.step_results[0].status == "skipped"
+        assert "pi binary" in (result.step_results[0].error or "").lower()
+
+
+# ============================================================================
 # Pool 模式测试
 # ============================================================================
 
@@ -374,9 +414,9 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
         assert len(result.step_results) == 3
         step_names = [r.step_name for r in result.step_results]
         assert all(n == "01-test" for n in step_names)
-        # 所有 subject 的 intermediates 都存在
+        # 所有 subject 的 intermediates 都存在（现在在 result/{task_id}/ 下）
         for subj in ["alpha", "beta", "gamma"]:
-            out_file = output_dir / "intermediates" / subj / "01-test" / "output.json"
+            out_file = result.task_dir / "intermediates" / subj / "01-test" / "output.json"
             assert out_file.exists(), f"Missing {out_file}"
 
     def test_pool_ordered_preserves_subject_order(self, tmp_path):

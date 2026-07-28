@@ -1,7 +1,7 @@
 """
 配置加载 —— Pydantic 模型 + YAML/环境变量/默认值
 
-优先级：默认值 ← YAML 文件 ← 环境变量（PAPER_RAG_XXX）
+优先级：默认值 ← YAML 文件 ← 环境变量（PAPER_REVIEW_XXX）
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ from pydantic import BaseModel
 
 
 class Config(BaseModel):
-    """paper-rag 全局配置
+    """paper-review 全局配置
 
     所有字段均有默认值，可通过 config.yaml 或环境变量覆盖。
-    环境变量使用 PAPER_RAG_ 前缀 + 大写字段名，例如 PAPER_RAG_CHUNK_SIZE=256。
+    环境变量使用 PAPER_REVIEW_ 前缀 + 大写字段名，例如 PAPER_REVIEW_CHUNK_SIZE=256。
 
     data_dir 决定所有数据存放位置（优先级：--data-dir > ./.paper-review/ > ~/.paper-review/）。
     index_dir / pdf_dir 为空字符串时自动从 data_dir 推导。
@@ -151,7 +151,7 @@ def load_config(
     优先级（低→高）：
     1. Config 默认值
     2. YAML 文件（如果存在）
-    3. 环境变量 PAPER_RAG_XXX
+    3. 环境变量 PAPER_REVIEW_XXX
     4. data_dir 参数（CLI --data-dir）
 
     Args:
@@ -183,7 +183,7 @@ def load_config(
             config = Config(**filtered)
 
     # --- 环境变量覆盖 ---
-    env_prefix = "PAPER_RAG_"
+    env_prefix = "PAPER_REVIEW_"
     env_overrides: dict[str, object] = {}
     for key, field_info in Config.model_fields.items():
         env_key = f"{env_prefix}{key.upper()}"

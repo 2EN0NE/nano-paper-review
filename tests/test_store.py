@@ -1,8 +1,8 @@
 """Store/SQLite 持久化层测试"""
 
 from helpers import make_mock_chunk_vecs, make_sample_paper
-from paper_rag.chunker import chunk_paper
-from paper_rag.store import Store
+from paper_review.search.chunker import chunk_paper
+from paper_review.search.store import Store
 
 
 class TestStore:

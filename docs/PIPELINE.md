@@ -229,20 +229,20 @@ Agent Prefix Prompt 模板：
 ## CLI
 
 ```bash
-paper-rag review <path> [OPTIONS]
+paper-review review <path> [OPTIONS]
 
 # 单篇
-paper-rag review ./papers/subject-001.pdf
+paper-review review ./papers/subject-001.pdf
 
 # 目录（批量）
-paper-rag review ./papers/pending-batch/
+paper-review review ./papers/pending-batch/
 
 # 覆盖 pipeline 配置
-paper-rag review ./dir/ --pipeline ./custom/pipeline.yaml
+paper-review review ./dir/ --pipeline ./custom/pipeline.yaml
 
 # 只看某个阶段
-paper-rag review ./dir/ --phase review    # 可指定：分步调试
-paper-rag review ./dir/ --step 02-novelty # 重跑单个步骤
+paper-review review ./dir/ --phase review    # 可指定：分步调试
+paper-review review ./dir/ --step 02-novelty # 重跑单个步骤
 ```
 
 `path` 判断规则：存在且是目录 → 批量模式；存在且是文件（.pdf） → 单篇模式。

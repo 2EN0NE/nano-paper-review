@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from paper_rag.embedder import OnnxEmbedder
+from paper_review.search.embedder import OnnxEmbedder
 
 
 @pytest.fixture

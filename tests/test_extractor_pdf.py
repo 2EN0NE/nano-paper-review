@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from paper_rag.extractor import count_pages, extract_pdf
+from paper_review.extractor import count_pages, extract_pdf
 
 # 用 fitz（PyMuPDF）在内存中生成测试 PDF
 pytest.importorskip("fitz")
@@ -156,7 +156,7 @@ class TestCountPages:
 
         # Just verify the function handles None gracefully
         # By patching the module-level flag
-        import paper_rag.extractor as ext
+        import paper_review.extractor as ext
 
         original_has = ext.HAS_PYMUPDF
         try:

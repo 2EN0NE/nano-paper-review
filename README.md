@@ -6,33 +6,72 @@
 
 ## 快速开始
 
+### 1. 安装
+
 ```bash
-# 安装（零 PyTorch / CUDA，仅 ~30MB 推理依赖）
-# 推荐：有 uv 用 uv（更快），没有则降级为 pip
-uv pip install -e .
-# 或：pip install -e .
-# 或：make install（自动检测 uv）
+# 推荐：使用交互式安装脚本（自动安装依赖 + 下载模型）
+bash scripts/install.sh
 
-# 0. 导出模型为 ONNX 格式（开发机执行一次，需要 PyTorch）
-python scripts/export_onnx.py
+# 或手动安装（仅装 Python 包）：
+# 有 uv 用 uv（全局工具安装）
+uv tool install --python 3.12 -e .[dev]
 
-# 1. 将历史论文建索引（评审前必须）
+# 没有 uv，降级为 pip
+python3 -m pip install -e .[dev]
+
+# 仅安装运行时依赖（不含 pytest 等开发工具）
+pip install -e .
+```
+
+> **开发期修改源码后**，如果需要重新安装：
+> `uv tool install --python 3.12 -e . --force`
+>
+> 开发依赖（`[dev]` extras）定义在 `pyproject.toml` 中，
+> 包含 `pytest`、`ruff`、`huggingface-hub`。CI 中也使用此方式安装。
+
+`install.sh` 会交互式询问是否下载 ONNX 模型：
+
+- **Embedding 模型**（bge-small-zh-v1.5, ~96MB）— 建议下载，否则检索使用确定性哈希（仅测试可用）
+- **Reranker 模型**（bge-reranker-v2-m3, ~1.1GB fp16）— 可选项，不下载则检索跳过 Cross-Encoder 精排
+
+> **CPU-only 设计**：所有模型推理使用 ONNX Runtime，无需 PyTorch / CUDA。
+> 总内存约 2-2.5GB（含 reranker），仅 embedding 时约 500MB。
+
+### 2. 初始化配置
+
+```bash
+# 生成默认 config.yaml 和 pipeline.yaml 到数据目录
+paper-review init
+```
+
+生成的文件包含详细注释：
+
+- `config.yaml` — 分块、检索、权重参数
+- `pipeline.yaml` — 管线编排定义（阶段、重试、并发）
+- `review-pipeline/` — 默认评审步骤（.py / .md），可编辑定制
+
+建议先阅读以上文件了解各配置项含义。
+
+### 3. 建历史论文索引
+
+```bash
 paper-review index --pdf-dir ./data/history
+```
 
-# 2. 执行评审
-paper-review review ./papers/pending/   # 目录模式（批量）
+### 4. 执行评审
+
+```bash
+paper-review review ./papers/pending/         # 目录模式（批量）
 paper-review review ./papers/subject-001.pdf  # 单篇模式
+```
 
-# 辅助命令
+### 辅助命令
+
+```bash
 paper-review search "深度学习信用评估"    # 快速检索
 paper-review status                      # 索引状态
 paper-review serve --port 8765           # HTTP API
 ```
-
-> **CPU-only 设计**：所有模型推理使用 ONNX Runtime，无需 PyTorch / CUDA。
-> embedding 模型约 100MB，reranker 模型约 1.1GB（fp16 等效），总内存约 2-2.5GB。
-
-第一次使用？`paper-review --help` 查看所有命令，`paper-review <cmd> --help` 查看子命令用法。
 
 ## 评审流水线
 
@@ -99,9 +138,16 @@ paper-review review ./dir/ --phase review
 # 重跑单个步骤（需已有中间产物）
 paper-review review ./dir/ --step 02-novelty
 
+# 无人值守模式（跳过空索引提醒、首次提示等交互式确认）
+paper-review review ./dir/ --skip-warnings
+paper-review search "深度学习" --skip-warnings
+
 # 指定自定义管线
 paper-review review ./dir/ --pipeline ./custom/pipeline.yaml
 ```
+
+> **`--skip-warnings`**：适用于 CI/CD、定时任务或脚本调用场景。
+> 索引为空时不会询问，直接跳过检索步骤。
 
 ## 检索引擎
 
@@ -173,7 +219,7 @@ API 完整文档：[`docs/API.md`](docs/API.md)
 │   │   └── post/{step}/output.json
 │   └── reports/{subject}/      # 最终报告
 └── logs/
-    └── paper-rag.log           # 运行时日志
+    └── paper-review.log           # 运行时日志
 ```
 
 ### 解析优先级
@@ -203,7 +249,7 @@ paper-review --data-dir /custom/data status
 paper-review --data-dir /custom/data search "测试"
 
 # 4. 环境变量
-PAPER_RAG_DATA_DIR=/custom/data paper-review status
+PAPER_REVIEW_DATA_DIR=/custom/data paper-review status
 ```
 
 所有 `config.yaml` 中的路径字段（`index_dir`、`pdf_dir`）留空即自动从 data_dir 推导。
@@ -238,7 +284,7 @@ reranker_model: BAAI/bge-reranker-v2-m3
 环境变量覆盖（优先级 > YAML）：
 
 ```bash
-export PAPER_RAG_CHUNK_SIZE=256
+export PAPER_REVIEW_CHUNK_SIZE=256
 ```
 
 ## 离线部署
@@ -256,14 +302,14 @@ ONNX 文件在开发机上通过 ``export_onnx.py`` 导出（需要 torch，只�
 python scripts/download_models.py --cache-dir ./models_cache
 bash scripts/offline_pack.sh --cache-dir ./models_cache --output-dir ./dist/offline
 
-# 产物: dist/paper-rag-offline-<timestamp>.tar.gz
+# 产物: dist/paper-review-offline-<timestamp>.tar.gz
 ```
 
 ### 目标机器：部署
 
 ```bash
-tar xzf paper-rag-offline-<timestamp>.tar.gz
-cd paper-rag-offline-<timestamp>
+tar xzf paper-review-offline-<timestamp>.tar.gz
+cd paper-review-offline-<timestamp>
 
 # 安装依赖（有 uv 用 uv，没有则降级为 pip）
 uv pip install --no-index --find-links=./offline_packages -e .
@@ -301,7 +347,7 @@ nano-paper-review/
 │   ├── pre-review/
 │   ├── review-pipeline/
 │   └── post-review/
-├── src/paper_rag/
+├── src/paper_review/
 │   ├── cli.py                # CLI 入口（Typer）
 │   ├── orchestrator.py       # 管线执行引擎
 │   ├── template_engine.py    # 模板变量引擎

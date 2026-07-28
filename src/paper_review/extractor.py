@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from paper_rag.store import PaperMeta
+from paper_review.search.store import PaperMeta
 
 # ============================================================================
 # 文件名模式

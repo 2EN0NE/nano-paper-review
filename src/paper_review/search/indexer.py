@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from paper_rag.store import (
+from paper_review.search.store import (
     BODY_WEIGHT,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -30,7 +30,7 @@ from paper_rag.store import (
 if TYPE_CHECKING:
     import numpy as np
 
-    from paper_rag.models import EmbeddingModelManager
+    from paper_review.search.models import EmbeddingModelManager
 
 
 def build_index(
@@ -56,7 +56,7 @@ def build_index(
         meaningful content.
     """
     # Deferred import to avoid circular dependency
-    from paper_rag.chunker import chunk_paper
+    from paper_review.search.chunker import chunk_paper
 
     chunks = chunk_paper(
         paper,

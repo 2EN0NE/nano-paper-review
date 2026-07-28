@@ -31,7 +31,7 @@ def _paper_review_bin() -> str:
     if which.returncode == 0:
         return which.stdout.strip()
     # Last resort: module invocation (works regardless of entry-point registration)
-    return f"{sys.executable} -m paper_rag"
+    return f"{sys.executable} -m paper_review"
 
 
 def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -67,9 +67,9 @@ class TestSmoke:
         assert result.returncode == 0
 
     def test_module_invocation(self):
-        """``python -m paper_rag --help`` also works."""
+        """``python -m paper_review --help`` also works."""
         result = subprocess.run(
-            [sys.executable, "-m", "paper_rag", "--help"],
+            [sys.executable, "-m", "paper_review", "--help"],
             capture_output=True,
             text=True,
         )

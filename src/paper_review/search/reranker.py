@@ -6,7 +6,7 @@ CPU-only inference.  No PyTorch or CUDA packages are required at runtime.
 
 Usage::
 
-    from paper_rag.reranker import CrossEncoderReranker
+    from paper_review.search.reranker import CrossEncoderReranker
 
     reranker = CrossEncoderReranker()
     reranker.load()
@@ -20,10 +20,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from paper_rag.config import Config, load_config
+from paper_review.config import Config, load_config
 
 if TYPE_CHECKING:
-    from paper_rag.store import Paper
+    from paper_review.search.store import Paper
 
 logger = logging.getLogger(__name__)
 
@@ -214,10 +214,16 @@ class OnnxReranker:
             input_ids[i, :seq_len] = e.ids
             attention_mask[i, :seq_len] = 1
 
-        outputs = session.run(
-            None,
-            {"input_ids": input_ids, "attention_mask": attention_mask},
-        )
+        # 构建 ONNX 输入：部分社区导出的模型要求 token_type_ids
+        onnx_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        session_input_names = [inp.name for inp in session.get_inputs()]
+        if "token_type_ids" in session_input_names:
+            onnx_inputs["token_type_ids"] = np.zeros_like(input_ids)
+
+        outputs = session.run(None, onnx_inputs)
         logits = outputs[0]
 
         # Softmax / sigmoid to get positive-class score

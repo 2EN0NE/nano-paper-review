@@ -1,32 +1,62 @@
-# 标准论文评审管线配置
-# output_dir 现在由 CLI 从 data_dir 自动推导（{data_dir}/output/），
-# 此文件中的 output_dir 会被 CLI 的 --data-dir 或自动解析的 data_dir 覆盖。
-# 如需手动指定，取消下行注释：
-# output_dir: ./output
+# ═══════════════════════════════════════════════════════════════════════════
+#  标准论文评审管线 — pipeline.yaml
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#   管线 = 三个阶段（Pre → Review → Post），每个阶段由若干 Step 组成。
+#   Step 可以是 .py 脚本或 .md Agent 提示词。
+#
+#   管线发现顺序：
+#     1. CLI `review` 命令输入路径旁的 pipeline.yaml（项目级自定义）
+#     2. {data_dir}/pipeline.yaml（`paper-review init` 生成的默认配置）
+#     3. {输入路径}/review-pipeline/ 目录下的步骤文件（免配置模式）
+#
+#   .md Step 支持模板变量：
+#     {subject.name}              —— 论文文件名
+#     {subject.text}              —— 论文全文
+#     {intermediates.XX.data.YY}  —— 前置步骤的输出数据
+#
+#   详细文档：docs/PIPELINE.md
+#   ═══════════════════════════════════════════════════════════════════════════
 
 name: "标准论文评审管线"
 version: "1.0"
 
+# ── Pre Phase（批量执行）────────────────────────────────────────────────
+# 概念：所有待审 Subject 依次执行每个 Step（不并行）。
+# 用途：格式归一化（doc→PDF）、元数据提取、临时建索引等批量操作。
+# 注意：此阶段不需要 Subject 上下文，只跑一次。
 pre:
-  directory: pre-review/
+  directory: pre-review/ # 步骤脚本目录（相对于此 yaml 所在目录）
   retry:
-    max_attempts: 2
+    max_attempts: 2 # Step 失败时的重试次数
+    on_failure: skip # 重试仍失败时的策略: skip（跳过）或 abort（终止管线）
+
+# ── Review Phase（逐篇执行）──────────────────────────────────────────────
+# 概念：每篇论文独立走完所有 Step，互不干扰。
+# 用途：检索相似文章 → 关键词提取 → Agent 逐维度评审 → 综合打分。
+# 特点：支持 Worker 池并发处理多篇论文。
+review:
+  directory: review-pipeline/ # 步骤脚本目录
+  retry:
+    max_attempts: 1 # 一般重试 1 次（Agent 评审费时）
     on_failure: skip
 
-review:
-  directory: review-pipeline/
-  retry:
-    max_attempts: 1
-    on_failure: skip
+  # ── Subject 排序 ──
+  # 控制论文的执行顺序，影响 Worker 池调度的公平性。
   subject_order:
-    sort_by: name
-    direction: asc
-  # Worker 池配置——多 Subject 时并发处理
+    sort_by: name # 排序字段: name / regex
+    direction: asc # asc 升序 / desc 降序
+
+  # ── Worker 池配置 ──
+  # 控制并发度。多 Subject 时并行提速，单 Subject 时退化顺序。
   pool:
-    workers: 5 # 最大并发 Worker 数，设为 1 退化为顺序执行
+    workers: 5 # 最大并发 Worker 数（1=顺序, 0=自动）
     timeout: 0 # 单个 Subject 超时秒数（0 = 无超时）
     ordered: true # 是否按 Subject 原始顺序返回结果
 
+# ── Post Phase（批量执行）───────────────────────────────────────────────
+# 概念：所有 Subject 完成 Review 后统一执行。
+# 用途：标签反写索引、报告归档（JSON + MD）、通知等收尾任务。
 post:
   directory: post-review/
   retry:

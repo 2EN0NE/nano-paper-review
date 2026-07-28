@@ -12,8 +12,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from paper_rag.reranker import CrossEncoderReranker, OnnxReranker
-from paper_rag.store import Paper, PaperMeta
+from paper_review.search.reranker import CrossEncoderReranker, OnnxReranker
+from paper_review.search.store import Paper, PaperMeta
 
 
 def _make_candidate(pid: str, text: str = "default content") -> Paper:
@@ -148,7 +148,7 @@ class TestCrossEncoderReranker:
 
     def test_model_name_default(self):
         """默认模型名与常量一致."""
-        from paper_rag.reranker import RERANKER_MODEL_NAME
+        from paper_review.search.reranker import RERANKER_MODEL_NAME
 
         reranker = CrossEncoderReranker()
         assert reranker.model_name == RERANKER_MODEL_NAME

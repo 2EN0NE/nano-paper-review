@@ -1,6 +1,6 @@
-# paper-rag 配置文件
-# 参考 src/paper_rag/config.py 中的 Config 模型查看所有可用字段
-# 环境变量覆盖：PAPER_RAG_XXX（优先级高于 YAML）
+# paper-review 配置文件
+# 参考 src/paper_review/config.py 中的 Config 模型查看所有可用字段
+# 环境变量覆盖：PAPER_REVIEW_XXX（优先级高于 YAML）
 #
 # data_dir 优先级：--data-dir 参数 > ./.paper-review/ 存在 > ~/.paper-review/（自动创建）
 # 以下路径留空 = 自动从 data_dir 推导：
@@ -33,9 +33,9 @@ head_ratio: 0.15
 tail_ratio: 0.10
 
 # --- 检索参数 ---
-recall_k: 50          # RRF 融合后的候选数
-final_top_n: 5        # Reranker 精排后的最终返回数
-rrf_k: 60             # RRF 融合常量
+recall_k: 50 # RRF 融合后的候选数
+final_top_n: 5 # Reranker 精排后的最终返回数
+rrf_k: 60 # RRF 融合常量
 
 
 # --- 模型选择 ---

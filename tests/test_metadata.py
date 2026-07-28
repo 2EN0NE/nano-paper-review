@@ -1,6 +1,6 @@
 """文件名元数据提取测试"""
 
-from paper_rag.extractor import extract_meta
+from paper_review.extractor import extract_meta
 
 
 def test_year_author_title_format():

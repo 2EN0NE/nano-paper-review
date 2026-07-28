@@ -8,8 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from paper_rag.config import Config
-from paper_rag.models import EmbeddingModelManager
+from paper_review.config import Config
+from paper_review.search.models import EmbeddingModelManager
 
 
 class TestEmbeddingModelManagerFallback:

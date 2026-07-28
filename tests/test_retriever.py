@@ -8,9 +8,9 @@ and the full hybrid search pipeline.
 import pytest
 
 from helpers import make_mock_chunk_vecs, make_sample_paper
-from paper_rag.chunker import chunk_paper
-from paper_rag.retriever import rrf_fuse
-from paper_rag.store import (
+from paper_review.search.chunker import chunk_paper
+from paper_review.search.retriever import rrf_fuse
+from paper_review.search.store import (
     SearchResult,
     Store,
 )
@@ -231,7 +231,7 @@ class TestHybridSearch:
 
     def test_search_returns_top_n_at_most(self):
         """结果不超过 FINAL_TOP_N 条"""
-        from paper_rag.store import FINAL_TOP_N
+        from paper_review.search.store import FINAL_TOP_N
 
         store = _setup_store_with_papers(
             [

@@ -86,5 +86,5 @@
 ## 启动
 
 ```bash
-python -m paper_rag.cli serve --port 8765 --host localhost
+python -m paper_review.cli serve --port 8765 --host localhost
 ```

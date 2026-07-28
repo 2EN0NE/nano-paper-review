@@ -148,14 +148,17 @@ class OnnxEmbedder:
             input_ids[i, :seq_len] = e.ids
             attention_mask[i, :seq_len] = 1
 
+        # 构建 ONNX 输入：部分社区导出的模型要求 token_type_ids
+        onnx_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        session_input_names = [inp.name for inp in session.get_inputs()]
+        if "token_type_ids" in session_input_names:
+            onnx_inputs["token_type_ids"] = np.zeros_like(input_ids)
+
         # ONNX inference
-        outputs = session.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-            },
-        )
+        outputs = session.run(None, onnx_inputs)
         last_hidden = outputs[0]  # (batch, seq_len, dim)
 
         # Mean pooling (weighted by attention_mask)

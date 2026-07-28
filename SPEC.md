@@ -1,8 +1,8 @@
-# 规范：本地论文检索服务（paper-rag）
+# 规范：论文评审流水线（paper-review）
 
 ## Problem Statement
 
-用户在一台 **2019 年 Debian Linux** 机器上（2CPU/4GB RAM，无 GPU，离线环境）需要建立一个**本地论文检索服务**，支持：
+用户在一台 **2019 年 Debian Linux** 机器上（2CPU/4GB RAM，无 GPU，离线环境）需要建立一个**本地论文评审工具**，支持：
 
 1. 从 PDF 目录自动解析、索引中文技术论文
 2. 通过 HTTP API 和 CLI 两种接口检索与待评议论文相似的已入库论文
@@ -55,20 +55,27 @@
 ### 1. 包结构与模块边界
 
 ```
-paper-rag/
+paper-review/
 ├── pyproject.toml
-├── config.yaml
-├── src/paper_rag/
-│   ├── cli.py            # CLI 入口（Typer）
-│   ├── server.py         # HTTP API 入口（Flask）
-│   ├── config.py         # 配置加载（Pydantic）
-│   ├── store.py          # SQLite 持久化层（含 schema、FTS5、向量读写）
-│   ├── extractor.py      # PDF 文本提取（PyMuPDF）
-│   ├── chunker.py        # 分块（段落边界优先 + 滑动窗口）
-│   ├── indexer.py        # 索引构建与增量管理
-│   ├── retriever.py      # 检索管道（BM25 + FAISS + RRF + Reranker）
-│   ├── reranker.py       # Cross-Encoder 精排封装
-│   └── models.py         # 模型管理层（离线加载）
+├── src/paper_review/
+│   ├── cli.py              # CLI 入口（Typer）
+│   ├── server.py           # HTTP API 入口（Flask）
+│   ├── config.py           # 配置加载（Pydantic）
+│   ├── extractor.py        # PDF 文本提取（PyMuPDF）
+│   ├── logging_config.py   # 日志系统
+│   │
+│   ├── orchestrator.py     # 流水线执行引擎
+│   ├── pipeline_models.py  # 管线数据模型 + Step 发现
+│   ├── pipeline_steps.py   # .py / .md Step 执行器
+│   ├── template_engine.py  # 模板变量替换 + Agent 前缀
+│   │
+│   ├── store.py            # SQLite 持久化层（含 schema、FTS5）
+│   ├── retriever.py        # 检索管道（BM25 + FAISS + RRF + Reranker）
+│   ├── reranker.py         # Cross-Encoder 精排封装
+│   ├── chunker.py          # 分块（段落边界优先 + 滑动窗口）
+│   ├── indexer.py          # 索引构建与增量管理
+│   ├── embedder.py         # ONNX Runtime 嵌入引擎
+│   └── models.py           # embedding / reranker 模型管理
 ├── tests/
 └── data/
 ```
@@ -267,18 +274,18 @@ CREATE TABLE embed_fingerprint (
 
 ```bash
 # 建索引
-python -m paper_rag.cli index --pdf-dir ./pdfs
+python -m paper_review.cli index --pdf-dir ./pdfs
 
 # 搜索
-python -m paper_rag.cli search "深度学习信用评估"
-python -m paper_rag.cli search "深度学习信用评估" --pool history
-python -m paper_rag.cli search "图神经网络" --chunk-level   # chunk 级
+python -m paper_review.cli search "深度学习信用评估"
+python -m paper_review.cli search "深度学习信用评估" --pool history
+python -m paper_review.cli search "图神经网络" --chunk-level   # chunk 级
 
 # 服务模式
-python -m paper_rag.cli serve --port 8765
+python -m paper_review.cli serve --port 8765
 
 # 状态
-python -m paper_rag.cli status
+python -m paper_review.cli status
 ```
 
 **HTTP API**：

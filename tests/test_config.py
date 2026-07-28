@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-from paper_rag.config import Config, resolve_data_dir
+from paper_review.config import Config, resolve_data_dir
 
 # 显式不存在的 config 路径，避免被项目根的 config.yaml 干扰
 _EXPLICIT_NONE_PATH = "/nonexistent/.paper-review/config.yaml"
@@ -120,7 +120,7 @@ class TestLoadConfigDataDir:
 
     def test_load_config_with_data_dir(self, tmp_path):
         """load_config(data_dir=...) 传入 resolve_data_dir。"""
-        from paper_rag.config import load_config
+        from paper_review.config import load_config
 
         dd = tmp_path / "data"
         dd.mkdir(parents=True)
@@ -131,7 +131,7 @@ class TestLoadConfigDataDir:
 
     def test_load_config_no_data_dir_auto(self, tmp_path):
         """load_config() 无 data_dir 时自动解析。"""
-        from paper_rag.config import load_config
+        from paper_review.config import load_config
 
         dot = tmp_path / ".paper-review"
         dot.mkdir(parents=True)
@@ -142,7 +142,7 @@ class TestLoadConfigDataDir:
 
     def test_load_config_fallback_auto_create(self, tmp_path):
         """load_config() fallback 到 ~/.paper-review/ 时自动创建。"""
-        from paper_rag.config import load_config
+        from paper_review.config import load_config
 
         home = tmp_path / "home"
         cwd = tmp_path / "project"
@@ -156,7 +156,7 @@ class TestLoadConfigDataDir:
 
     def test_load_config_yaml_overrides_data_dir_derived(self, tmp_path):
         """Config YAML 中的显式 index_dir 不被 data_dir 覆盖。"""
-        from paper_rag.config import load_config
+        from paper_review.config import load_config
 
         dd = tmp_path / "data"
         dd.mkdir(parents=True)
@@ -170,7 +170,7 @@ class TestLoadConfigDataDir:
 
     def test_load_config_yaml_data_dir_field_sets_derived_paths(self, tmp_path):
         """YAML 中 data_dir 字段被 load_config() 读取，自动推导子路径。"""
-        from paper_rag.config import load_config
+        from paper_review.config import load_config
 
         dd = tmp_path / "yaml-data-dir"
         dd.mkdir(parents=True)
@@ -183,7 +183,7 @@ class TestLoadConfigDataDir:
 
     def test_load_config_yaml_data_dir_with_explicit_index(self, tmp_path):
         """YAML 中同时指定 data_dir 和 index_dir，index_dir 优先。"""
-        from paper_rag.config import load_config
+        from paper_review.config import load_config
 
         dd = tmp_path / "base"
         dd.mkdir(parents=True)

@@ -9,8 +9,8 @@ import tempfile
 import pytest
 
 from helpers import make_mock_chunk_vecs, make_sample_paper
-from paper_rag.chunker import chunk_paper
-from paper_rag.store import Store
+from paper_review.search.chunker import chunk_paper
+from paper_review.search.store import Store
 
 pytestmark = pytest.mark.integration
 
@@ -37,7 +37,7 @@ class TestFaissInit:
     def test_init_faiss_default_dim(self):
         store = Store(":memory:")
         store.init_faiss()
-        from paper_rag.store import VECTOR_DIM
+        from paper_review.search.store import VECTOR_DIM
 
         assert store._faiss_dim == VECTOR_DIM
         store.close()

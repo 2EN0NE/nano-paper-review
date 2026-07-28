@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
-from paper_rag.cli import app
+from paper_review.cli import app
 
 runner = CliRunner()
 
@@ -33,7 +33,7 @@ class TestHelp:
 class TestStatusCommand:
     """paper-review status"""
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_status_output(self, mock_open_store):
         mock_store = MagicMock()
         mock_store.state_summary.return_value = {
@@ -52,7 +52,7 @@ class TestStatusCommand:
         assert "pending" in result.stdout
         assert "15" in result.stdout
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_status_empty_index(self, mock_open_store):
         mock_store = MagicMock()
         mock_store.state_summary.return_value = {
@@ -72,7 +72,7 @@ class TestStatusCommand:
 class TestSearchCommand:
     """paper-review search"""
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_search_found(self, mock_open_store):
         mock_store = MagicMock()
         mock_store.search.return_value = [
@@ -96,7 +96,7 @@ class TestSearchCommand:
         assert "张三" in result.stdout
         assert "2023" in result.stdout
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_search_no_results(self, mock_open_store):
         mock_store = MagicMock()
         mock_store.search.return_value = []
@@ -106,7 +106,7 @@ class TestSearchCommand:
         assert result.exit_code == 0
         assert "无匹配结果" in result.stdout
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_search_with_pool_flag(self, mock_open_store):
         mock_store = MagicMock()
         mock_store.search.return_value = []
@@ -116,7 +116,7 @@ class TestSearchCommand:
         kwargs = mock_store.search.call_args.kwargs
         assert kwargs.get("pool_filter") == "pending"
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_search_with_limit(self, mock_open_store):
         """--limit 由 CLI 展示层截断，不传给 store.search。"""
         mock_store = MagicMock()
@@ -146,7 +146,7 @@ class TestSearchCommand:
         kwargs = mock_store.search.call_args.kwargs
         assert "limit" not in kwargs
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_search_no_rerank_flag(self, mock_open_store):
         mock_store = MagicMock()
         mock_store.search.return_value = []
@@ -160,14 +160,14 @@ class TestSearchCommand:
 class TestServeCommand:
     """paper-review serve"""
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_serve_starts_with_default_port(self, mock_open_store):
         mock_store = MagicMock()
         mock_store.state_summary.return_value = {"papers": 0, "pools": {}}
         mock_open_store.return_value = mock_store
 
         # Patch at the module level where it's imported
-        with patch("paper_rag.cli.create_app") as mock_create:
+        with patch("paper_review.cli.create_app") as mock_create:
             mock_app = MagicMock()
             mock_create.return_value = mock_app
 
@@ -175,13 +175,13 @@ class TestServeCommand:
 
             mock_app.run.assert_called_once_with(host="localhost", port=8765, debug=False)
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_serve_with_custom_port(self, mock_open_store):
         mock_store = MagicMock()
         mock_store.state_summary.return_value = {"papers": 0, "pools": {}}
         mock_open_store.return_value = mock_store
 
-        with patch("paper_rag.cli.create_app") as mock_create:
+        with patch("paper_review.cli.create_app") as mock_create:
             mock_app = MagicMock()
             mock_create.return_value = mock_app
 
@@ -193,14 +193,14 @@ class TestServeCommand:
 class TestIndexCommand:
     """paper-review index"""
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_index_no_pdf_dir(self, mock_open_store):
         """缺少 --pdf-dir 参数应报错。"""
         result = runner.invoke(app, ["index"])
         assert result.exit_code != 0
         assert "Missing option" in result.stderr or "Error" in result.stderr
 
-    @patch("paper_rag.cli._open_store")
+    @patch("paper_review.cli.open_store")
     def test_index_nonexistent_dir(self, mock_open_store):
         """不存在的 --pdf-dir 应报错。"""
         result = runner.invoke(app, ["index", "--pdf-dir", "/nonexistent/path"])

@@ -7,7 +7,7 @@
 
 Usage::
 
-    from paper_rag.retriever import hybrid_search
+    from paper_review.search.retriever import hybrid_search
     results = hybrid_search(store, query, embed_model=embed_mgr,
                             pool_filter="history", with_rerank=True)
 """
@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from paper_rag.store import (
+from paper_review.search.store import (
     FINAL_TOP_N,
     RECALL_K,
     RRF_K,
@@ -27,8 +27,8 @@ from paper_rag.store import (
 )
 
 if TYPE_CHECKING:
-    from paper_rag.models import EmbeddingModelManager
-    from paper_rag.reranker import CrossEncoderReranker
+    from paper_review.search.models import EmbeddingModelManager
+    from paper_review.search.reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
 

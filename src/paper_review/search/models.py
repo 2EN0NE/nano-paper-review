@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from paper_rag.config import Config, load_config
+from paper_review.config import Config, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,7 @@ class EmbeddingModelManager:
         onnx_dir = model_cache_dir / self._model_name.replace("/", "--")
 
         if (onnx_dir / "model.onnx").exists():
-            from paper_rag.embedder import OnnxEmbedder
+            from paper_review.search.embedder import OnnxEmbedder
 
             self._embedder = _OnnxEmbedderWrapper(
                 OnnxEmbedder(model_dir=onnx_dir),
@@ -130,7 +130,7 @@ class EmbeddingModelManager:
             return self._embedder.encode(texts)
 
         # Fallback: deterministic hash
-        from paper_rag.store import deterministic_hash_vector
+        from paper_review.search.store import deterministic_hash_vector
 
         self.load()
         return np.array([deterministic_hash_vector(t, self._dim) for t in texts], dtype=np.float32)

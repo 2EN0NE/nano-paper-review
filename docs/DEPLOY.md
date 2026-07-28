@@ -11,14 +11,14 @@
 
 ```bash
 # 1. 下载 Python 依赖 whl
-cd paper-rag
+cd paper-review
 bash scripts/offline_pack.sh
 
 # 2. 下载模型
 python scripts/download_models.py --cache-dir ./models
 
 # 3. 打包
-tar czvf paper-rag-offline.tar.gz \
+tar czvf paper-review-offline.tar.gz \
     offline_packages/ models/ src/ \
     config.yaml pyproject.toml \
     scripts/
@@ -28,8 +28,8 @@ tar czvf paper-rag-offline.tar.gz \
 
 ```bash
 # 1. 解压
-tar xzvf paper-rag-offline.tar.gz
-cd paper-rag
+tar xzvf paper-review-offline.tar.gz
+cd paper-review
 
 # 2. 安装依赖
 pip install --no-index \
@@ -40,10 +40,10 @@ pip install --no-index \
 # 编辑 config.yaml，设置 model_cache_dir = ./models
 
 # 4. 建索引
-python -m paper_rag.cli index --pdf-dir ./pdfs
+python -m paper_review.cli index --pdf-dir ./pdfs
 
 # 5. 启动服务
-python -m paper_rag.cli serve --port 8765
+python -m paper_review.cli serve --port 8765
 ```
 
 ## 配置 config.yaml
@@ -79,9 +79,9 @@ models/
 ## 验证安装
 
 ```bash
-python -m paper_rag.cli status
+python -m paper_review.cli status
 # 输出: 索引状态（0篇论文，应该能输出）
 
-python -m paper_rag.cli serve
+python -m paper_review.cli serve
 # 启动 HTTP 服务在 localhost:8765
 ```

@@ -15,7 +15,7 @@ import time
 
 from flask import Flask, jsonify, request
 
-from paper_rag.store import Store
+from paper_review.search.store import Store
 
 logger = logging.getLogger(__name__)
 

@@ -2,11 +2,11 @@
 
 ## Problem Statement
 
-用户有一批待评审的技术论文（Subject），需要与历史论文库（Reference）进行自动化比对评审。目前 paper-rag 提供了检索能力（找到相似论文），但缺少一个结构化的评审工作流引擎——用户无法定义多步骤的评审流程、无法让 Agent 按自定义规则逐维度打分、无法将评审结果持久化归档和反向写入索引。每一次评审都是手工操作，无法批量化和标准化。
+用户有一批待评审的技术论文（Subject），需要与历史论文库（Reference）进行自动化比对评审。目前 paper-review 提供了检索能力（找到相似论文），但缺少一个结构化的评审工作流引擎——用户无法定义多步骤的评审流程、无法让 Agent 按自定义规则逐维度打分、无法将评审结果持久化归档和反向写入索引。每一次评审都是手工操作，无法批量化和标准化。
 
 ## Solution
 
-构建一个 **Review Pipeline Orchestrator**：用户通过一个 `pipeline.yaml` 声明三个阶段（Pre → Review → Post），每个阶段目录内放置 `.py`（脚本步骤）和 `.md`（Agent 步骤）文件。一个 CLI 命令 `paper-rag review <path>` 自动执行整条管道，产出结构化评审报告（JSON + Markdown）并将标签和元数据反馈回 paper-rag 索引。
+构建一个 **Review Pipeline Orchestrator**：用户通过一个 `pipeline.yaml` 声明三个阶段（Pre → Review → Post），每个阶段目录内放置 `.py`（脚本步骤）和 `.md`（Agent 步骤）文件。一个 CLI 命令 `paper-review review <path>` 自动执行整条管道，产出结构化评审报告（JSON + Markdown）并将标签和元数据反馈回 paper-review 索引。
 
 三个阶段：
 
@@ -16,7 +16,7 @@
 
 ## User Stories
 
-1. As a 论文评审者, I want to run `paper-rag review ./pending-batch/` and get structured review reports for every PDF in the directory, so that I can review a batch of 50 papers in one command.
+1. As a 论文评审者, I want to run `paper-review review ./pending-batch/` and get structured review reports for every PDF in the directory, so that I can review a batch of 50 papers in one command.
 
 2. As a 论文评审者, I want to define my own review rules as `.md` prompt files, so that I can customize what dimensions (novelty, methodology, experiments, writing quality) the agent evaluates.
 
@@ -30,7 +30,7 @@
 
 7. As a 论文评审者, I want review results persisted as both JSON (machine-readable) and Markdown (human-readable), so that both downstream tools and human readers can consume them.
 
-8. As a 论文评审者, I want extracted keywords written back to the paper-rag index as tags, so that future searches can find papers by review-generated categories.
+8. As a 论文评审者, I want extracted keywords written back to the paper-review index as tags, so that future searches can find papers by review-generated categories.
 
 9. As a 论文评审者, I want to re-run a single failed step without re-running the entire pipeline, so that I can fix a prompt file and retry just that agent step.
 
@@ -114,7 +114,7 @@ Configurable per phase in `pipeline.yaml`: `max_attempts` (1-3) and `on_failure`
 
 ### CLI Interface
 
-Single unified command: `paper-rag review <path>`. Path can be a single PDF (single-subject mode) or a directory (multi-subject batch mode).
+Single unified command: `paper-review review <path>`. Path can be a single PDF (single-subject mode) or a directory (multi-subject batch mode).
 
 Optional flags: `--pipeline` (custom pipeline.yaml path), `--phase` (run only one phase), `--step` (re-run a single step from existing intermediates).
 
@@ -175,7 +175,7 @@ review:
 
 ## Further Notes
 
-- The pipeline orchestration is entirely separate from the paper-rag retrieval service. They share the Store module (for tag writing in Post Phase) but have independent execution lifecycles.
-- The `.py` step scripts can import `paper_rag` modules (Store, retriever) directly — they are Python scripts running in the same environment.
+- The pipeline orchestration is entirely separate from the paper-review retrieval service. They share the Store module (for tag writing in Post Phase) but have independent execution lifecycles.
+- The `.py` step scripts can import `paper_review` modules (Store, retriever) directly — they are Python scripts running in the same environment.
 - The `intermediates` directory should be considered append-only by steps; steps should not modify prior steps' output files.
 - ADR 0001 documents the rationale for subprocess-based agent execution over pi SDK or workflow frameworks.

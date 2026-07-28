@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 
-from paper_rag.store import Chunk, Paper
+from paper_review.search.store import Chunk, Paper
 
 # ============================================================================
 # 配置常量

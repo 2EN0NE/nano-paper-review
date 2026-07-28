@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from paper_rag.orchestrator import (
+from paper_review.orchestrator import (
     SubjectOrderConfig,
     _order_subjects,
     run_pipeline,
@@ -147,9 +147,10 @@ class TestMultiPhaseExecution:
         result = run_pipeline(pipeline_dir, input_pdf)
 
         # 检查各阶段 intermediates
-        assert (output_dir / "intermediates" / "pre" / "01-pre" / "output.json").exists()
-        assert (output_dir / "intermediates" / "subject" / "01-review" / "output.json").exists()
-        assert (output_dir / "intermediates" / "post" / "01-post" / "output.json").exists()
+        tdir = result.task_dir / "intermediates"
+        assert (tdir / "pre" / "01-pre" / "output.json").exists()
+        assert (tdir / "subject" / "01-review" / "output.json").exists()
+        assert (tdir / "post" / "01-post" / "output.json").exists()
         assert result.success
 
     def test_target_phase_only_runs_that_phase(self, tmp_path):
@@ -186,5 +187,6 @@ class TestMultiPhaseExecution:
 
         # target_phase='review' → pre 不执行
         result = run_pipeline(pipeline_dir, input_pdf, target_phase="review")
-        assert not (output_dir / "intermediates" / "pre" / "01-pre" / "output.json").exists()
-        assert (output_dir / "intermediates" / "subject" / "01-review" / "output.json").exists()
+        tdir2 = result.task_dir / "intermediates"
+        assert not (tdir2 / "pre" / "01-pre" / "output.json").exists()
+        assert (tdir2 / "subject" / "01-review" / "output.json").exists()

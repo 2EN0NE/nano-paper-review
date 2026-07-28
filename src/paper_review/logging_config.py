@@ -3,7 +3,7 @@
 
 配置来源（优先级递增）：
 1. logging.yaml 默认值
-2. 环境变量 PAPER_RAG_LOG_LEVEL, PAPER_RAG_LOG_DIR
+2. 环境变量 PAPER_REVIEW_LOG_LEVEL, PAPER_REVIEW_LOG_DIR
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ _DEFAULT_LOG_CONFIG: dict = {
             "class": "logging.handlers.TimedRotatingFileHandler",
             "level": "INFO",
             "formatter": "standard",
-            "filename": "logs/paper-rag.log",
+            "filename": "logs/paper-review.log",
             "when": "midnight",
             "interval": 1,
             "backupCount": 14,
@@ -48,12 +48,12 @@ _DEFAULT_LOG_CONFIG: dict = {
         },
     },
     "loggers": {
-        "paper_rag": {
+        "paper_review": {
             "level": "DEBUG",
             "handlers": ["console", "file"],
             "propagate": False,
         },
-        "paper_rag.orchestrator": {
+        "paper_review.orchestrator": {
             "level": "DEBUG",
             "handlers": ["console", "file"],
             "propagate": False,
@@ -84,7 +84,7 @@ def set_log_config_search_paths(data_dir: Path) -> None:
 def _resolve_log_dir(cfg: dict) -> Path:
     """从日志配置中提取日志文件目录，确保存在。"""
     file_handler = cfg.get("handlers", {}).get("file", {})
-    filename = file_handler.get("filename", "logs/paper-rag.log")
+    filename = file_handler.get("filename", "logs/paper-review.log")
     log_dir = Path(filename).parent
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
@@ -92,7 +92,7 @@ def _resolve_log_dir(cfg: dict) -> Path:
 
 def _apply_env_overrides(cfg: dict) -> dict:
     """环境变量覆盖日志级别和路径。"""
-    env_level = os.environ.get("PAPER_RAG_LOG_LEVEL")
+    env_level = os.environ.get("PAPER_REVIEW_LOG_LEVEL")
     if env_level:
         env_level = env_level.upper()
         for logger_name, logger_cfg in cfg.get("loggers", {}).items():
@@ -101,11 +101,11 @@ def _apply_env_overrides(cfg: dict) -> dict:
         for handler_cfg in cfg.get("handlers", {}).values():
             handler_cfg["level"] = env_level
 
-    env_dir = os.environ.get("PAPER_RAG_LOG_DIR")
+    env_dir = os.environ.get("PAPER_REVIEW_LOG_DIR")
     if env_dir:
         file_handler = cfg.get("handlers", {}).get("file", {})
         if file_handler:
-            old_path = Path(file_handler.get("filename", "logs/paper-rag.log"))
+            old_path = Path(file_handler.get("filename", "logs/paper-review.log"))
             file_handler["filename"] = str(Path(env_dir) / old_path.name)
 
     return cfg
@@ -126,10 +126,10 @@ def setup_logging(
         data_dir: 数据目录。用于初始化日志配置文件搜索路径（优先从 {data_dir}/logging.yaml 查找）。
 
     Returns:
-        paper_rag 根 logger。
+        paper_review 根 logger。
     """
     # --- 初始化搜索路径（优先搜索 data_dir） ---
-    from paper_rag.config import resolve_data_dir
+    from paper_review.config import resolve_data_dir
 
     # 每次重新设置搜索路径（支持不同调用传不同 data_dir）
     set_log_config_search_paths(resolve_data_dir(data_dir or None))
@@ -165,7 +165,7 @@ def setup_logging(
     if log_dir:
         file_handler = cfg.get("handlers", {}).get("file", {})
         if file_handler:
-            old_name = Path(file_handler.get("filename", "paper-rag.log")).name
+            old_name = Path(file_handler.get("filename", "paper-review.log")).name
             file_handler["filename"] = str(Path(log_dir) / old_name)
 
     # --- 创建日志目录 ---
@@ -174,7 +174,7 @@ def setup_logging(
     # --- 应用配置 ---
     logging.config.dictConfig(cfg)
 
-    return logging.getLogger("paper_rag")
+    return logging.getLogger("paper_review")
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -184,6 +184,6 @@ def get_logger(name: str) -> logging.Logger:
         name: 模块名（如 'orchestrator', 'retriever'）。
 
     Returns:
-        'paper_rag.{name}' 的 Logger 实例。
+        'paper_review.{name}' 的 Logger 实例。
     """
-    return logging.getLogger(f"paper_rag.{name}")
+    return logging.getLogger(f"paper_review.{name}")

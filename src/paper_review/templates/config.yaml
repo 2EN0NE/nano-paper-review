@@ -1,0 +1,35 @@
+# paper-review 配置文件
+# 搜索路径（高→低）：此文件 > cwd/config.yaml > 默认值
+# 环境变量覆盖：PAPER_REVIEW_XXX（如 PAPER_REVIEW_CHUNK_SIZE=256）
+
+# ── 目录配置 ──
+# data_dir 优先由 CLI --data-dir 指定，或自动使用 ./.paper-review/ / ~/.paper-review/
+# 以下路径留空则从 data_dir 自动推导
+index_dir: "" # 索引目录（默认: {data_dir}/index）
+pdf_dir: "" # PDF 源文件目录（默认: {data_dir}/pdfs）
+
+# ── 分块参数 ──
+chunk_size: 512 # 每个 Chunk 的字符数
+chunk_overlap: 128 # Chunk 间重叠字符数
+
+# ── 文档向量加权 Mean Pooling 参数 ──
+# 按文档位置三段加权：头部（标题/摘要）、正文、尾部（结论）
+head_weight: 5.0 # 头部权重
+body_weight: 2.0 # 正文权重
+tail_weight: 4.0 # 尾部权重
+head_ratio: 0.15 # 头部占比（文档前 15%）
+tail_ratio: 0.10 # 尾部占比（文档后 10%）
+
+# ── 检索参数 ──
+recall_k: 50 # RRF 融合前的候选集大小
+final_top_n: 5 # 最终返回结果数
+rrf_k: 60 # 倒数排序融合（RRF）常数
+
+# ── 模型 ──
+embedding_model: "BAAI/bge-small-zh-v1.5"
+reranker_model: "BAAI/bge-reranker-v2-m3"
+vector_dim: 512
+
+# ── Worker 池 ──
+pool_workers: 5 # 并发 Worker 数（0=自动，1=顺序执行）
+pool_timeout: 0 # 单 Subject 超时秒数（0=无超时）

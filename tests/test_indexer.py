@@ -11,8 +11,8 @@ from unittest.mock import MagicMock
 import numpy as np
 
 from helpers import make_sample_paper
-from paper_rag.indexer import build_index
-from paper_rag.store import DocVector
+from paper_review.search.indexer import build_index
+from paper_review.search.store import DocVector
 
 
 class TestBuildIndex:
@@ -46,7 +46,7 @@ class TestBuildIndex:
         """chunk_vec 的 chunk_id 与 chunk 的 chunk_id 一一对应。"""
         paper = make_sample_paper("信用评估")
         # First, detect how many chunks the chunker will produce
-        from paper_rag.chunker import chunk_paper
+        from paper_review.search.chunker import chunk_paper
 
         expected_n = len(chunk_paper(paper, chunk_size=100, overlap=10))
 
@@ -80,7 +80,7 @@ class TestBuildIndex:
 
     def test_empty_paper_returns_empty_chunks(self):
         """空文本论文返回空 chunks 列表。"""
-        from paper_rag.store import Paper, PaperMeta
+        from paper_review.search.store import Paper, PaperMeta
 
         empty_paper = Paper(
             paper_id="empty",
@@ -106,7 +106,7 @@ class TestBuildIndex:
         """model.encode 被调用时传入所有 chunk 文本。"""
         paper = make_sample_paper("信用评估")
         # Detect chunk count first
-        from paper_rag.chunker import chunk_paper
+        from paper_review.search.chunker import chunk_paper
 
         expected_n = len(chunk_paper(paper, chunk_size=500, overlap=50))
 
@@ -124,7 +124,7 @@ class TestBuildIndex:
 
     def test_short_paper_produces_single_chunk(self):
         """短论文产生一个 chunk。"""
-        from paper_rag.store import Paper, PaperMeta
+        from paper_review.search.store import Paper, PaperMeta
 
         short_paper = Paper(
             paper_id="short",
@@ -145,7 +145,7 @@ class TestBuildIndex:
     def test_position_weights_passed_to_chunker(self):
         """build_index 透传 position weight 参数到 chunker。"""
         paper = make_sample_paper("信用评估")
-        from paper_rag.chunker import chunk_paper
+        from paper_review.search.chunker import chunk_paper
 
         expected_n = len(
             chunk_paper(

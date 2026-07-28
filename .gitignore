@@ -227,3 +227,14 @@ prototype_index.sqlite
 
 # Agent
 .pi/
+
+# Full system pip freeze (use pip install -e .[dev] instead)
+requirements.lock
+
+# -------------------------------------------------------------------
+# Project-specific
+# -------------------------------------------------------------------
+
+# 用户管线数据目录（索引、输出、中间产物）
+.paper-review/
+logs/

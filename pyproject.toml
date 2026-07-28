@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "paper-rag"
+name = "paper-review"
 version = "0.1.0"
 description = "Offline paper review pipeline — BM25 + FAISS hybrid search + ONNX reranker"
 requires-python = ">=3.10"
@@ -19,8 +19,11 @@ dependencies = [
   "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4", "huggingface-hub>=0.20.0"]
+
 [project.scripts]
-paper-review = "paper_rag.cli:app"
+paper-review = "paper_review.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -43,12 +46,12 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/paper_rag/cli.py" = ["UP007"]
+"src/paper_review/cli.py" = ["UP007"]
 "tests/*.py" = ["S108"]               # allow temp paths in tests
 "tests/e2e/*.py" = ["S603", "S607"]   # subprocess calls for CLI smoke test
-"src/paper_rag/config.py" = ["UP045"] # pre-existing: Optional[X] style
+"src/paper_review/config.py" = ["UP045"] # pre-existing: Optional[X] style
 # (models.py and reranker.py no longer use lazy type imports)
-"src/paper_rag/orchestrator.py" = [
+"src/paper_review/orchestrator.py" = [
   "S603",
 ] # pre-existing: intended subprocess use
 [tool.pytest.ini_options]

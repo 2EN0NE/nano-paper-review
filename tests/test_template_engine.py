@@ -5,10 +5,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from paper_rag.orchestrator import StepResult, run_pipeline
-from paper_rag.template_engine import (
+from paper_review.orchestrator import StepResult, run_pipeline
+from paper_review.template_engine import (
     TemplateContext,
     build_agent_prefix,
     resolve_variables,
@@ -212,7 +213,7 @@ class TestMdStepExecution:
             "open(os.path.join(d,'output.json'),'w'))"
         )
 
-        with patch("paper_rag.orchestrator.subprocess.run") as mock_subprocess:
+        with patch("paper_review.pipeline_steps.subprocess.run") as mock_subprocess:
             mock_subprocess.return_value = MagicMock(
                 returncode=0,
                 stdout='{"step":"02-novelty","status":"ok","data":{"score":0.85}}',
@@ -236,7 +237,7 @@ class TestMdStepExecution:
         pi_calls = [a for a, _ in mock_subprocess.call_args_list if "pi" in a[0]]
 
         # 输出路径
-        md_step_dir = output_dir / "intermediates" / "subject-01" / "02-novelty"
+        md_step_dir = result.task_dir / "intermediates" / "subject-01" / "02-novelty"
         output_file = md_step_dir / "output.json"
         assert output_file.exists()
         with open(output_file) as f:
@@ -253,7 +254,7 @@ class TestMdStepExecution:
         md_content = "论文名称: {subject.name}"
         (steps_dir / "01-review.md").write_text(md_content)
 
-        with patch("paper_rag.orchestrator.subprocess.run") as mock_run:
+        with patch("paper_review.pipeline_steps.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0, stdout='{"step":"01-review","status":"ok","data":{}}'
             )
@@ -270,9 +271,12 @@ class TestMdStepExecution:
         args, kwargs = mock_run.call_args
         cmd = args[0]
         if "pi" in cmd[0]:
-            # 检查 -m 参数
-            if "-m" in cmd:
-                idx = cmd.index("-m")
-                prompt = cmd[idx + 1] if idx + 1 < len(cmd) else ""
+            # 检查 -p 参数后面的 @file 路径中是否包含已替换的内容
+            prompt_file = None
+            if "-p" in cmd:
+                idx = cmd.index("-p")
+                prompt_file = cmd[idx + 1] if idx + 1 < len(cmd) else ""
+            if prompt_file:
+                prompt = Path(prompt_file.lstrip("@")).read_text(encoding="utf-8")
                 assert "subject-01" in prompt
                 assert "{subject.name}" not in prompt

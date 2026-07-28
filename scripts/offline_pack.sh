@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# offline_pack.sh — Package paper-rag for offline deployment
+# offline_pack.sh — Package paper-review for offline deployment
 #
 # Usage:
 #   bash scripts/offline_pack.sh [--cache-dir DIR] [--output-dir DIR]
@@ -12,8 +12,8 @@
 #   4. Packages everything into a portable tarball
 #
 # On the target machine (offline), the user:
-#   tar xzf paper-rag-offline-*.tar.gz
-#   cd paper-rag-offline-*
+#   tar xzf paper-review-offline-*.tar.gz
+#   cd paper-review-offline-*
 #   pip install --no-index --find-links=./offline_packages -e .
 # ============================================================================
 
@@ -67,9 +67,9 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-TARBALL_NAME="paper-rag-offline-${TIMESTAMP}.tar.gz"
+TARBALL_NAME="paper-review-offline-${TIMESTAMP}.tar.gz"
 
-echo "=== paper-rag Offline Pack ==="
+echo "=== paper-review Offline Pack ==="
 echo "  Project:    $PROJECT_DIR"
 echo "  Output:     $OUTPUT_DIR"
 echo "  Cache:      $CACHE_DIR"

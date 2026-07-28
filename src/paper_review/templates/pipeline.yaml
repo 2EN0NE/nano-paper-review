@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════
+# 标准论文评审管线配置
+# ═══════════════════════════════════════════════════
+#
+# 管线 = 三个阶段（Pre → Review → Post）
+# 每个阶段由若干 Step 组成，Step 可以是 .py 脚本或 .md Agent 提示词
+#
+# .md 步骤支持模板变量：
+#   {subject.name}          —— 论文文件名
+#   {subject.text}          —— 论文全文
+#   {intermediates.XX.data}  —— 前置步骤的输出
+#
+# ═══════════════════════════════════════════════════
+
+name: "标准论文评审管线"
+version: "1.0"
+
+# ── Pre Phase（批量执行）───────────────────────────
+# 所有 Subject 依次执行每个 Step（不并行）
+pre:
+  directory: pre-review/ # 步骤脚本目录（相对于此 yaml 所在目录）
+  retry:
+    max_attempts: 2 # 失败重试次数
+    on_failure: skip # skip（跳过）或 abort（终止）
+
+# ── Review Phase（逐篇执行）────────────────────────
+# 每篇论文独立走完所有 Step，支持 Worker 池并发
+review:
+  directory: review-pipeline/ # 步骤脚本目录
+  retry:
+    max_attempts: 1
+    on_failure: skip
+  subject_order:
+    sort_by: name # name / regex
+    direction: asc # asc / desc
+  pool:
+    workers: 5 # 并发 Worker 数（1=顺序）
+    timeout: 0 # 单 Subject 超时秒数（0=无超时）
+    ordered: true # 按 Subject 顺序返回结果
+
+# ── Post Phase（批量执行）──────────────────────────
+post:
+  directory: post-review/
+  retry:
+    max_attempts: 2
+    on_failure: skip

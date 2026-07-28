@@ -45,7 +45,7 @@
 │   │   └── post/{step}/output.json
 │   └── reports/{subject}/      #  最终报告
 └── logs/
-    └── paper-rag.log           # 运行时日志
+    └── paper-review.log           # 运行时日志
 ```
 
 ### 关键路径对照
@@ -58,7 +58,7 @@
 | 最终报告 | `{data_dir}/output/reports/` |
 | 运行时日志 | `{data_dir}/logs/` |
 | ONNX 模型缓存 | `~/.cache/paper-review/models/`（不受 data_dir 影响） |
-| CLI 命令行 | `--data-dir` 或 `PAPER_RAG_DATA_DIR` 环境变量 |
+| CLI 命令行 | `--data-dir` 或 `PAPER_REVIEW_DATA_DIR` 环境变量 |
 
 > 模型缓存独立于 data_dir 的原因：每个 ONNX 模型约 400MB-1GB，跨项目共享免重复下载。
 
@@ -76,13 +76,13 @@ mkdir .paper-review
 paper-review --data-dir /custom/data status
 
 # 环境变量
-PAPER_RAG_DATA_DIR=/custom/data paper-review index --pdf-dir ~/papers
+PAPER_REVIEW_DATA_DIR=/custom/data paper-review index --pdf-dir ~/papers
 ```
 
 ## 架构速览
 
 ```
-src/paper_rag/
+src/paper_review/
 ├── orchestrator.py     # 评审管线执行引擎 ← 项目核心
 ├── template_engine.py  # 模板变量替换 + Agent 前缀生成
 ├── store.py            # SQLite（FTS5 BM25）+ FAISS 持久化
@@ -163,3 +163,45 @@ Pre Phase (batch) → Review Phase (per subject) → Post Phase (batch)
 - **不测试**：FAISS 和 sentence-transformers 的第三方行为；HTTP 路由单独集成测试
 
 前置条件：`PYTHONPATH=src pip install -e .`
+
+## 安装与依赖管理
+
+### 开发安装
+
+```bash
+# 安装运行时 + 开发依赖（pytest, ruff, huggingface-hub）
+pip install -e .[dev]
+
+# 仅运行时（不含开发工具）
+pip install -e .
+```
+
+`[dev]` extras 定义在 `pyproject.toml` 的 `[project.optional-dependencies] dev` 中。
+CI 中也使用 `pip install -e .[dev]` 方式安装，不依赖 `requirements.lock`（已被移除）。
+
+### 日志系统
+
+日志通过 `logging_config.py` 集中管理。初始化逻辑：
+
+- **全局初始化**：`setup_logging()` 在 CLI 的 `_main_callback` 中调用，所有命令共享。
+  `--log-level` 和 `--log-dir` 为全局选项（不是 `review` 子命令专属）。
+- **配置来源**（优先级递增）：
+  1. `{data_dir}/logging.yaml` 或 `cwd/logging.yaml`
+  2. 环境变量 `PAPER_REVIEW_LOG_LEVEL`、`PAPER_REVIEW_LOG_DIR`
+  3. 默认配置：console (DEBUG) + file (INFO, `{data_dir}/logs/paper-review.log`, 14 天轮转)
+- **模块级 logger**：通过 `get_logger(__name__)` 或 `logging.getLogger(__name__)`
+  获取，统一归入 `paper_review.*` 命名空间。
+- **Store.log()**：写入 `ops_log` 内存列表，不经过 logger 系统。
+  关键操作同时使用 `logger.info/warning` 和 `self.log()`。
+
+### 测试运行
+
+```bash
+# 全部测试
+PYTHONPATH=src python -m pytest tests/ -v
+
+# 分层运行
+python -m pytest tests/ -q -m "not integration"   # 单元测试
+python -m pytest tests/ -q -m "integration"        # 集成测试
+python -m pytest tests/e2e/ -v                      # E2E 测试（需先 pip install -e .）
+```

@@ -9,6 +9,8 @@ Store 封装了所有索引数据的 SQLite 存储，包括：
 - 文档级 Mean Pooling 向量 (doc_vectors)
 - 内容去重哈希 (content_dedup)
 - Embedding 模型指纹 (embed_fingerprint)
+
+数据类型与工具函数 → search_types.py
 """
 
 from __future__ import annotations
@@ -18,146 +20,37 @@ import json
 import logging
 import math
 import os
-import re
 import sqlite3
-import struct
-from dataclasses import dataclass, field
+import threading
 
 import numpy as np
 
-from paper_rag.config import Config, load_config
+from paper_review.config import Config, load_config
+from paper_review.search.search_types import (  # noqa: F401 — 向后兼容 re-export
+    BODY_WEIGHT,
+    CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    FINAL_TOP_N,
+    HEAD_RATIO,
+    HEAD_WEIGHT,
+    RECALL_K,
+    RRF_K,
+    TAIL_RATIO,
+    TAIL_WEIGHT,
+    VECTOR_DIM,
+    Chunk,
+    ChunkVector,
+    DocVector,
+    Paper,
+    PaperMeta,
+    SearchResult,
+    deserialize_vector,
+    deterministic_hash_vector,
+    normalize_cjk_for_fts,
+    serialize_vector,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# ============================================================================
-# 配置常量（与 chunker.py 共享）
-# ============================================================================
-
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 128
-RRF_K = 60
-RECALL_K = 50
-FINAL_TOP_N = 5
-
-HEAD_WEIGHT = 5.0
-BODY_WEIGHT = 2.0
-TAIL_WEIGHT = 4.0
-HEAD_RATIO = 0.15
-TAIL_RATIO = 0.10
-
-VECTOR_DIM = 512
-
-
-# ============================================================================
-# 数据模型
-# ============================================================================
-
-
-@dataclass
-class PaperMeta:
-    filename: str = ""
-    title_hint: str = ""
-    year: int = 0
-    author_hint: str = ""
-    arxiv_id: str = ""
-    tags: list[str] = field(default_factory=list)
-
-
-@dataclass
-class Paper:
-    paper_id: str = ""
-    filepath: str = ""
-    meta: PaperMeta = field(default_factory=PaperMeta)
-    raw_text: str = ""
-    pages: int = 1
-    pool: str = "history"
-
-
-@dataclass
-class Chunk:
-    chunk_id: str = ""
-    paper_id: str = ""
-    text: str = ""
-    page_num: int = 1
-    seq: int = 0
-    start_pos: int = 0
-    end_pos: int = 0
-    token_count: int = 0
-    position_weight: float = 1.0
-
-
-@dataclass
-class DocVector:
-    paper_id: str = ""
-    vector: list[float] = field(default_factory=list)
-    dim: int = 512
-    weight_config: str = ""
-
-
-@dataclass
-class ChunkVector:
-    chunk_id: str = ""
-    vector: list[float] = field(default_factory=list)
-    dim: int = 512
-
-
-@dataclass
-class SearchResult:
-    paper_id: str = ""
-    filename: str = ""
-    pool: str = ""
-    score: float = 0.0
-    title_hint: str = ""
-    year: int = 0
-    author_hint: str = ""
-    arxiv_id: str = ""
-    pages: int = 0
-    match_chunk_snippet: str = ""
-    tags: list[str] = field(default_factory=list)
-
-
-# ============================================================================
-# CJK 归一化（FTS5 中文分词辅助）
-# ============================================================================
-
-_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
-
-
-def normalize_cjk_for_fts(text: str) -> str:
-    """在 CJK 字符之间插入空格，使 FTS5 unicode61 tokenizer 能正确分词"""
-    return _CJK_RE.sub(r" \g<0> ", text)
-
-
-# ============================================================================
-# 向量序列化
-# ============================================================================
-
-
-def serialize_vector(vec: list[float]) -> bytes:
-    return struct.pack(f"<{len(vec)}f", *vec)
-
-
-def deserialize_vector(blob: bytes) -> list[float]:
-    n = len(blob) // 4
-    return list(struct.unpack(f"<{n}f", blob))
-
-
-# ============================================================================
-# 模拟 Embedding（用于测试，无真实模型依赖）
-# ============================================================================
-
-
-def deterministic_hash_vector(text: str, dim: int = VECTOR_DIM) -> list[float]:
-    h = hashlib.sha256(text.encode()).digest()
-    vec: list[float] = []
-    for i in range(dim):
-        byte_val = h[i % 32]
-        offset = h[(i + 13) % 32]
-        val = ((byte_val * 256 + offset) / 65535.0) * 2 - 1
-        vec.append(val)
-    norm = math.sqrt(sum(v * v for v in vec))
-    return [v / (norm + 1e-8) for v in vec]
 
 
 # ============================================================================
@@ -170,6 +63,11 @@ class Store:
 
     def __init__(self, db_path: str = ":memory:", config: Config | None = None):
         self.config = config or load_config()
+        # 确保 db_path 的父目录存在（防止 pipeline 脚本首次运行时创建失败）
+        if db_path != ":memory:":
+            from pathlib import Path
+
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -204,6 +102,7 @@ class Store:
         self._faiss_dim: int = VECTOR_DIM
         self._next_faiss_paper_id: int = 1
         self._next_faiss_chunk_id: int = 1
+        self._faiss_lock = threading.Lock()
 
         self._init_schema()
 
@@ -412,32 +311,32 @@ class Store:
     # --- FAISS 内部辅助 ---
 
     def _add_to_faiss(self, paper: Paper, chunk_vecs: list[ChunkVector], doc_vec: DocVector):
-        """将论文的向量添加到 FAISS 索引。"""
+        """将论文的向量添加到 FAISS 索引（线程安全）。"""
         if self._faiss_papers is None:
             return
+        with self._faiss_lock:
+            # 论文级向量
+            paper_vec = np.array([doc_vec.vector], dtype=np.float32)
+            paper_faiss_id = self._next_faiss_paper_id
+            self._faiss_papers.add_with_ids(paper_vec, np.array([paper_faiss_id], dtype=np.int64))
+            self._faiss_paper_id_map[paper_faiss_id] = paper.paper_id
+            self._faiss_paper_rev_map[paper.paper_id] = paper_faiss_id
+            self._next_faiss_paper_id += 1
 
-        # 论文级向量
-        paper_vec = np.array([doc_vec.vector], dtype=np.float32)
-        paper_faiss_id = self._next_faiss_paper_id
-        self._faiss_papers.add_with_ids(paper_vec, np.array([paper_faiss_id], dtype=np.int64))
-        self._faiss_paper_id_map[paper_faiss_id] = paper.paper_id
-        self._faiss_paper_rev_map[paper.paper_id] = paper_faiss_id
-        self._next_faiss_paper_id += 1
-
-        # Chunk 级向量
-        if self._faiss_chunks is not None and chunk_vecs:
-            chunk_vec_array = np.array([cv.vector for cv in chunk_vecs], dtype=np.float32)
-            chunk_ids = []
-            for cv in chunk_vecs:
-                cid = self._next_faiss_chunk_id
-                self._faiss_chunk_id_map[cid] = cv.chunk_id
-                self._faiss_chunk_rev_map[cv.chunk_id] = cid
-                chunk_ids.append(cid)
-                self._next_faiss_chunk_id += 1
-            self._faiss_chunks.add_with_ids(
-                chunk_vec_array,
-                np.array(chunk_ids, dtype=np.int64),
-            )
+            # Chunk 级向量
+            if self._faiss_chunks is not None and chunk_vecs:
+                chunk_vec_array = np.array([cv.vector for cv in chunk_vecs], dtype=np.float32)
+                chunk_ids = []
+                for cv in chunk_vecs:
+                    cid = self._next_faiss_chunk_id
+                    self._faiss_chunk_id_map[cid] = cv.chunk_id
+                    self._faiss_chunk_rev_map[cv.chunk_id] = cid
+                    chunk_ids.append(cid)
+                    self._next_faiss_chunk_id += 1
+                self._faiss_chunks.add_with_ids(
+                    chunk_vec_array,
+                    np.array(chunk_ids, dtype=np.int64),
+                )
 
     def _rebuild_faiss(self):
         """从内存缓存重建两个 FAISS 索引。"""
@@ -467,7 +366,59 @@ class Store:
                 self._faiss_chunk_rev_map[chunk_id] = faiss_id
                 self._next_faiss_chunk_id += 1
 
+    def _checkpoint_faiss(self):
+        """FAISS 检查点：将当前 FAISS 索引写入磁盘后重新初始化。
+
+        在批量索引流程中周期性调用，将 FAISS 内存占用降回初始值。
+        ``content_hashes`` 等去重缓存不受影响。
+
+        线程安全：使用 ``self._faiss_lock`` 保护。
+
+        警告：调用后 FAISS ID 计数器重置为 1。后续添加新论文时会从 1
+        开始分配 ID，但已写入磁盘的索引已有这些 ID 的条目。请确保
+        checkpoint 后不再添加论文，或在重新添加前从磁盘重新加载。
+        """
+        if self.index_dir is None:
+            self.log("CHECKPOINT: SKIP (no index_dir)")
+            return
+        with self._faiss_lock:
+            dim = self._faiss_dim
+            self.save_faiss()
+            self.init_faiss(dim=dim)
+        logger.info(
+            "FAISS checkpoint: index written to %s, in-memory index re-initialized (dim=%d)",
+            self.index_dir,
+            dim,
+        )
+        self.log(f"CHECKPOINT: FAISS flushed to disk (dim={dim})")
+
     # --- 加载 ---
+
+    def load_content_hashes_only(self):
+        """轻量加载：只加载 content_dedup + embed_fingerprint。
+
+        用于批量索引场景，避免将全部论文/chunks/向量加载到内存。
+        """
+        self.content_hashes.clear()
+        for row in self.db.execute("SELECT sha256, paper_id FROM content_dedup"):
+            self.content_hashes[row["sha256"]] = row["paper_id"]
+        row = self.db.execute(
+            "SELECT value FROM embed_fingerprint WHERE key='embed_model'"
+        ).fetchone()
+        if row:
+            self.embed_fingerprint = row["value"]
+            # 比对指纹，配置变更时发出警告
+            current_fp = self._current_fingerprint()
+            if current_fp != self.embed_fingerprint:
+                logger.warning(
+                    "Embedding fingerprint mismatch: stored=%r current=%r. "
+                    "Run `paper-review rebuild-vectors` to recompute doc vectors.",
+                    self.embed_fingerprint,
+                    current_fp,
+                )
+                self.log(
+                    f"FINGERPRINT MISMATCH: stored={self.embed_fingerprint} current={current_fp}"
+                )
 
     def load_all(self):
         """从 SQLite 加载全部数据到内存缓存"""
@@ -565,7 +516,7 @@ class Store:
             force_reindex: 即使内容相同也重新索引（默认走去重检测）
         """
         # 先用 chunker 重新分块（确保一致性）
-        from paper_rag.chunker import chunk_paper as _chunk
+        from paper_review.search.chunker import chunk_paper as _chunk
 
         chunks = _chunk(paper)
         if not chunks:
@@ -581,54 +532,59 @@ class Store:
             existing_pid = self.content_hashes[content_hash]
             if existing_pid in self.papers:
                 self.log(f"  DEDUP: content matches {existing_pid}, storing metadata only")
-                # 存储元数据和 chunks（FTS 可检索）,
+                # 存储元数据和 chunks（FTS 可检索），
                 # 但跳过向量编码和 FAISS 索引
-                db.execute(
-                    """INSERT OR REPLACE INTO papers
-                       (paper_id, filepath, filename, title_hint, year, author_hint,
-                        arxiv_id, tags, pool, raw_text, pages)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        paper.paper_id,
-                        paper.filepath,
-                        paper.meta.filename,
-                        paper.meta.title_hint,
-                        paper.meta.year,
-                        paper.meta.author_hint,
-                        paper.meta.arxiv_id,
-                        json.dumps(paper.meta.tags, ensure_ascii=False),
-                        paper.pool,
-                        paper.raw_text,
-                        paper.pages,
-                    ),
-                )
-                for c in chunks:
+                try:
+                    db.execute("BEGIN IMMEDIATE")
                     db.execute(
-                        """INSERT INTO chunks
-                           (chunk_id, paper_id, text, page_num, seq,
-                            start_pos, end_pos, token_count, position_weight)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        """INSERT OR REPLACE INTO papers
+                           (paper_id, filepath, filename, title_hint, year, author_hint,
+                            arxiv_id, tags, pool, raw_text, pages)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
-                            c.chunk_id,
-                            c.paper_id,
-                            c.text,
-                            c.page_num,
-                            c.seq,
-                            c.start_pos,
-                            c.end_pos,
-                            c.token_count,
-                            c.position_weight,
+                            paper.paper_id,
+                            paper.filepath,
+                            paper.meta.filename,
+                            paper.meta.title_hint,
+                            paper.meta.year,
+                            paper.meta.author_hint,
+                            paper.meta.arxiv_id,
+                            json.dumps(paper.meta.tags, ensure_ascii=False),
+                            paper.pool,
+                            paper.raw_text,
+                            paper.pages,
                         ),
                     )
-                    rowid = db.execute(
-                        "SELECT rowid FROM chunks WHERE chunk_id = ?", (c.chunk_id,)
-                    ).fetchone()[0]
-                    db.execute(
-                        """INSERT INTO chunks_fts(rowid, chunk_id, paper_id, text)
-                           VALUES (?, ?, ?, ?)""",
-                        (rowid, c.chunk_id, c.paper_id, normalize_cjk_for_fts(c.text)),
-                    )
-                db.commit()
+                    for c in chunks:
+                        db.execute(
+                            """INSERT INTO chunks
+                               (chunk_id, paper_id, text, page_num, seq,
+                                start_pos, end_pos, token_count, position_weight)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                c.chunk_id,
+                                c.paper_id,
+                                c.text,
+                                c.page_num,
+                                c.seq,
+                                c.start_pos,
+                                c.end_pos,
+                                c.token_count,
+                                c.position_weight,
+                            ),
+                        )
+                        rowid = db.execute(
+                            "SELECT rowid FROM chunks WHERE chunk_id = ?", (c.chunk_id,)
+                        ).fetchone()[0]
+                        db.execute(
+                            """INSERT INTO chunks_fts(rowid, chunk_id, paper_id, text)
+                               VALUES (?, ?, ?, ?)""",
+                            (rowid, c.chunk_id, c.paper_id, normalize_cjk_for_fts(c.text)),
+                        )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
                 self.papers[paper.paper_id] = paper
                 for c in chunks:
                     self.chunks[c.chunk_id] = c
@@ -730,6 +686,192 @@ class Store:
 
             # 更新 FAISS 索引
             self._add_to_faiss(paper, chunk_vecs, doc_vec)
+
+        except Exception:
+            db.rollback()
+            raise
+
+        return chunks
+
+    # ---- bulk 批量索引（轻内存） ----
+
+    def bulk_add_paper(
+        self,
+        paper: Paper,
+        chunk_vecs: list[ChunkVector],
+        doc_vec: DocVector,
+        force_reindex: bool = False,
+    ) -> list[Chunk]:
+        """批量添加论文——只写 SQLite + FAISS，跳过内存 dict 缓存。
+
+        与 ``add_paper`` 功能相同，但不同时维护 ``self.papers``、
+        ``self.chunks``、``self.chunk_vectors``、``self.doc_vectors``
+        等运行时 dict。
+
+        用于 ``paper-review index`` 批量建索引场景，每 Epoch 结束时
+        通过创建新的 Store 实例释放 FAISS 内存，避免 OOM。
+
+        唯一保留的内存缓存是 ``self.content_hashes``（内容去重）。
+        """
+        # 局部导入避免循环依赖
+        from paper_review.search.chunker import chunk_paper as _chunk
+
+        chunks = _chunk(paper)
+        if not chunks:
+            self.log(f"BULK_ADD: {paper.filepath} → SKIP (no content)")
+            return []
+
+        db = self.db
+        self.log(f"BULK_ADD: {paper.filepath} → pool={paper.pool}")
+
+        content_hash = hashlib.sha256(paper.raw_text.encode()).hexdigest()
+        if not force_reindex and content_hash in self.content_hashes:
+            existing_pid = self.content_hashes[content_hash]
+            self.log(f"  DEDUP: content matches {existing_pid}, storing metadata only")
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute(
+                    """INSERT OR REPLACE INTO papers
+                       (paper_id, filepath, filename, title_hint, year, author_hint,
+                        arxiv_id, tags, pool, raw_text, pages)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        paper.paper_id,
+                        paper.filepath,
+                        paper.meta.filename,
+                        paper.meta.title_hint,
+                        paper.meta.year,
+                        paper.meta.author_hint,
+                        paper.meta.arxiv_id,
+                        json.dumps(paper.meta.tags, ensure_ascii=False),
+                        paper.pool,
+                        paper.raw_text,
+                        paper.pages,
+                    ),
+                )
+                for c in chunks:
+                    db.execute(
+                        """INSERT INTO chunks
+                           (chunk_id, paper_id, text, page_num, seq,
+                            start_pos, end_pos, token_count, position_weight)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            c.chunk_id,
+                            c.paper_id,
+                            c.text,
+                            c.page_num,
+                            c.seq,
+                            c.start_pos,
+                            c.end_pos,
+                            c.token_count,
+                            c.position_weight,
+                        ),
+                    )
+                    rowid = db.execute(
+                        "SELECT rowid FROM chunks WHERE chunk_id = ?", (c.chunk_id,)
+                    ).fetchone()[0]
+                    db.execute(
+                        """INSERT INTO chunks_fts(rowid, chunk_id, paper_id, text)
+                           VALUES (?, ?, ?, ?)""",
+                        (rowid, c.chunk_id, c.paper_id, normalize_cjk_for_fts(c.text)),
+                    )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            # 仅更新去重缓存
+            self.content_hashes[content_hash] = paper.paper_id
+            return chunks
+
+        current_fp = self._current_fingerprint()
+
+        try:
+            db.execute("BEGIN IMMEDIATE")
+
+            db.execute(
+                """INSERT OR REPLACE INTO papers
+                   (paper_id, filepath, filename, title_hint, year, author_hint,
+                    arxiv_id, tags, pool, raw_text, pages)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    paper.paper_id,
+                    paper.filepath,
+                    paper.meta.filename,
+                    paper.meta.title_hint,
+                    paper.meta.year,
+                    paper.meta.author_hint,
+                    paper.meta.arxiv_id,
+                    json.dumps(paper.meta.tags, ensure_ascii=False),
+                    paper.pool,
+                    paper.raw_text,
+                    paper.pages,
+                ),
+            )
+
+            for c in chunks:
+                db.execute(
+                    """INSERT INTO chunks
+                       (chunk_id, paper_id, text, page_num, seq,
+                        start_pos, end_pos, token_count, position_weight)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        c.chunk_id,
+                        c.paper_id,
+                        c.text,
+                        c.page_num,
+                        c.seq,
+                        c.start_pos,
+                        c.end_pos,
+                        c.token_count,
+                        c.position_weight,
+                    ),
+                )
+                rowid = db.execute(
+                    "SELECT rowid FROM chunks WHERE chunk_id = ?", (c.chunk_id,)
+                ).fetchone()[0]
+                db.execute(
+                    """INSERT INTO chunks_fts(rowid, chunk_id, paper_id, text)
+                       VALUES (?, ?, ?, ?)""",
+                    (rowid, c.chunk_id, c.paper_id, normalize_cjk_for_fts(c.text)),
+                )
+
+            for cv in chunk_vecs:
+                db.execute(
+                    """INSERT OR REPLACE INTO chunk_vectors
+                       (chunk_id, vector, dim) VALUES (?, ?, ?)""",
+                    (cv.chunk_id, serialize_vector(cv.vector), cv.dim),
+                )
+
+            db.execute(
+                """INSERT OR REPLACE INTO doc_vectors
+                   (paper_id, vector, dim, weight_config) VALUES (?, ?, ?, ?)""",
+                (
+                    doc_vec.paper_id,
+                    serialize_vector(doc_vec.vector),
+                    doc_vec.dim,
+                    doc_vec.weight_config,
+                ),
+            )
+
+            db.execute(
+                "INSERT OR REPLACE INTO content_dedup(sha256, paper_id) VALUES (?, ?)",
+                (content_hash, paper.paper_id),
+            )
+            db.execute(
+                """INSERT OR REPLACE INTO embed_fingerprint(key, value)
+                   VALUES ('embed_model', ?)""",
+                (current_fp,),
+            )
+
+            # 更新去重缓存 + 指纹缓存（事务内）
+            self.content_hashes[content_hash] = paper.paper_id
+            if not self.embed_fingerprint:
+                self.embed_fingerprint = current_fp
+
+            # 更新 FAISS 索引（在 commit 之前，失败时整个回滚）
+            self._add_to_faiss(paper, chunk_vecs, doc_vec)
+
+            db.commit()
 
         except Exception:
             db.rollback()
@@ -1173,3 +1315,23 @@ def mean_pool_chunks(
     if norm > 1e-8:
         weighted = [v / norm for v in weighted]
     return weighted
+
+
+def open_store(data_dir: str | None = None) -> Store:
+    """打开索引（数据目录含 FAISS 初始化）。
+
+    命令行和测试的统一入口。自动解析 data_dir → index.sqlite 路径，
+    加载全部数据并初始化/恢复 FAISS 索引。
+    """
+    from paper_review.config import resolve_data_dir
+
+    dd = resolve_data_dir(data_dir)
+    index_dir = dd / "index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    db_path = str(index_dir / "index.sqlite")
+
+    store = Store(db_path)
+    store.load_all()
+    if not store.load_faiss():
+        store.init_faiss()
+    return store

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 
-from paper_rag.store import (
+from paper_review.search.store import (
     Chunk,
     ChunkVector,
     DocVector,

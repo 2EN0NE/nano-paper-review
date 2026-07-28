@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-from paper_rag.orchestrator import (
+from paper_review.orchestrator import (
     PipelineConfig,
     run_pipeline,
 )
@@ -46,8 +46,9 @@ class TestMultiSubject:
         )
 
         # 验证每篇都有 intermediates
+        tdir = result.task_dir / "intermediates"
         for subj in ["paper-aaa", "paper-bbb", "paper-ccc"]:
-            inter_dir = output_dir / "intermediates" / subj / "01-check"
+            inter_dir = tdir / subj / "01-check"
             output_file = inter_dir / "output.json"
             assert output_file.exists(), f"Missing {output_file}"
             with open(output_file) as f:
@@ -73,7 +74,7 @@ class TestMultiSubject:
         for name in ["aaa.pdf", "bbb.pdf", "ccc.pdf"]:
             (input_dir / name).write_text("dummy")
 
-        with patch("paper_rag.orchestrator.logger.warning") as mock_warn:
+        with patch("paper_review.orchestrator.logger.warning"):
             result = run_pipeline(
                 pipeline_yaml={
                     "name": "multi",
@@ -84,9 +85,10 @@ class TestMultiSubject:
             )
 
         # bbb 有 error output.json，aaa 和 ccc 有 ok output.json
-        aaa_out = output_dir / "intermediates" / "aaa" / "01-check" / "output.json"
-        bbb_out = output_dir / "intermediates" / "bbb" / "01-check" / "output.json"
-        ccc_out = output_dir / "intermediates" / "ccc" / "01-check" / "output.json"
+        tdir = result.task_dir / "intermediates"
+        aaa_out = tdir / "aaa" / "01-check" / "output.json"
+        bbb_out = tdir / "bbb" / "01-check" / "output.json"
+        ccc_out = tdir / "ccc" / "01-check" / "output.json"
 
         assert aaa_out.exists()
         assert bbb_out.exists()
@@ -122,25 +124,31 @@ class TestMultiSubject:
 
 
 class TestPrePostPhases:
-    def test_pre_phase_batch_mode(self, tmp_path):
-        """Pre 阶段以批量模式执行。"""
+    def test_pre_phase_batch_execution(self, tmp_path):
+        """Pre 阶段以批量模式真实执行（创建 intermediates/pre/01-pre/output.json）。"""
         output_dir = tmp_path / "output"
         pipeline_dir = tmp_path / "pipeline"
         pipeline_dir.mkdir()
         pre_dir = pipeline_dir / "pre-review"
         pre_dir.mkdir(parents=True)
 
-        # Pre 脚本：创建 key.txt 表示批量处理
+        # Pre 脚本：写入 output.json + 辅助文件
         pre_script = (
             "import json, os; d=os.environ['PIPELINE_STEP_DIR']; "
             "os.makedirs(d, exist_ok=True); "
-            "open(os.path.join(d, 'key.txt'), 'w').write('batch-done'); "
-            "json.dump({'step':'01-pre','status':'ok','data':{}}, "
+            "open(os.path.join(d, 'converted.txt'), 'w').write('batch-done'); "
+            "json.dump({'step':'01-convert','status':'ok','data':{'converted':True}}, "
             "open(os.path.join(d,'output.json'),'w'))"
         )
         (pre_dir / "01-convert.py").write_text(pre_script)
+        (pre_dir / "02-validate.py").write_text(
+            "import json, os; d=os.environ['PIPELINE_STEP_DIR']; "
+            "os.makedirs(d, exist_ok=True); "
+            "json.dump({'step':'02-validate','status':'ok','data':{}}, "
+            "open(os.path.join(d,'output.json'),'w'))"
+        )
 
-        # Review 步骤（空占位）
+        # Review 步骤
         review_dir = pipeline_dir / "review-pipeline"
         review_dir.mkdir()
         (review_dir / "01-review.py").write_text(
@@ -150,20 +158,47 @@ class TestPrePostPhases:
             "open(os.path.join(d,'output.json'),'w'))"
         )
 
+        # Post 步骤
+        post_dir = pipeline_dir / "post-review"
+        post_dir.mkdir()
+        (post_dir / "01-archive.py").write_text(
+            "import json, os; d=os.environ['PIPELINE_STEP_DIR']; "
+            "os.makedirs(d, exist_ok=True); "
+            "json.dump({'step':'01-archive','status':'ok','data':{}}, "
+            "open(os.path.join(d,'output.json'),'w'))"
+        )
+
+        # 使用 pipeline.yaml 文件替代 dict（走完整的文件加载路径）
+        yaml_path = pipeline_dir / "pipeline.yaml"
+        yaml_path.write_text(
+            f"name: pre-test\n"
+            f"output_dir: {output_dir}\n"
+            f"pre:\n"
+            f"  directory: pre-review/\n"
+            f"review:\n"
+            f"  directory: review-pipeline/\n"
+            f"post:\n"
+            f"  directory: post-review/\n"
+        )
+
         input_pdf = tmp_path / "subject.pdf"
         input_pdf.write_text("dummy")
 
-        # 这里我们直接跳过 Pre 阶段测试（run_pipeline 当前仅实现 review 阶段）
-        # 验证 pipeline config 能加载 Pre 配置
-        cfg = PipelineConfig.from_dict(
-            {
-                "name": "pre-test",
-                "output_dir": str(output_dir),
-                "pre": {"directory": "pre-review/"},
-                "review": {"directory": "review-pipeline/"},
-            }
+        result = run_pipeline(
+            pipeline_yaml=pipeline_dir,
+            input_path=input_pdf,
         )
-        assert cfg.pre.directory == "pre-review/"
+
+        # 验证 Pre 批量阶段执行
+        tdir = result.task_dir / "intermediates"
+        assert (tdir / "pre" / "01-convert" / "output.json").exists()
+        assert (tdir / "pre" / "01-convert" / "converted.txt").exists()
+        assert (tdir / "pre" / "02-validate" / "output.json").exists()
+        # 验证 Review 阶段执行
+        assert (tdir / "subject" / "01-review" / "output.json").exists()
+        # 验证 Post 批量阶段执行
+        assert (tdir / "post" / "01-archive" / "output.json").exists()
+        assert result.success
 
     def test_pipeline_yaml_pre_review_post_directories(self):
         """完整三项 pipeline.yaml 解析。"""

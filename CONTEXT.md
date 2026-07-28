@@ -1,6 +1,6 @@
 # 评审流水线
 
-离线论文评审工作流。在 paper-rag 检索服务的上层，对 pending 池中的论文与历史池中的论文进行自动比对评审。
+离线论文评审工作流。在本地混合检索引擎（BM25 + FAISS + Cross-Encoder 精排）的上层，对 pending 池中的论文与历史池中的论文进行自动比对评审。
 
 ## Language
 
@@ -26,7 +26,7 @@ _Avoid_: Review session, review job
 _Avoid_: Stage
 
 **Pre Phase**:
-格式归一化阶段。对输入目录批量处理：doc/docx → PDF（外部脚本），可选调用 paper-rag index 命令将 PDF 建索引到 pending pool。
+格式归一化阶段。对输入目录批量处理：doc/docx → PDF（外部脚本），可选调用 paper-review index 命令将 PDF 建索引到 pending pool。
 输出：处理结果目录、成功/失败条目、下一阶段所需元数据。
 
 **Review Phase**:
@@ -97,11 +97,11 @@ _Avoid_: Output contract, step format
 Step 执行失败时的重试策略：重试次数、是否跳过继续（skip-and-continue）或中断，可在 `pipeline.yaml` 定义。
 
 **Orchestrator**:
-流水线的执行引擎。纯 Python 模块（`src/paper_rag/orchestrator.py`），负责 Step 发现/排序/顺序执行。.py 步骤用 Python 直接执行；.md 步骤通过 `subprocess.run(["pi", "-m", resolved_prompt])` 调用 pi。
+流水线的执行引擎。纯 Python 模块（`src/paper_review/orchestrator.py`），负责 Step 发现/排序/顺序执行。.py 步骤用 Python 直接执行；.md 步骤通过 `subprocess.run(["pi", "-p", "@prompt_file.md"])` 调用 pi。
 _Avoid_: Pipeline runner, executor, engine
 
 **Pipeline CLI**:
-统一入口命令：`paper-rag review <path>`。path 可以是单篇 PDF 或 PDF 目录。Orchestrator 自动检测并选择单篇/目录模式。
+统一入口命令：`paper-review review <path>`。path 可以是单篇 PDF 或 PDF 目录。Orchestrator 自动检测并选择单篇/目录模式。
 
 **Output Root**:
 评审产出的根目录。由 `data_dir` 推导为 `{data_dir}/output/`，也可通过 `pipeline.yaml` 的 `output_dir` 字段覆盖（优先级更高）。
