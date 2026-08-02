@@ -718,8 +718,10 @@ def run_pipeline(
     import datetime
     import hashlib
 
-    task_seed = f"{input_path.absolute()}:{datetime.datetime.now().isoformat()}"
-    task_id = hashlib.sha256(task_seed.encode()).hexdigest()[:8]
+    now = datetime.datetime.now()
+    task_seed = f"{input_path.absolute()}:{now.isoformat()}"
+    hash_suffix = hashlib.sha256(task_seed.encode()).hexdigest()[:8]
+    task_id = now.strftime("%Y%m%d-%H%M%S") + "-" + hash_suffix
     task_dir = config.output_dir / "result" / task_id
     logger.info("Task ID: %s → %s", task_id, task_dir)
 
