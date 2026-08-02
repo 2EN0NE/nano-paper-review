@@ -110,7 +110,14 @@ class TestReviewE2E:
         pipeline_dir, output_dir = _make_pipeline_dir(tmp_path, data_dir)
 
         result = subprocess.run(
-            [_paper_review_bin(), "--data-dir", str(data_dir), "review", "--skip-warnings", str(pipeline_dir)],
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(pipeline_dir),
+            ],
             capture_output=True,
             text=True,
             timeout=30,
@@ -147,15 +154,15 @@ class TestReviewE2E:
         steps_dir.mkdir()
         # 模拟真实 01-search.py 的行为：使用 PIPELINE_DATA_DIR 定位 index
         (steps_dir / "01-search.py").write_text(
-            'import json, os, sys;'
+            "import json, os, sys;"
             'sys.path.insert(0, os.environ.get("PIPELINE_PIPELINE_DIR", "."));'
-            'from paper_review.search.store import Store;'
+            "from paper_review.search.store import Store;"
             'dd = os.environ.get("PIPELINE_DATA_DIR", "");'
             'db_path = os.path.join(dd, "index", "index.sqlite") if dd else ":memory:";'
-            'store = Store(db_path=db_path);'
-            'store.load_all();'
+            "store = Store(db_path=db_path);"
+            "store.load_all();"
             'd = os.environ["PIPELINE_STEP_DIR"];'
-            'os.makedirs(d, exist_ok=True);'
+            "os.makedirs(d, exist_ok=True);"
             'json.dump({"step":"01-search","status":"ok","data":{}},'
             '          open(os.path.join(d,"output.json"),"w"))'
         )
@@ -164,8 +171,14 @@ class TestReviewE2E:
         pdf.write_text("dummy")
 
         result = subprocess.run(
-            [_paper_review_bin(), "--data-dir", str(data_dir),
-             "review", "--skip-warnings", str(pdf)],
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(pdf),
+            ],
             capture_output=True,
             text=True,
             timeout=15,
@@ -219,7 +232,14 @@ class TestReviewE2E:
         pdf_path.write_text("dummy")
 
         result = subprocess.run(
-            [_paper_review_bin(), "--data-dir", str(data_dir), "review", "--skip-warnings", str(pdf_path)],
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(pdf_path),
+            ],
             capture_output=True,
             text=True,
             timeout=15,
