@@ -13,7 +13,7 @@ import json
 import os
 import re
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from paper_review.logging_config import get_logger
@@ -320,6 +320,7 @@ def _run_subjects_pooled(
     all_results: dict[str, list[StepResult]] = {}
     errors: list[str] = []
     start_times: dict[str, float] = {}
+    timed_out_futures: set[Future] = set()  # 超时但因 running 无法 cancel 的 future
 
     executor = ThreadPoolExecutor(max_workers=actual_workers)
     try:
@@ -374,6 +375,7 @@ def _run_subjects_pooled(
 
             for future in timed_out:
                 pending.discard(future)
+                timed_out_futures.add(future)
                 subject = future_map[future]
                 future.cancel()
                 errors.append(subject)
@@ -407,6 +409,27 @@ def _run_subjects_pooled(
                 )
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+
+    # ── 等待超时但 worker 线程仍在运行的 future 实质完成 ──
+    # Python ThreadPoolExecutor 无法 cancel 正在运行的线程（cancel() 返回 False），
+    # 因此超时 Subject 的 worker 可能仍在跑。必须在 return 前等它们结束，
+    # 否则 Post 阶段会在 Review 未完成时拿到不完整的 intermediates。
+    if timed_out_futures:
+        done_timed_out, _ = wait(timed_out_futures)
+        for future in done_timed_out:
+            subject = future_map[future]
+            try:
+                _, results = future.result()
+                all_results[subject] = results
+                elapsed = time.monotonic() - start_times[subject]
+                logger.info(
+                    "  [%s] ✓ completed after timeout in %.0fs",
+                    subject,
+                    elapsed,
+                )
+            except (CancelledError, Exception) as e:
+                # worker 已被 cancel 或已将异常记入 all_results
+                logger.debug("  [%s] timed-out future resolved with %s", subject, type(e).__name__)
 
     if pool_cfg.ordered:
         all_results = {s: all_results[s] for s in subjects if s in all_results}

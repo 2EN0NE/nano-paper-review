@@ -520,3 +520,72 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
 
         assert result.success
         assert len(result.step_results) == 2
+
+    def test_pool_waits_for_running_timed_out_workers(self, tmp_path, monkeypatch):
+        """超时 Subject 的 worker 线程仍在运行时，_run_subjects_pooled 必须等待。
+
+        复现条件：pool.timeout 小于 worker 实际耗时 → pending.discard() 移除
+        → while 循环退出 → executor.shutdown(wait=False) 不等待 → 函数提前 return。
+        此时 Post 阶段拿到不完整的 intermediates 开始生成 Excel，
+        而 worker 线程事后才跑完 pp.review_step_done() 更新计数器。
+        """
+        import threading
+        import time as _time
+
+        from paper_review.orchestrator import _run_subjects_pooled
+        from paper_review.pipeline_models import (
+            PoolConfig,
+            RetryConfig,
+            ReviewPhaseConfig,
+            StepFile,
+            StepResult,
+        )
+
+        # 跟踪每个 subject 完成的 step 数（必须等所有 step 跑完）
+        step_count: dict[str, int] = {}
+        step_lock = threading.Lock()
+
+        def tracking_run_step(step, step_dir, env, prior_results=None, subject_name="", **kwargs):
+            subject = env.get("PIPELINE_SUBJECT", "unknown")
+            _time.sleep(0.8)  # per-step 耗时；2 steps × 0.8s = 1.6s > 1s timeout
+            with step_lock:
+                step_count[subject] = step_count.get(subject, 0) + 1
+            return StepResult(
+                step_name=step.stem,
+                status="ok",
+                subject=subject,
+            )
+
+        monkeypatch.setattr(
+            "paper_review.orchestrator._run_step",
+            tracking_run_step,
+        )
+
+        steps = [
+            StepFile(path=Path("01-test.py"), stem="01-test", step_type="py"),
+            StepFile(path=Path("02-test.py"), stem="02-test", step_type="py"),
+        ]
+
+        subjects = ["subj-a", "subj-b"]
+
+        # pool 有 2 workers，timeout 50ms（远小于 worker 的 150ms sleep）
+        phase_config = ReviewPhaseConfig(
+            directory="dummy",
+            pool=PoolConfig(workers=2, timeout=1, ordered=False),
+            retry=RetryConfig(max_attempts=1, on_failure="skip"),
+        )
+
+        all_results = _run_subjects_pooled(
+            steps=steps,
+            subjects=subjects,
+            phase_config=phase_config,
+            output_dir=tmp_path / "output",
+            base_env={},
+        )
+
+        # ★ 关键断言：每个 subject 的所有 step 必须都已完成
+        assert step_count == {"subj-a": 2, "subj-b": 2}, (
+            f"Expected all steps done, got {step_count}"
+        )
+        # 结果必须覆盖所有 subject
+        assert len(all_results) == 2
