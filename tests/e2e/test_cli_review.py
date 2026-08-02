@@ -101,7 +101,7 @@ class TestReviewE2E:
         pipeline_dir, output_dir = _make_pipeline_dir(tmp_path, data_dir)
 
         result = subprocess.run(
-            [_paper_review_bin(), "--data-dir", str(data_dir), "review", str(pipeline_dir)],
+            [_paper_review_bin(), "--data-dir", str(data_dir), "review", "--skip-warnings", str(pipeline_dir)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -209,7 +209,7 @@ class TestReviewE2E:
         pdf_path.write_text("dummy")
 
         result = subprocess.run(
-            [_paper_review_bin(), "--data-dir", str(data_dir), "review", str(pdf_path)],
+            [_paper_review_bin(), "--data-dir", str(data_dir), "review", "--skip-warnings", str(pdf_path)],
             capture_output=True,
             text=True,
             timeout=15,
