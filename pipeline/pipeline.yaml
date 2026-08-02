@@ -19,7 +19,7 @@
 #   ═══════════════════════════════════════════════════════════════════════════
 
 name: "标准论文评审管线"
-version: "1.0"
+version: "2.0"
 
 # ── Pre Phase（批量执行）────────────────────────────────────────────────
 # 概念：所有待审 Subject 依次执行每个 Step（不并行）。
@@ -27,6 +27,14 @@ version: "1.0"
 # 注意：此阶段不需要 Subject 上下文，只跑一次。
 pre:
   directory: pre-review/ # 步骤脚本目录（相对于此 yaml 所在目录）
+  # manifest_step: 产 subject-manifest.json 的 step 名称（不含扩展名）
+  # 缺失时框架不自动生成 manifest，Review 阶段直接从 CLI 路径发现 Subject
+  manifest_step: "00-convert"
+  # duplicate_policy: 同名 Subject 去重策略
+  #   skip   — 以先出现的为准，后出现的跳过（默认）
+  #   rename — 自动加后缀（如 论文A-1）
+  #   error  — 终止管线报告冲突
+  duplicate_policy: skip
   retry:
     max_attempts: 2 # Step 失败时的重试次数
     on_failure: skip # 重试仍失败时的策略: skip（跳过）或 abort（终止管线）
@@ -37,6 +45,13 @@ pre:
 # 特点：支持 Worker 池并发处理多篇论文。
 review:
   directory: review-pipeline/ # 步骤脚本目录
+  # subject_source: Subject 来源声明
+  #   type: manifest — 从 {{ output_dir }}/subject-manifest.json 读取
+  #   type: cli       — 直接从 CLI 输入路径发现（默认）
+  subject_source:
+    type: manifest
+    path: "{{ output_dir }}/subject-manifest.json"
+  duplicate_policy: skip
   retry:
     max_attempts: 1 # 一般重试 1 次（Agent 评审费时）
     on_failure: skip
@@ -51,14 +66,15 @@ review:
   # 控制并发度。多 Subject 时并行提速，单 Subject 时退化顺序。
   pool:
     workers: 5 # 最大并发 Worker 数（1=顺序, 0=自动）
-    timeout: 0 # 单个 Subject 超时秒数（0 = 无超时）
+    timeout: 600 # 单个 Subject 超时秒数（10分钟/篇，.md Agent 步骤可能较慢）
     ordered: true # 是否按 Subject 原始顺序返回结果
 
 # ── Post Phase（批量执行）───────────────────────────────────────────────
 # 概念：所有 Subject 完成 Review 后统一执行。
-# 用途：标签反写索引、报告归档（JSON + MD）、通知等收尾任务。
+# 用途：标签反写索引、报告归档（JSON + MD）、Excel 汇总、通知等收尾任务。
 post:
   directory: post-review/
+  duplicate_policy: skip
   retry:
     max_attempts: 2
     on_failure: skip

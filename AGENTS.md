@@ -112,6 +112,11 @@ pipeline/
 - **配置读取**：`config.py` 的 Pydantic 模型；默认值在 `store.py` 顶层常量。
 - **向量序列化**：`struct.pack("f" * dim, *vec)` 写入 BLOB。
 - **CLI**：Typer 框架，`paper-review` 统一入口。新增子命令时，docstring 即为 `--help` 文案，必须写清用法和选项含义。
+- **CLI 设计红线**：见 SPEC.md § CLI 命令设计原则。核心约束：
+  - `init` 做开箱即用的引导，生成完整脚手架确保用户能直接体验
+  - `config` 是模型选择 / 设置管理的唯一入口
+  - 模型发现逻辑统一在 `model_discovery` 模块，供 `config` 和 `install.sh` 共用
+  - 不新增与现有命令职责重叠的命令——优先扩展现有命令参数
 
 ## 关键设计决策
 
@@ -156,11 +161,47 @@ Pre Phase (batch) → Review Phase (per subject) → Post Phase (batch)
 
 详见 `CONTEXT.md`（术语）、`docs/PIPELINE.md`（设计）、`docs/SPEC-PIPELINE.md`（需求规格）。
 
-## 测试策略
+## 测试体系
 
-- **Seam**：`Store(":memory:")` 纯内存 SQLite；管线测试用临时目录 + mock `subprocess.run`
-- **测试数据**：确定性纯文本模拟 PDF 内容
+### 三级分层
+
+| 层级 | 目录 | 定位 | 运行方式 | 是否用 mock |
+|------|------|------|----------|-------------|
+| 单元测试 | `tests/test_*.py` | 纯 Python 函数/类级别的独立逻辑验证 | `PYTHONPATH=src python -m pytest` | 允许 mock 第三方依赖（onnxruntime、tokenizers 等） |
+| 模型集成测试 | `tests/test_model_integration.py` | 双路径：有模型时真跑 ONNX 推理，无模型时 mock | `PYTHONPATH=src python -m pytest` | mock 当模型不可用时；真实推理当模型可用时 |
+| E2E 测试 | `tests/e2e/` | **以独立空间的 CLI 命令执行**，验证全链路行为 | `python -m pytest tests/e2e/ -v` | **禁止 mock**：必须通过 `subprocess.run([paper-review, ...])` 在隔离的 `--data-dir` 中执行 |
+
+### E2E 测试的核心约束（红线）
+
+E2E 测试是集成测试的唯一权威标准：
+
+1. **CLI 命令独立空间执行**：每个测试在 `tmp_path` 中创建完整的数据目录，通过 `--data-dir` 隔离，不依赖外部文件或缓存。
+2. **禁止 mock**：E2E 测试不能 mock 任何内部函数。唯一允许的 mock 是外部工具（如 `pandoc`、`pi` 的 mock 二进制）。
+3. **验证产物**：检查管线产物文件（`output.json`、manifest、Excel、report）的存在性和内容正确性，不只检查 `returncode`。
+4. **覆盖关键路径**：必须覆盖 Pre→Review→Post 完整链路、边界情况（空输入、去重、格式不支持）和特性开关（单篇 vs 多篇 Excel）。
+5. **隔离性**：测试间互不依赖，每个测试独立创建 `tmp_path` 隔离。
+
+### 测试数据
+
+- **确定性 PDF**：`_make_pdf()` 生成最小有效 PDF（含文本内容的 PDF-1.4）
+- **确定性 docx**：`_make_docx()` 生成最小 OOXML 文档
 - **不测试**：FAISS 和 sentence-transformers 的第三方行为；HTTP 路由单独集成测试
+
+### 运行测试
+
+```bash
+# 单元 + 模型集成测试（不需 onnxruntime，mock 兜底）
+PYTHONPATH=src python -m pytest tests/ --ignore=tests/test_cli.py --ignore=tests/test_cli_data_dir.py
+
+# 真模型集成测试（需要 onnxruntime + 已下载的模型）
+uv run --with pytest python -m pytest tests/test_model_integration.py
+
+# E2E 测试（需要 paper-review 已安装）
+PYTHONPATH=src python -m pytest tests/e2e/ -v
+
+# 全量
+PYTHONPATH=src python -m pytest tests/ --ignore=tests/test_cli.py --ignore=tests/test_cli_data_dir.py && PYTHONPATH=src python -m pytest tests/e2e/ -v
+```
 
 前置条件：`PYTHONPATH=src pip install -e .`
 

@@ -50,6 +50,29 @@
 
 13. 作为一名开发者，我希望能使用纯 Python 标准库 + pip 可安装的依赖实现整个系统，使得依赖冲突最小化
 
+## CLI 命令设计原则
+
+paper-review 的命令遵循以下设计原则：
+
+### 命令职责边界
+
+| 命令 | 定位 | 职责 |
+|------|------|------|
+| `init` | 开箱引导 | 一键生成完整可用的项目脚手架：config.yaml + pipeline.yaml + 所有默认管线步骤文件（pre-review/、review-pipeline/、post-review/）。生成后用户可直接运行 `paper-review review ./paper.pdf` 体验完整流程。引导完成后提示 `config` 命令和配置文件路径。 |
+| `config` | 完整设置 | 模型选择（本地发现 + 在线 3 档推荐）、配置编辑。`init` 之后的下一步。 |
+| `review` | 核心工作 | 执行评审流水线。单 PDF 或目录批量。 |
+| `index` | 检索子系统 | 建历史论文索引。 |
+| `search` | 检索子系统 | 混合检索。 |
+| `status` | 检索子系统 | 查看索引状态。 |
+| `serve` | 检索子系统 | 启动 HTTP API。 |
+
+### 设计红线
+
+1. **不新增与现有命令职责重叠的命令**。优先扩展现有命令的参数而非新建。
+2. **`init` 做开箱即用的引导**。`init` 应生成完整的项目脚手架（含所有默认步骤文件），确保用户按 README 步骤即可直接体验评审管线。`init` 结束时应提示 `config` 命令和配置文件路径。
+3. **模型选择逻辑统一在 `model_discovery` 模块**，供 `config` 命令和 `install.sh` 共用。
+4. **install.sh 的模型流程与 `config` 一致**：先扫描本地 → 有则列出让选，没有则 3 档推荐。
+
 ## Implementation Decisions
 
 ### 1. 包结构与模块边界

@@ -1,3 +1,4 @@
+# ruff: noqa: UP007  -- Python 3.9 不支持 X | None 语法
 """
 CLI 入口 —— 论文检索服务的命令行接口
 
@@ -8,11 +9,10 @@ CLI 入口 —— 论文检索服务的命令行接口
 - serve: 启动 HTTP 服务
 """
 
-from __future__ import annotations
-
 import hashlib
 import logging
 from pathlib import Path
+from typing import Optional  # noqa: F401 # needed by Typer get_type_hints()
 
 import typer
 
@@ -503,18 +503,20 @@ def _read_template(name: str) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
-def _get_default_pipeline_source() -> Path | None:
+def _get_default_pipeline_source(subdir: str = "review-pipeline") -> Path | None:
     """找到默认管线步骤脚本的源目录。
 
     对于 editable install（-e .），步骤文件位于项目根目录的 pipeline/ 下。
-    路径：{项目根}/pipeline/review-pipeline/
+    路径：{项目根}/pipeline/{subdir}/
+
+    subdir: 'review-pipeline' | 'pre-review' | 'post-review'
     """
     try:
         import paper_review
 
         mod_file = paper_review.__file__  # src/paper_review/__init__.py
         repo_root = Path(mod_file).resolve().parent.parent.parent  # 项目根
-        candidate = repo_root / "pipeline" / "review-pipeline"
+        candidate = repo_root / "pipeline" / subdir
         if candidate.is_dir():
             return candidate
     except Exception:
@@ -657,15 +659,20 @@ _DEFAULT_PIPELINE_YAML = """# ════════════════�
 #   {subject.text}          —— 论文全文
 #   {intermediates.XX.data}  —— 前置步骤的输出
 #
+# 解析时变量（在 pipeline.yaml 中使用）：
+#   {{ output_dir }}        —— 输出根目录
+#
 # ═══════════════════════════════════════════════════
 
 name: "标准论文评审管线"
-version: "1.0"
+version: "2.0"
 
 # ── Pre Phase（批量执行）───────────────────────────
 # 所有 Subject 依次执行每个 Step（不并行）
 pre:
   directory: pre-review/   # 步骤脚本目录（相对于此 yaml 所在目录）
+  manifest_step: "00-convert"  # 产 subject-manifest.json 的 step
+  duplicate_policy: skip        # skip | rename | error
   retry:
     max_attempts: 2        # 失败重试次数
     on_failure: skip        # skip（跳过）或 abort（终止）
@@ -674,6 +681,10 @@ pre:
 # 每篇论文独立走完所有 Step，支持 Worker 池并发
 review:
   directory: review-pipeline/  # 步骤脚本目录
+  subject_source:
+    type: manifest             # manifest | cli（默认）
+    path: "{{ output_dir }}/subject-manifest.json"
+  duplicate_policy: skip
   retry:
     max_attempts: 1
     on_failure: skip
@@ -682,12 +693,13 @@ review:
     direction: asc          # asc / desc
   pool:
     workers: 5              # 并发 Worker 数（1=顺序）
-    timeout: 0              # 单 Subject 超时秒数（0=无超时）
+    timeout: 120            # 单 Subject 超时秒数
     ordered: true           # 按 Subject 顺序返回结果
 
 # ── Post Phase（批量执行）──────────────────────────
 post:
   directory: post-review/
+  duplicate_policy: skip
   retry:
     max_attempts: 2
     on_failure: skip
@@ -755,14 +767,45 @@ def init(
             typer.echo(f"  ✓ 创建 {step_path}")
         cfg_changed = True
 
-    # pre-review/ 和 post-review/ 空目录（pipeline.yaml 引用了它们）
-    for sub in ("pre-review", "post-review"):
-        sub_dir = dd / sub
-        if not sub_dir.exists():
-            sub_dir.mkdir(parents=True, exist_ok=True)
-            (sub_dir / ".gitkeep").touch()
-            typer.echo(f"  ✓ 创建 {sub_dir}/")
+    # pre-review/: 从安装包复制默认步骤
+    pre_src = _get_default_pipeline_source("pre-review")
+    target_pre_dir = dd / "pre-review"
+    if pre_src and pre_src.is_dir() and list(pre_src.iterdir()):
+        for f in sorted(pre_src.iterdir()):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            dest = target_pre_dir / f.name
+            if dest.exists() and not force:
+                continue
+            target_pre_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+            typer.echo(f"  ✓ 创建 {dest}")
             cfg_changed = True
+    elif not target_pre_dir.exists():
+        target_pre_dir.mkdir(parents=True, exist_ok=True)
+        (target_pre_dir / ".gitkeep").touch()
+        typer.echo(f"  ✓ 创建 {target_pre_dir}/")
+        cfg_changed = True
+
+    # post-review/: 从安装包复制默认步骤
+    post_src = _get_default_pipeline_source("post-review")
+    target_post_dir = dd / "post-review"
+    if post_src and post_src.is_dir() and list(post_src.iterdir()):
+        for f in sorted(post_src.iterdir()):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            dest = target_post_dir / f.name
+            if dest.exists() and not force:
+                continue
+            target_post_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+            typer.echo(f"  ✓ 创建 {dest}")
+            cfg_changed = True
+    elif not target_post_dir.exists():
+        target_post_dir.mkdir(parents=True, exist_ok=True)
+        (target_post_dir / ".gitkeep").touch()
+        typer.echo(f"  ✓ 创建 {target_post_dir}/")
+        cfg_changed = True
 
     if not cfg_changed:
         typer.echo("  所有文件已存在，无变更。")
@@ -771,9 +814,190 @@ def init(
     typer.echo("📖 建议阅读以上文件中的注释了解各配置项含义。")
     typer.echo("   编辑 review-pipeline/ 下的步骤文件可自定义评审逻辑。")
     typer.echo("")
+    typer.echo("后续运行 paper-review config 完成更多设置（模型选择等）。")
+    typer.echo(f"配置文件: {dd / 'config.yaml'}")
+    typer.echo("")
     typer.echo("快速体验：")
     typer.echo("  paper-review index --pdf-dir ./data/history")
     typer.echo("  paper-review review ./待审论文.pdf")
+
+
+@app.command()
+def config():
+    """
+    完整配置管理。
+
+    包括交互式 ONNX 模型选择（扫描本地缓存 + HuggingFace hub，
+    无本地模型时提供 3 档推荐下载），以及显示当前配置。
+    """
+    from pathlib import Path
+
+    from paper_review.model_discovery import (
+        scan_huggingface_cache,
+        scan_model_cache,
+    )
+
+    model_cache = Path.home() / ".cache" / "paper-review" / "models"
+
+    # Phase 1: 扫描本地
+    local = scan_model_cache(model_cache)
+    hf = scan_huggingface_cache()
+    seen_names: set[str] = {m.display_name for m in local}
+    for m in hf:
+        if m.display_name not in seen_names:
+            local.append(m)
+            seen_names.add(m.display_name)
+
+    emb_models = [m for m in local if m.model_type == "embedding"]
+    rerank_models = [m for m in local if m.model_type == "reranker"]
+
+    # ── Embedding ──
+    typer.echo()
+    typer.echo("━━━ Embedding 模型 ━━━")
+    _pick_or_download_model(
+        model_type="embedding",
+        local_models=emb_models,
+        model_cache=model_cache,
+    )
+
+    # ── Reranker ──
+    typer.echo()
+    typer.echo("━━━ Reranker 模型 ━━━")
+    _pick_or_download_model(
+        model_type="reranker",
+        local_models=rerank_models,
+        model_cache=model_cache,
+    )
+
+    typer.echo()
+    typer.echo("✓ 模型设置完成。编辑 config.yaml 可手动指定模型名称。")
+
+
+def _pick_or_download_model(
+    model_type: str,
+    local_models: list,
+    model_cache: Path,
+):
+    """让用户从本地模型中选择，或从 HF 下载，或跳过。"""
+    from paper_review.model_discovery import (
+        _model_dir_name,
+        download_model,
+        get_known_download_options,
+    )
+
+    if local_models:
+        typer.echo(f"发现 {len(local_models)} 个本地可用 {model_type} 模型：")
+        for i, m in enumerate(local_models, 1):
+            dim_info = f", {m.dim}维" if m.dim else ""
+            typer.echo(f"  ✓ [{i}] {m.display_name} ({m.size_mb:.0f}MB{dim_info}) — 已可用")
+        typer.echo(f"  [d] 下载另一个 {model_type} 模型")
+        typer.echo("  [s] 跳过（保持当前设置）")
+
+        choice = typer.prompt("选择", default="s")
+        if choice.lower() == "s":
+            typer.echo(f"  ⊘ 保持当前 {model_type} 模型")
+            return
+        if choice.lower() == "d":
+            _download_flow(model_type, model_cache)
+            return
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(local_models):
+                _link_model(local_models[idx], model_cache)
+                return
+        except ValueError:
+            pass
+        typer.echo("  无效选择，保持当前设置")
+        return
+
+    # 没有本地模型 → 推荐下载
+    typer.echo(f"未发现本地 {model_type} 模型。")
+    options = get_known_download_options(model_type)
+    typer.echo("可用的在线模型：")
+    for i, opt in enumerate(options, 1):
+        dim_hint = f", {opt['dim']}维" if opt.get("dim") else ""
+        typer.echo(
+            f"  [{i}] {opt['display_name']} ({opt['size_hint']}{dim_hint}) — {opt['description']}"
+        )
+    typer.echo("  [s] 跳过")
+
+    choice = typer.prompt("选择要下载的模型", default="1")
+    if choice.lower() == "s":
+        typer.echo(f"  ⊘ 跳过 {model_type} 模型")
+        return
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(options):
+            opt = options[idx]
+            typer.echo(f"  正在下载 {opt['display_name']} ...")
+            target = model_cache / _model_dir_name(opt["display_name"])
+            ok = download_model(opt["onnx_repo"], target)
+            if ok:
+                typer.echo(f"  ✓ 下载完成 → {target}")
+            else:
+                typer.echo("  ✗ 下载失败")
+            return
+    except ValueError:
+        pass
+    typer.echo(f"  无效选择，跳过 {model_type} 模型")
+
+
+def _download_flow(model_type: str, model_cache: Path):
+    """从 HF 下载新模型的交互流程。"""
+    from paper_review.model_discovery import (
+        _model_dir_name,
+        download_model,
+        get_known_download_options,
+    )
+
+    options = get_known_download_options(model_type)
+    typer.echo("可下载的模型：")
+    for i, opt in enumerate(options, 1):
+        dim_hint = f", {opt['dim']}维" if opt.get("dim") else ""
+        typer.echo(
+            f"  [{i}] {opt['display_name']} ({opt['size_hint']}{dim_hint}) — {opt['description']}"
+        )
+
+    choice = typer.prompt("选择", default="1")
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(options):
+            opt = options[idx]
+            target = model_cache / _model_dir_name(opt["display_name"])
+            typer.echo(f"  正在下载 {opt['display_name']} ...")
+            ok = download_model(opt["onnx_repo"], target)
+            if ok:
+                typer.echo(f"  ✓ 下载完成 → {target}")
+            else:
+                typer.echo("  ✗ 下载失败")
+    except ValueError:
+        typer.echo("  无效选择")
+
+
+def _link_model(model, model_cache: Path):
+    """将已发现的模型注册到 paper-review 缓存中。
+
+    如果模型已在 paper-review 缓存目录下则无需操作；
+    否则创建符号链接。
+    """
+    from paper_review.model_discovery import _model_dir_name
+
+    if model.path.parent == model_cache or str(model.path).startswith(str(model_cache)):
+        typer.echo(f"  ✓ 使用 {model.display_name}")
+        return
+
+    expected_path = model_cache / _model_dir_name(model.display_name)
+    if expected_path.exists():
+        typer.echo(f"  ✓ 使用 {model.display_name}")
+        return
+
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        expected_path.symlink_to(model.path, target_is_directory=True)
+        typer.echo(f"  ✓ 链接 {model.display_name} → {expected_path}")
+    except OSError as e:
+        typer.echo(f"  ⚠ 无法创建链接: {e}")
+        typer.echo(f"    模型位于: {model.path}")
 
 
 def main():

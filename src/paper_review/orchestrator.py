@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, wait
+import re
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from paper_review.logging_config import get_logger
@@ -36,8 +38,136 @@ from paper_review.pipeline_models import (  # noqa: F401 — 向后兼容 re-exp
     validate_step_output,
 )
 from paper_review.pipeline_steps import _run_step  # Step 分派
+from paper_review.progress import PipelineProgress
 
 logger = get_logger("orchestrator")
+
+# 解析时模板变量 pattern：{{ variable }}
+_PARSE_TIME_VAR = re.compile(r"\{\{\s*(\w+)\s*\}\}")
+
+
+# ============================================================================
+# Manifest & Subject 发现
+# ============================================================================
+
+
+def _load_manifest(manifest_path: Path) -> dict | None:
+    """加载 subject-manifest.json，返回解析后的 dict。
+
+    文件不存在时返回 None（调用方可回退到 CLI 发现）；
+    文件存在但不可解析时记录 error 后仍返回 None，
+    调用方应据此判断 Pre 阶段可能未正确完成。
+    """
+    if not manifest_path.exists():
+        logger.info("Manifest not found at %s — will fall back to CLI discovery", manifest_path)
+        return None
+    try:
+        with open(manifest_path) as f:
+            data = json.load(f)
+        logger.info("Loaded manifest: %d subjects", len(data.get("subjects", [])))
+        return data
+    except json.JSONDecodeError as e:
+        logger.error(
+            "Manifest file exists at %s but JSON is corrupt: %s. "
+            "Pre phase may have failed to produce a valid manifest.",
+            manifest_path,
+            e,
+        )
+        return None
+    except OSError as e:
+        logger.error("Failed to read manifest at %s: %s", manifest_path, e)
+        return None
+
+
+def _resolve_parse_time_vars(value: str, var_map: dict[str, str]) -> str:
+    """替换字符串中的 {{ var_name }} 模板变量。对未匹配变量发出 warning。"""
+
+    def _replacer(m: re.Match) -> str:
+        var_name = m.group(1)
+        if var_name in var_map:
+            return var_map[var_name]
+        logger.warning(
+            "Unknown template variable '{{ %s }}' in '%s' — left as-is",
+            var_name,
+            value,
+        )
+        return m.group(0)
+
+    return _PARSE_TIME_VAR.sub(_replacer, value)
+
+
+def _resolve_config_vars(value: str, output_dir: Path) -> str:
+    """解析配置中的 {{ output_dir }} 等变量。"""
+    var_map = {
+        "output_dir": str(output_dir.absolute()),
+    }
+    return _resolve_parse_time_vars(value, var_map)
+
+
+def _discover_subjects(
+    input_path: Path,
+) -> list[str]:
+    """从 CLI 输入路径发现 Subject 列表（纯 CLI 扫描）。
+
+    manifest 模式由 run_pipeline 内联处理，此函数仅做 CLI 回退扫描。
+    """
+    if input_path.is_dir():
+        return sorted(f.stem for f in input_path.iterdir() if f.is_file() and f.suffix == ".pdf")
+    else:
+        return [input_path.stem]
+
+
+def _apply_duplicate_policy(
+    subjects: list[str],
+    policy: str,
+) -> list[str]:
+    """按 duplicate_policy 处理同名 Subject。
+
+    policy:
+      skip   — 以先出现的为准，后出现的跳过（默认）
+      rename — 自动在重复项后加 -1, -2 等后缀
+      error  — 抛出 ValueError
+    """
+    if policy == "error":
+        seen: set[str] = set()
+        for s in subjects:
+            if s in seen:
+                raise ValueError(f"Duplicate subject '{s}' detected with duplicate_policy=error")
+            seen.add(s)
+        return subjects
+
+    if policy == "rename":
+        result: list[str] = []
+        counter: dict[str, int] = {}
+        for s in subjects:
+            if s in counter:
+                counter[s] += 1
+                result.append(f"{s}-{counter[s]}")
+            else:
+                counter[s] = 0
+                result.append(s)
+        return result
+
+    # skip（默认）: 保留先出现的
+    if policy != "skip":
+        logger.warning(
+            "Unknown duplicate_policy '%s' — falling back to 'skip'. Valid values: skip, rename, error",
+            policy,
+        )
+
+    result: list[str] = []
+    seen: set[str] = set()
+    skipped_count = 0
+    for s in subjects:
+        if s in seen:
+            skipped_count += 1
+            logger.info("Duplicate subject '%s' skipped (duplicate_policy=skip)", s)
+            continue
+        seen.add(s)
+        result.append(s)
+    if skipped_count:
+        logger.info("Skipped %d duplicate subject(s)", skipped_count)
+    return result
 
 
 # ============================================================================
@@ -53,6 +183,7 @@ def _process_single_subject(
     output_dir: Path,
     base_env: dict,
     progress: PoolProgress | None = None,
+    pp: PipelineProgress | None = None,
 ) -> tuple[str, list[StepResult]]:
     """处理单个 Subject 的所有 Step（供顺序/池化模式共用）。
 
@@ -63,10 +194,17 @@ def _process_single_subject(
     """
     if progress:
         progress.on_subject_start(subject)
+    if pp:
+        pp.review_subject_running(subject)
 
     subject_results: list[StepResult] = []
 
     for step in steps:
+        logger.info(
+            "  [%s] step '%s' starting",
+            subject,
+            step.stem,
+        )
         # 构建 intermediates 路径（优先使用任务结果目录）
         result_base = base_env.get("PIPELINE_RESULT_DIR", str(output_dir))
         if phase_name == "review":
@@ -80,6 +218,7 @@ def _process_single_subject(
             "PIPELINE_SUBJECT": subject,
             "PIPELINE_STEP_NAME": step.stem,
             "PIPELINE_INTERMEDIATES": str(Path(result_base) / "intermediates"),
+            "PIPELINE_DUPLICATE_POLICY": phase_config.duplicate_policy,
         }
 
         # 重试循环
@@ -141,6 +280,9 @@ def _process_single_subject(
 
         subject_results.append(result)
 
+        if pp:
+            pp.review_step_done(subject)
+
         if result.status == "error" and phase_config.retry.on_failure == "abort":
             logger.error("Aborting pipeline for %s due to %s failure", subject, step.stem)
             break
@@ -158,14 +300,16 @@ def _run_subjects_pooled(
     output_dir: Path,
     base_env: dict,
     progress: PoolProgress | None = None,
+    pp: PipelineProgress | None = None,
 ) -> dict[str, list[StepResult]]:
     """使用 Worker 池并发处理多个 Subject。
 
     每个 Worker 负责一个 Subject 的全部 Steps（顺序执行）。
-    支持超时取消和进度回调。
+    超时按单个 Subject 计时（非整个池），每秒轮询进度。
     """
     pool_cfg = phase_config.pool
     actual_workers = min(pool_cfg.workers, len(subjects))
+    per_subject_timeout = pool_cfg.timeout if pool_cfg.timeout > 0 else None
 
     logger.info(
         "Pool mode: %d worker(s) processing %d subject(s)",
@@ -175,11 +319,11 @@ def _run_subjects_pooled(
 
     all_results: dict[str, list[StepResult]] = {}
     errors: list[str] = []
+    start_times: dict[str, float] = {}
 
-    # 手动管理 executor——超时时用 shutdown(wait=False) 避免阻塞
     executor = ThreadPoolExecutor(max_workers=actual_workers)
     try:
-        future_map = {}
+        future_map: dict[Future, str] = {}
         for s in subjects:
             fut = executor.submit(
                 _process_single_subject,
@@ -190,65 +334,80 @@ def _run_subjects_pooled(
                 output_dir,
                 base_env,
                 progress,
+                pp,
             )
             future_map[fut] = s
+            start_times[s] = time.monotonic()
 
-        # 使用 wait() 轮询——避免 as_completed 在超时后仍等待 running future
         pending = set(future_map.keys())
         while pending:
-            poll_timeout = pool_cfg.timeout if pool_cfg.timeout > 0 else None
-            done, pending = wait(pending, timeout=poll_timeout)
+            done, pending = wait(pending, timeout=1.0)  # 每秒 poll
 
             for future in done:
                 subject = future_map[future]
                 try:
                     _, results = future.result()
                     all_results[subject] = results
-                    logger.debug("  Subject '%s' completed (%d steps)", subject, len(results))
+                    elapsed = time.monotonic() - start_times[subject]
+                    logger.info(
+                        "  [%s] ✓ completed in %.0fs",
+                        subject,
+                        elapsed,
+                    )
                 except Exception as e:
-                    logger.error("  Subject '%s' failed: %s", subject, e)
+                    logger.error("  [%s] ✗ failed: %s", subject, e)
                     errors.append(subject)
                     if progress:
                         progress.on_subject_fail(subject, "error", str(e))
-                    error_results: list[StepResult] = []
-                    for step in steps:
-                        error_results.append(
-                            StepResult(
-                                step_name=step.stem,
-                                status="error",
-                                error=f"Pool worker failed: {e}",
-                                subject=subject,
-                            )
-                        )
-                    all_results[subject] = error_results
+                    all_results[subject] = _make_error_results(steps, subject, str(e))
 
-            # 超时后有 pending future → 标记为超时失败
-            if pending:
-                logger.error("  %d subject(s) timed out after %ds", len(pending), pool_cfg.timeout)
-                for future in pending:
-                    subject = future_map[future]
-                    errors.append(subject)
-                    future.cancel()
-                    if progress:
-                        progress.on_subject_fail(
-                            subject, "timeout", f"Timed out after {pool_cfg.timeout}s"
-                        )
-                    error_results = []
-                    for step in steps:
-                        error_results.append(
-                            StepResult(
-                                step_name=step.stem,
-                                status="error",
-                                error=f"Timed out after {pool_cfg.timeout}s",
-                                subject=subject,
-                            )
-                        )
-                    all_results[subject] = error_results
-                break  # 不再继续轮询
+            # 检查每个 pending subject 是否超时
+            now = time.monotonic()
+            timed_out: list[Future] = []
+            for future in list(pending):
+                subject = future_map[future]
+                if (
+                    per_subject_timeout is not None
+                    and (now - start_times[subject]) > per_subject_timeout
+                ):
+                    timed_out.append(future)
+
+            for future in timed_out:
+                pending.discard(future)
+                subject = future_map[future]
+                future.cancel()
+                errors.append(subject)
+                logger.error(
+                    "  [%s] ✗ timed out after %ds",
+                    subject,
+                    per_subject_timeout,
+                )
+                if progress:
+                    progress.on_subject_fail(
+                        subject,
+                        "timeout",
+                        f"Timed out after {per_subject_timeout}s",
+                    )
+                all_results[subject] = _make_error_results(
+                    steps,
+                    subject,
+                    f"Timed out after {per_subject_timeout}s",
+                )
+
+            # 实时进度 — PipelineProgress 由 _process_single_subject 内的回调更新，
+            # spinner 线程负责刷新。这里只需回退到 logger 报告（无 pp 时）。
+            if not pp:
+                done_count = len(all_results)
+                running_count = len(pending)
+                logger.info(
+                    "  Progress: %d/%d done, %d running",
+                    done_count,
+                    len(subjects),
+                    running_count,
+                )
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
-    # 按原始顺序返回（pool_cfg.ordered）
     if pool_cfg.ordered:
         all_results = {s: all_results[s] for s in subjects if s in all_results}
 
@@ -256,6 +415,23 @@ def _run_subjects_pooled(
         logger.warning("Pool mode finished with %d failed subject(s): %s", len(errors), errors)
 
     return all_results
+
+
+def _make_error_results(
+    steps: list[StepFile],
+    subject: str,
+    error_msg: str,
+) -> list[StepResult]:
+    """为超时/失败的 subject 生成统一的 error StepResult 列表。"""
+    return [
+        StepResult(
+            step_name=step.stem,
+            status="error",
+            error=error_msg,
+            subject=subject,
+        )
+        for step in steps
+    ]
 
 
 def _run_phase_steps(
@@ -266,6 +442,7 @@ def _run_phase_steps(
     output_dir: Path,
     base_env: dict,
     progress: PoolProgress | None = None,
+    pp: PipelineProgress | None = None,
 ) -> dict[str, list[StepResult]]:
     """运行阶段内的所有步骤。
 
@@ -302,6 +479,7 @@ def _run_phase_steps(
             output_dir=output_dir,
             base_env=base_env,
             progress=progress,
+            pp=pp,
         )
 
     # 顺序执行模式（Pre/Post 单 Subject，或 Review 单 Subject/workers=1）
@@ -321,6 +499,7 @@ def _run_phase_steps(
                 "PIPELINE_SUBJECT": subject,
                 "PIPELINE_STEP_NAME": step.stem,
                 "PIPELINE_INTERMEDIATES": str(Path(result_base) / "intermediates"),
+                "PIPELINE_DUPLICATE_POLICY": phase_config.duplicate_policy,
             }
 
             result: StepResult | None = None
@@ -357,6 +536,15 @@ def _run_phase_steps(
                 )
 
             all_results[subject].append(result)
+
+            # Progress display update
+            if pp:
+                if phase_name == "pre":
+                    pp.pre_step_done()
+                elif phase_name == "post":
+                    pp.post_step_done()
+                elif phase_name == "review":
+                    pp.review_step_done(subject)
 
             if result.status == "error" and phase_config.retry.on_failure == "abort":
                 logger.error("Aborting pipeline due to %s failure on %s", step.stem, subject)
@@ -503,41 +691,6 @@ def run_pipeline(
     if pipeline_dir is None:
         pipeline_dir = Path.cwd()
 
-    # 确定 subject
-    if input_path.is_dir():
-        raw_subjects = sorted(
-            f.stem for f in input_path.iterdir() if f.is_file() and f.suffix == ".pdf"
-        )
-    else:
-        raw_subjects = [input_path.stem]
-
-    if not raw_subjects:
-        logger.warning("No PDF files found at %s", input_path)
-        return PipelineResult(subject="", success=True)
-
-    # 应用 Subject 排序
-    subjects = _order_subjects(raw_subjects, config.review.subject_order)
-    primary_subject = subjects[0]
-
-    # 从全局配置（config.yaml / env var）覆盖 pool 默认值
-    if pool_progress is None:
-        # 从环境变量读取 pool 默认覆盖
-        env_workers = os.environ.get("PAPER_REVIEW_POOL_WORKERS")
-        env_timeout = os.environ.get("PAPER_REVIEW_POOL_TIMEOUT")
-        if env_workers is not None:
-            try:
-                config.review.pool.workers = int(env_workers)
-            except ValueError:
-                pass
-        if env_timeout is not None:
-            try:
-                config.review.pool.timeout = int(env_timeout)
-            except ValueError:
-                pass
-
-    logger.info("Pipeline '%s' starting — %d subject(s)", config.name, len(subjects))
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-
     # 生成任务指纹（在任何阶段执行前，确保 intermediates 路径可用）
     import datetime
     import hashlib
@@ -552,7 +705,6 @@ def run_pipeline(
     if resolved_data_dir is None:
         resolved_data_dir = os.environ.get("PAPER_REVIEW_DATA_DIR")
     if resolved_data_dir is None:
-        # fallback: 从 cwd 或 home 自动发现
         from paper_review.config import resolve_data_dir
 
         resolved_data_dir = str(resolve_data_dir())
@@ -563,72 +715,218 @@ def run_pipeline(
         "PIPELINE_PIPELINE_DIR": str(pipeline_dir.absolute()),
         "PIPELINE_DATA_DIR": resolved_data_dir,
         "PIPELINE_RESULT_DIR": str(task_dir),
+        "PIPELINE_INPUT_PATH": str(input_path.absolute()),
     }
-
-    # 定义各阶段
-    phase_defs: list[tuple[str, PhaseConfig, str]] = [
-        ("pre", config.pre, config.pre.directory),
-        ("review", config.review, config.review.directory),
-        ("post", config.post, config.post.directory),
-    ]
-
-    if target_phase:
-        phase_defs = [p for p in phase_defs if p[0] == target_phase]
 
     all_phase_results: dict[str, dict[str, list[StepResult]]] = {}
     all_step_results: list[StepResult] = []
     overall_success = True
+    subjects: list[str] = []
+    primary_subject = ""
 
-    # 顺序执行各阶段
-    for phase_name, phase_cfg, phase_dir_str in phase_defs:
-        if not phase_dir_str:
-            logger.debug("Phase '%s' has no directory, skipping", phase_name)
-            continue
+    # ── 确定需要跑哪些阶段 ──
+    has_pre = bool(config.pre.directory)
+    has_review = bool(config.review.directory)
+    has_post = bool(config.post.directory)
 
-        phase_dir = pipeline_dir / phase_dir_str
-        steps = discover_steps(phase_dir)
+    if target_phase:
+        has_pre = target_phase == "pre"
+        has_review = target_phase == "review"
+        has_post = target_phase == "post"
 
-        if not steps:
-            logger.debug("Phase '%s' has no steps, skipping", phase_name)
-            continue
+    # ── Pre Phase（在 Subject 发现之前运行）──
+    pre_steps_count = 0
+    if has_pre:
+        pre_dir = pipeline_dir / config.pre.directory
+        pre_steps = discover_steps(pre_dir)
+        if target_step and target_phase == "pre":
+            pre_steps = [s for s in pre_steps if s.stem == target_step]
+        if pre_steps:
+            logger.info("Phase [pre] — %d step(s)", len(pre_steps))
+            pre_steps_count = len(pre_steps)
+            pre_results = _run_phase_steps(
+                steps=pre_steps,
+                phase_name="pre",
+                subjects=["_batch_"],
+                phase_config=config.pre,
+                output_dir=config.output_dir,
+                base_env=base_env,
+            )
+            all_phase_results["pre"] = pre_results
+            for subj, subj_results in pre_results.items():
+                all_step_results.extend(subj_results)
+                for r in subj_results:
+                    if r.status == "error":
+                        overall_success = False
 
-        # 过滤单步骤
-        if target_step:
-            steps = [s for s in steps if s.stem == target_step]
-            if not steps:
-                logger.warning("Step '%s' not found in phase '%s'", target_step, phase_name)
-                continue
+            # 验证 manifest_step 是否实际运行
+            declared_step = config.pre.manifest_step
+            if declared_step:
+                pre_batch_results = pre_results.get("_batch_", [])
+                manifest_step_ran = any(r.step_name == declared_step for r in pre_batch_results)
+                if manifest_step_ran:
+                    manifest_step_result = next(
+                        r for r in pre_batch_results if r.step_name == declared_step
+                    )
+                    if manifest_step_result.status == "error":
+                        logger.error(
+                            "Declared manifest_step '%s' failed in Pre phase — "
+                            "manifest may be missing or incomplete",
+                            declared_step,
+                        )
+                    else:
+                        logger.info(
+                            "Manifest step '%s' completed successfully",
+                            declared_step,
+                        )
+                else:
+                    logger.warning(
+                        "Declared manifest_step '%s' was not found in Pre phase steps. "
+                        "Available steps: %s",
+                        declared_step,
+                        [s.stem for s in pre_steps],
+                    )
 
-        # 确定 subjects（pre/post 为批量模式：一个虚拟 subject）
-        if phase_name == "review":
-            phase_subjects = subjects
+    # ── Subject 发现（Pre 阶段可能已产生 manifest）──
+    use_manifest = config.review.subject_source.type == "manifest"
+    if use_manifest:
+        manifest_path_str = _resolve_config_vars(
+            config.review.subject_source.path, config.output_dir
+        )
+        manifest_data = _load_manifest(Path(manifest_path_str))
+        if manifest_data:
+            subjects_data = manifest_data.get("subjects", [])
+            if subjects_data:
+                raw_subjects = [s["name"] for s in subjects_data]
+            else:
+                logger.warning("Manifest contains 0 subjects — falling back to CLI discovery")
+                raw_subjects = _discover_subjects(input_path)
         else:
-            phase_subjects = ["_batch_"]
+            # manifest 不存在或损坏 → CLI 扫描（_load_manifest 已记录具体原因）
+            logger.info(
+                "Falling back to CLI subject discovery from %s",
+                input_path,
+            )
+            raw_subjects = _discover_subjects(input_path)
+    else:
+        raw_subjects = _discover_subjects(input_path)
 
-        logger.info(
-            "Phase [%s] — %d step(s), %d subject(s)",
-            phase_name,
-            len(steps),
-            len(phase_subjects),
+    raw_subjects = _apply_duplicate_policy(raw_subjects, config.review.duplicate_policy)
+
+    if not raw_subjects:
+        logger.warning("No subjects found for review — skipping Review/Post phases")
+        # 如果已经跑过 Pre，直接返回结果
+        report_path = task_dir / "report.md"
+        conclusion = _generate_report(
+            report_path,
+            task_id,
+            config.name,
+            all_phase_results,
+            all_step_results,
+            overall_success,
+        )
+        return PipelineResult(
+            subject="",
+            success=overall_success,
+            step_results=all_step_results,
+            task_id=task_id,
+            task_dir=task_dir,
+            conclusion=conclusion,
         )
 
-        phase_results = _run_phase_steps(
-            steps=steps,
-            phase_name=phase_name,
-            subjects=phase_subjects,
-            phase_config=phase_cfg,
-            output_dir=config.output_dir,
-            base_env=base_env,
-            progress=pool_progress,
-        )
-        all_phase_results[phase_name] = phase_results
+    subjects = _order_subjects(raw_subjects, config.review.subject_order)
+    primary_subject = subjects[0]
 
-        # 汇总
-        for subj, subj_results in phase_results.items():
-            all_step_results.extend(subj_results)
-            for r in subj_results:
-                if r.status == "error":
-                    overall_success = False
+    # 从全局配置（config.yaml / env var）覆盖 pool 默认值
+    if pool_progress is None:
+        env_workers = os.environ.get("PAPER_REVIEW_POOL_WORKERS")
+        env_timeout = os.environ.get("PAPER_REVIEW_POOL_TIMEOUT")
+        if env_workers is not None:
+            try:
+                config.review.pool.workers = int(env_workers)
+            except ValueError:
+                pass
+        if env_timeout is not None:
+            try:
+                config.review.pool.timeout = int(env_timeout)
+            except ValueError:
+                pass
+
+    logger.info("Pipeline '%s' — %d subject(s)", config.name, len(subjects))
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Progress display ──
+    # Discover step counts for review/post phases
+    _review_steps_for_count = (
+        discover_steps(pipeline_dir / config.review.directory) if has_review else []
+    )
+    _post_steps_for_count = discover_steps(pipeline_dir / config.post.directory) if has_post else []
+    pp = PipelineProgress(
+        pre_steps=pre_steps_count,
+        review_subjects=len(subjects),
+        review_steps_per_subject=len(_review_steps_for_count),
+        post_steps=len(_post_steps_for_count),
+    )
+    # Pre phase already completed
+    for _ in range(pre_steps_count):
+        pp.pre_step_done()
+    pp.start()
+
+    # ── Review Phase ──
+    if has_review:
+        review_dir = pipeline_dir / config.review.directory
+        review_steps = discover_steps(review_dir)
+        if target_step and target_phase == "review":
+            review_steps = [s for s in review_steps if s.stem == target_step]
+        if review_steps:
+            logger.info(
+                "Phase [review] — %d step(s), %d subject(s)",
+                len(review_steps),
+                len(subjects),
+            )
+            review_results = _run_phase_steps(
+                steps=review_steps,
+                phase_name="review",
+                subjects=subjects,
+                phase_config=config.review,
+                output_dir=config.output_dir,
+                base_env=base_env,
+                progress=pool_progress,
+                pp=pp,
+            )
+            all_phase_results["review"] = review_results
+            for subj, subj_results in review_results.items():
+                all_step_results.extend(subj_results)
+                for r in subj_results:
+                    if r.status == "error":
+                        overall_success = False
+
+    # ── Post Phase ──
+    if has_post:
+        post_dir = pipeline_dir / config.post.directory
+        post_steps = discover_steps(post_dir)
+        if target_step and target_phase == "post":
+            post_steps = [s for s in post_steps if s.stem == target_step]
+        if post_steps:
+            logger.info("Phase [post] — %d step(s)", len(post_steps))
+            post_results = _run_phase_steps(
+                steps=post_steps,
+                phase_name="post",
+                subjects=["_batch_"],
+                phase_config=config.post,
+                output_dir=config.output_dir,
+                base_env=base_env,
+                pp=pp,
+            )
+            all_phase_results["post"] = post_results
+            for subj, subj_results in post_results.items():
+                all_step_results.extend(subj_results)
+                for r in subj_results:
+                    if r.status == "error":
+                        overall_success = False
+
+    # 完成进度条
+    pp.finish()
 
     # 生成 report.md
     report_path = task_dir / "report.md"

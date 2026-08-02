@@ -17,10 +17,12 @@ dependencies = [
   "rank-bm25>=0.2.0",
   "flask>=2.3.0",
   "pyyaml>=6.0",
+  "openpyxl>=3.1.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4", "huggingface-hub>=0.20.0"]
+dev = ["pytest>=8.0", "ruff>=0.4", "huggingface-hub>=0.20.0", "openpyxl>=3.1.0"]
+excel = ["openpyxl>=3.1.0"]
 
 [project.scripts]
 paper-review = "paper_review.cli:app"
@@ -47,13 +49,11 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "src/paper_review/cli.py" = ["UP007"]
-"tests/*.py" = ["S108"]               # allow temp paths in tests
-"tests/e2e/*.py" = ["S603", "S607"]   # subprocess calls for CLI smoke test
-"src/paper_review/config.py" = ["UP045"] # pre-existing: Optional[X] style
+"src/paper_review/orchestrator.py" = ["S603"]
+"tests/*.py" = ["S108"]                       # allow temp paths in tests
+"tests/e2e/*.py" = ["S603", "S607"]           # subprocess calls for CLI smoke test
+"src/paper_review/config.py" = ["UP045"]      # pre-existing: Optional[X] style
 # (models.py and reranker.py no longer use lazy type imports)
-"src/paper_review/orchestrator.py" = [
-  "S603",
-] # pre-existing: intended subprocess use
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]

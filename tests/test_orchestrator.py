@@ -7,10 +7,9 @@ Core Engine 测试 (T1): pipeline.yaml 解析 + Step 发现 + .py 执行
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from paper_review.orchestrator import (
     PipelineConfig,
@@ -140,18 +139,15 @@ class TestStepDiscovery:
 
 
 class TestPyStepExecution:
-    def test_py_step_subprocess_called(self, tmp_path):
-        """.py 步骤调用 subprocess.run 并传入正确参数。"""
+    def test_py_step_runpy_called(self, tmp_path):
+        """.py 步骤通过 runpy.run_path 在进程内执行。"""
         output_dir = tmp_path / "output"
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
         step_file = steps_dir / "01-test.py"
         step_file.write_text("print('hello')")
 
-        # 由于我们实际 mock subprocess，验证参数
-        with patch("paper_review.pipeline_steps.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-
+        with patch("paper_review.pipeline_steps.runpy.run_path") as mock_run:
             run_pipeline(
                 pipeline_yaml={
                     "name": "t1",
@@ -162,64 +158,71 @@ class TestPyStepExecution:
             )
 
             assert mock_run.called
-            args, kwargs = mock_run.call_args
-            # args[0] is the command list
-            cmd = args[0]
-            assert cmd == [sys.executable, str(step_file)] or sys.executable in cmd[0]
-            assert str(step_file) in cmd or step_file.name in cmd
+            call_path = mock_run.call_args[0][0]
+            assert call_path == str(step_file) or Path(call_path).name == step_file.name
 
     def test_py_step_env_vars_injected(self, tmp_path):
-        """环境变量 PIPELINE_STEP_DIR 等被注入到 subprocess。"""
+        """环境变量 PIPELINE_STEP_DIR 等被注入到 os.environ（进程内执行）。"""
         output_dir = tmp_path / "output"
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
+        # 步骤脚本捕获并写入 os.environ 中的关键变量
         (steps_dir / "01-test.py").write_text(
-            "import os; print(os.environ.get('PIPELINE_STEP_DIR'))"
+            "import json, os\n"
+            "d = os.environ.get('PIPELINE_STEP_DIR', 'not-set')\n"
+            "step_name = os.environ.get('PIPELINE_STEP_NAME', 'not-set')\n"
+            "out = os.environ.get('PIPELINE_OUTPUT_DIR', 'not-set')\n"
+            "step_dir = os.environ['PIPELINE_STEP_DIR']\n"
+            "os.makedirs(step_dir, exist_ok=True)\n"
+            "with open(os.path.join(step_dir, 'output.json'), 'w') as f:\n"
+            "    json.dump({'step': step_name, 'status': 'ok', 'data': {'step_dir': d, 'output_dir': out}}, f)\n"
         )
 
-        with patch("paper_review.pipeline_steps.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        run_pipeline(
+            pipeline_yaml={
+                "name": "t1",
+                "output_dir": str(output_dir),
+                "review": {"directory": str(steps_dir.absolute())},
+            },
+            input_path=tmp_path / "subject-01.pdf",
+        )
 
-            run_pipeline(
-                pipeline_yaml={
-                    "name": "t1",
-                    "output_dir": str(output_dir),
-                    "review": {"directory": str(steps_dir.absolute())},
-                },
-                input_path=tmp_path / "subject-01.pdf",
-            )
-
-            env = mock_run.call_args.kwargs.get("env", {})
-            assert "PIPELINE_STEP_DIR" in env
-            assert "PIPELINE_OUTPUT_DIR" in env
-            assert "PIPELINE_STEP_NAME" in env
-            assert env["PIPELINE_STEP_NAME"] == "01-test"
+        # 验证 output.json 中捕获了关键环境变量
+        result_dirs = list((output_dir / "result").iterdir())
+        assert len(result_dirs) == 1
+        task_dir = result_dirs[0]
+        step_output = task_dir / "intermediates" / "subject-01" / "01-test" / "output.json"
+        assert step_output.exists()
+        data = json.loads(step_output.read_text())
+        assert data["status"] == "ok"
+        assert data["data"]["step_dir"] != "not-set"
+        assert data["data"]["output_dir"] != "not-set"
 
     def test_py_step_creates_intermediates_dir_before_running(self, tmp_path):
-        """Orchestrator 在运行前创建 intermediates 目录。"""
+        """Orchestrator 在运行 .py 步骤前创建 intermediates 目录。"""
         output_dir = tmp_path / "output"
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
-        (steps_dir / "01-test.py").write_text("")
+        # 步骤脚本写 output.json 来验证目录已存在
+        (steps_dir / "01-test.py").write_text(
+            "import json, os\n"
+            "step = os.environ['PIPELINE_STEP_DIR']\n"
+            "assert os.path.isdir(step), f'step_dir does not exist: {step}'\n"
+            "with open(os.path.join(step, 'output.json'), 'w') as f:\n"
+            "    json.dump({'step':'01-test','status':'ok','data':{}}, f)\n"
+        )
 
-        with patch("paper_review.pipeline_steps.subprocess.run") as mock_run:
-            mock_proc = MagicMock()
-            mock_proc.returncode = 0
-            mock_proc.stdout = ""
-            mock_proc.stderr = ""
-            mock_run.return_value = mock_proc
+        result = run_pipeline(
+            pipeline_yaml={
+                "name": "t1",
+                "output_dir": str(output_dir),
+                "review": {"directory": str(steps_dir.absolute())},
+            },
+            input_path=tmp_path / "subject-01.pdf",
+        )
 
-            result = run_pipeline(
-                pipeline_yaml={
-                    "name": "t1",
-                    "output_dir": str(output_dir),
-                    "review": {"directory": str(steps_dir.absolute())},
-                },
-                input_path=tmp_path / "subject-01.pdf",
-            )
-
-            expected_dir = result.task_dir / "intermediates" / "subject-01" / "01-test"
-            assert expected_dir.exists()
+        expected_dir = result.task_dir / "intermediates" / "subject-01" / "01-test"
+        assert expected_dir.exists()
 
 
 # ============================================================================

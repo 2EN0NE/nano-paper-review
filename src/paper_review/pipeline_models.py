@@ -169,11 +169,24 @@ class SubjectOrderConfig:
 class PhaseConfig:
     directory: str = ""
     retry: RetryConfig = field(default_factory=RetryConfig)
+    # manifest_step: 产 manifest 的 step 名称（仅 pre 阶段使用）
+    manifest_step: str = ""
+    # duplicate_policy: 同名 Subject 去重策略
+    duplicate_policy: str = "skip"  # 'skip' | 'rename' | 'error'
+
+
+@dataclass
+class SubjectSourceConfig:
+    """Subject 来源配置。"""
+
+    type: str = "cli"  # 'cli' | 'manifest'
+    path: str = ""  # manifest 文件路径（type=manifest 时有效）
 
 
 @dataclass
 class ReviewPhaseConfig(PhaseConfig):
     subject_order: SubjectOrderConfig = field(default_factory=SubjectOrderConfig)
+    subject_source: SubjectSourceConfig = field(default_factory=SubjectSourceConfig)
     pool: PoolConfig = field(default_factory=PoolConfig)
 
 
@@ -199,16 +212,23 @@ class PipelineConfig:
                 max_attempts=pre_data.get("retry", {}).get("max_attempts", 1),
                 on_failure=pre_data.get("retry", {}).get("on_failure", "skip"),
             ),
+            manifest_step=pre_data.get("manifest_step", ""),
+            duplicate_policy=pre_data.get("duplicate_policy", "skip"),
         )
 
         review_data = data.get("review", {"directory": ""})
         priority_data = review_data.get("subject_order", {}).get("priority")
         pool_data = review_data.get("pool", {})
+        subject_source_data = review_data.get("subject_source", {})
         review = ReviewPhaseConfig(
             directory=review_data.get("directory", ""),
             retry=RetryConfig(
                 max_attempts=review_data.get("retry", {}).get("max_attempts", 1),
                 on_failure=review_data.get("retry", {}).get("on_failure", "skip"),
+            ),
+            subject_source=SubjectSourceConfig(
+                type=subject_source_data.get("type", "cli"),
+                path=subject_source_data.get("path", ""),
             ),
             subject_order=SubjectOrderConfig(
                 sort_by=review_data.get("subject_order", {}).get("sort_by", "name"),
@@ -220,6 +240,7 @@ class PipelineConfig:
                 timeout=pool_data.get("timeout", 0),
                 ordered=pool_data.get("ordered", True),
             ),
+            duplicate_policy=review_data.get("duplicate_policy", "skip"),
         )
 
         post_data = data.get("post", {})
@@ -229,6 +250,7 @@ class PipelineConfig:
                 max_attempts=post_data.get("retry", {}).get("max_attempts", 1),
                 on_failure=post_data.get("retry", {}).get("on_failure", "skip"),
             ),
+            duplicate_policy=post_data.get("duplicate_policy", "skip"),
         )
 
         return cls(

@@ -2,7 +2,7 @@
 管线 Steps 执行器
 
 负责执行单个 Pipeline Step：
-- .py → subprocess.run([python, step_path])
+- .py → runpy.run_path() 在进程内执行
 - .md → subprocess.run([pi, -p, @prompt_file])
 """
 
@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import subprocess
-import sys
+import threading
 from pathlib import Path
 
 from paper_review.logging_config import get_logger
@@ -19,54 +20,64 @@ from paper_review.pipeline_models import StepFile, StepResult
 
 logger = get_logger("orchestrator")
 
+# 进程内执行 .py 步骤时的环境变量互斥锁（Worker 池并发时保护 os.environ）
+_py_step_lock = threading.Lock()
+
 
 def _run_py_step(step: StepFile, step_dir: Path, env: dict) -> StepResult:
-    """执行一个 .py 步骤。"""
-    logger.debug("Running .py step: %s", step.stem)
+    """执行一个 .py 步骤（进程内执行，共享包环境）。
+
+    Worker 池并发时使用 _py_step_lock 保护 os.environ 互斥访问，
+    避免线程间环境变量竞争。
+    """
+    logger.info("  [.py] %s — starting", step.stem)
 
     os.makedirs(step_dir, exist_ok=True)
-    step_env = {**env, "PIPELINE_STEP_DIR": str(step_dir)}
+    step_env = {**os.environ, **env, "PIPELINE_STEP_DIR": str(step_dir)}
 
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(step.path)],
-            env=step_env,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("Step %s timed out", step.stem)
-        return StepResult(
-            step_name=step.stem,
-            status="error",
-            error="Timed out after 600s",
-        )
+    with _py_step_lock:
+        # 记录步骤执行前 os.environ 中被覆盖的 key 原始值
+        _prev = {k: os.environ.get(k) for k in step_env if k in os.environ}
+        try:
+            os.environ.update(step_env)
+            runpy.run_path(str(step.path), run_name="__main__")
+        except (Exception, SystemExit) as e:
+            if isinstance(e, SystemExit):
+                logger.warning("  [.py] %s — exited with code %s", step.stem, e.code)
+            else:
+                logger.warning("  [.py] %s — failed: %s", step.stem, e)
+            error_msg = str(e)
 
-    if proc.returncode != 0:
-        error_msg = proc.stderr.strip() or f"exit code {proc.returncode}"
-        logger.warning("Step %s failed: %s", step.stem, error_msg)
+            output_file = step_dir / "output.json"
+            if output_file.exists():
+                try:
+                    with open(output_file) as f:
+                        data = json.load(f)
+                    return StepResult(
+                        step_name=step.stem,
+                        status="error",
+                        error=error_msg,
+                        data=data.get("data", {}),
+                    )
+                except (OSError, json.JSONDecodeError):
+                    pass
 
-        # 即使失败也检查是否有 output.json
-        output_file = step_dir / "output.json"
-        if output_file.exists():
-            try:
-                with open(output_file) as f:
-                    data = json.load(f)
-                return StepResult(
-                    step_name=step.stem,
-                    status="error",
-                    error=error_msg,
-                    data=data.get("data", {}),
-                )
-            except (OSError, json.JSONDecodeError):
-                pass
-
-        return StepResult(
-            step_name=step.stem,
-            status="error",
-            error=error_msg,
-        )
+            return StepResult(
+                step_name=step.stem,
+                status="error",
+                error=error_msg,
+            )
+        finally:
+            # 恢复被覆盖的 key
+            for k, v in _prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            # 清理步骤新增的 key（不在 _prev 中的）
+            for k in step_env:
+                if k not in _prev:
+                    os.environ.pop(k, None)
 
     # 成功 — 读取 output.json
     output_file = step_dir / "output.json"
@@ -79,6 +90,7 @@ def _run_py_step(step: StepFile, step_dir: Path, env: dict) -> StepResult:
             logger.warning("Failed to parse output.json for %s: %s", step.stem, e)
 
     step_status = data.get("status", "ok")
+    logger.info("  [.py] %s — %s", step.stem, step_status)
     return StepResult(
         step_name=step.stem,
         status=step_status,

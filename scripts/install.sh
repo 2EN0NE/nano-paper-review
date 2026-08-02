@@ -136,178 +136,77 @@ cd "$REPO_ROOT"
 
 if $USE_UV; then
 	# ---- uv 路径：全局工具安装 ----
-	# uv tool install 会自动管理 Python 版本 + 创建隔离环境 + 注册 entry point
-	# 安装后 paper-review 命令直接全局可用（不需要 source venv）
-	#
-	# 注意：开发期修改源码后，需要重新安装才能生效：
-	#   uv tool install --python 3.12 -e . --force
-	#
+	# uv tool install 自动管理 Python 版本 + 创建隔离环境 + 注册 entry point。
+	# --force 确保每次运行时根据当前 pyproject.toml 重装全部依赖（新增依赖也会补上）。
 	info "通过 uv tool install 安装 paper-review（自动管理 Python 版本）..."
 	uv tool install --python 3.12 -e . --force 2>&1 || {
 		warn "uv tool install 失败，降级到 python3 -m pip..."
-		python3 -m pip install -e .
+		python3 -m pip install --upgrade -e .
 	}
 else
 	# ---- pip 路径：直接安装 ----
-	python3 -m pip install -e .
+	# --upgrade 确保新增依赖也会被安装（首次运行等效于普通 install -e .）
+	python3 -m pip install --upgrade -e .
 fi
 
 ok "Python 包安装完成"
 
 # ============================================================================
-# 2. 下载 ONNX 模型
+# 2. 选择 / 下载 ONNX 模型（交互式，支持本地发现 + 3档推荐）
 # ============================================================================
 if $SKIP_MODELS; then
-	info "跳过模型下载（--skip-models）"
+	info "跳过模型选择（--skip-models）"
 else
 	echo ""
 	echo "=========================================="
-	echo "  ONNX 模型下载"
+	echo "  模型选择"
 	echo "=========================================="
 	echo ""
 	info "模型将缓存到: ${MODEL_CACHE_DIR}"
 	echo ""
 
-	# 检查 huggingface_hub 是否可用
-	HF_HUB_AVAILABLE=false
-	python3 -c "from huggingface_hub import snapshot_download; print('ok')" 2>/dev/null && HF_HUB_AVAILABLE=true
-
-	if ! $HF_HUB_AVAILABLE; then
-		info "安装 huggingface-hub（用于模型下载）..."
-		python3 -m pip install -q huggingface-hub 2>/dev/null || {
-			warn "无法安装 huggingface-hub，将使用 curl 下载"
-		}
-		python3 -c "from huggingface_hub import snapshot_download; print('ok')" 2>/dev/null && HF_HUB_AVAILABLE=true
-	fi
-
-	# ---- Embedding 模型（必下） ----
-	EMB_TARGET="$MODEL_CACHE_DIR/$EMBEDDING_DIR_NAME"
-	if [[ -f "$EMB_TARGET/model.onnx" ]]; then
-		ok "Embedding 模型已存在: $(du -sh "$EMB_TARGET" 2>/dev/null | cut -f1) — 跳过"
+	DISCOVERY_SCRIPT="$REPO_ROOT/scripts/discover_models.py"
+	if $YES_MODE; then
+		python3 "$DISCOVERY_SCRIPT" --yes
 	else
-		if $YES_MODE; then
-			DOWNLOAD_EMB=true
-		else
-			echo ""
-			read -r -p "下载 embedding 模型（${EMBEDDING_MODEL}, ~96MB）? [Y/n]: " ans
-			case "$ans" in
-			[Nn]*) DOWNLOAD_EMB=false ;;
-			*) DOWNLOAD_EMB=true ;;
-			esac
-		fi
-
-		if $DOWNLOAD_EMB; then
-			info "下载 embedding 模型中..."
-			mkdir -p "$EMB_TARGET"
-			if $HF_HUB_AVAILABLE; then
-				python3 -c "
-from huggingface_hub import snapshot_download
-import os
-dl = snapshot_download('$EMBEDDING_ONNX_REPO', local_dir='$EMB_TARGET')
-# 如果下载的是 onnx/ 子目录，把文件移出来
-onnx_sub = os.path.join('$EMB_TARGET', 'onnx')
-if os.path.isdir(onnx_sub):
-    for f in os.listdir(onnx_sub):
-        os.rename(os.path.join(onnx_sub, f), os.path.join('$EMB_TARGET', f))
-    os.rmdir(onnx_sub)
-print('下载完成')
-" 2>&1
-			else
-				# 用 curl 下载关键文件
-				BASE_URL="https://huggingface.co/${EMBEDDING_ONNX_REPO}/resolve/main"
-				files=("model.onnx" "tokenizer.json" "config.json" "special_tokens_map.json")
-				for f in "${files[@]}"; do
-					info "  下载 ${f}..."
-					curl -sL "${BASE_URL}/${f}" -o "${EMB_TARGET}/${f}" || {
-						# 尝试 onnx/ 子目录
-						curl -sL "${BASE_URL}/onnx/${f}" -o "${EMB_TARGET}/${f}" || warn "  跳过 ${f}"
-					}
-				done
-			fi
-			if [[ -f "$EMB_TARGET/model.onnx" ]]; then
-				ok "Embedding 模型下载完成 ($(du -sh "$EMB_TARGET" | cut -f1))"
-			else
-				warn "Embedding 模型下载可能不完整。可稍后手动运行:"
-				warn "  python3 -c \"from huggingface_hub import snapshot_download; snapshot_download('${EMBEDDING_ONNX_REPO}', local_dir='${EMB_TARGET}')\""
-			fi
-		else
-			info "跳过 embedding 模型（将使用确定性哈希降级，仅适合测试）"
-		fi
-	fi
-
-	# ---- Reranker 模型（可选） ----
-	echo ""
-	RERANK_TARGET="$MODEL_CACHE_DIR/$RERANKER_DIR_NAME"
-	if [[ -f "$RERANK_TARGET/model.onnx" ]]; then
-		ok "Reranker 模型已存在: $(du -sh "$RERANK_TARGET" 2>/dev/null | cut -f1) — 跳过"
-	else
-		if $YES_MODE; then
-			DOWNLOAD_RERANK=true
-		else
-			read -r -p "下载 reranker 模型（${RERANKER_MODEL}, ~1.1GB fp16）? [y/N]: " ans
-			case "$ans" in
-			[Yy]*) DOWNLOAD_RERANK=true ;;
-			*) DOWNLOAD_RERANK=false ;;
-			esac
-		fi
-
-		if $DOWNLOAD_RERANK; then
-			info "下载 reranker 模型中..."
-			mkdir -p "$RERANK_TARGET"
-			if $HF_HUB_AVAILABLE; then
-				python3 -c "
-from huggingface_hub import snapshot_download
-import os
-dl = snapshot_download('$RERANKER_ONNX_REPO', local_dir='$RERANK_TARGET', ignore_patterns=['*.md', '*.txt'])
-onnx_sub = os.path.join('$RERANK_TARGET', 'onnx')
-if os.path.isdir(onnx_sub):
-    for f in os.listdir(onnx_sub):
-        os.rename(os.path.join(onnx_sub, f), os.path.join('$RERANK_TARGET', f))
-    os.rmdir(onnx_sub)
-print('下载完成')
-" 2>&1
-			else
-				BASE_URL="https://huggingface.co/${RERANKER_ONNX_REPO}/resolve/main"
-				files=("model.onnx" "model.onnx_data" "tokenizer.json" "config.json")
-				for f in "${files[@]}"; do
-					info "  下载 ${f}..."
-					curl -sL "${BASE_URL}/${f}" -o "${RERANK_TARGET}/${f}" || {
-						curl -sL "${BASE_URL}/onnx/${f}" -o "${RERANK_TARGET}/${f}" || warn "  跳过 ${f}"
-					}
-				done
-			fi
-			if [[ -f "$RERANK_TARGET/model.onnx" ]]; then
-				ok "Reranker 模型下载完成 ($(du -sh "$RERANK_TARGET" | cut -f1))"
-			else
-				warn "Reranker 模型下载可能不完整."
-			fi
-		else
-			info "跳过 reranker 模型（检索将跳过 Cross-Encoder 精排，直接返回 RRF 结果）"
-		fi
+		python3 "$DISCOVERY_SCRIPT"
 	fi
 fi
 
 # ============================================================================
-# 3. 初始化提示
+# 3. 初始化 / 更新管线步骤
 # ============================================================================
 echo ""
 echo "=========================================="
 echo "  安装完成！"
 echo "=========================================="
 echo ""
-echo "接下来，建议运行："
-echo ""
-echo "  1. 初始化默认配置（生成 config.yaml + pipeline.yaml + 默认评审步骤）"
-echo "  paper-review init"
-echo ""
-echo "  2. 建历史论文索引"
-echo "  paper-review index --pdf-dir ./data/history"
-echo ""
-echo "  3. 执行评审"
-echo "  paper-review review ./待审论文.pdf"
-echo ""
-echo "  4. 查看索引状态"
-echo "  paper-review status"
-echo ""
+
+DATA_DIR="${HOME}/.paper-review"
+
+if [ -d "$DATA_DIR" ]; then
+	echo "检测到已有数据目录 $DATA_DIR"
+	echo ""
+	echo "  如需更新管线步骤文件（如新增的 Excel 导出等）："
+	echo "    paper-review init --force"
+	echo ""
+	echo "  ⚠ --force 会覆盖数据目录下的 config.yaml、pipeline.yaml 和所有步骤文件。"
+	echo "    如果你自定义过这些文件，请先备份。"
+else
+	echo "接下来，建议运行："
+	echo ""
+	echo "  1. 初始化默认配置（生成 config.yaml + pipeline.yaml + 默认评审步骤）"
+	echo "  paper-review init"
+	echo ""
+	echo "  2. 建历史论文索引"
+	echo "  paper-review index --pdf-dir ./data/history"
+	echo ""
+	echo "  3. 执行评审"
+	echo "  paper-review review ./待审论文.pdf"
+	echo ""
+	echo "  4. 查看索引状态"
+	echo "  paper-review status"
+	echo ""
+fi
 
 # ---- 提示 init（不自动执行，用户自行决定） ----
