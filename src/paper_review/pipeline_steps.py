@@ -166,7 +166,7 @@ def _run_md_step(
     # 5. 调用 pi（-p 非交互模式）
     pi_binary = env.get("PIPELINE_PI_BINARY", "pi")
     try:
-        proc = subprocess.run(
+        proc = subprocess.run(  # noqa: S603 — pi_binary is user-configurable, not untrusted input
             [pi_binary, "-p", f"@{prompt_file}"],
             env=step_env,
             capture_output=True,
