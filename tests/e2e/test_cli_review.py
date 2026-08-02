@@ -31,6 +31,15 @@ def _paper_review_bin() -> str:
     return f"{sys.executable} -m paper_review"
 
 
+def _find_task_dir(output_dir: Path) -> Path:
+    """在 output/result/ 下找到唯一的 task 目录并返回。"""
+    result_dir = output_dir / "result"
+    assert result_dir.is_dir(), f"result dir not found: {result_dir}"
+    subdirs = list(result_dir.iterdir())
+    assert len(subdirs) == 1, f"expected 1 task dir, got {len(subdirs)}: {subdirs}"
+    return subdirs[0]
+
+
 def _make_pipeline_dir(base: Path, data_dir: Path) -> tuple[Path, Path]:
     """在 base 下创建完整管线目录，返回 (pipeline_dir, output_dir)。"""
     # 初始化数据目录（创建 index/ 和 output/ 以避免首次运行交互提示）
@@ -113,15 +122,16 @@ class TestReviewE2E:
         )
 
         # 验证 pre intermediates
-        pre_out = output_dir / "intermediates" / "pre" / "01-pre" / "output.json"
+        task_dir = _find_task_dir(output_dir)
+        pre_out = task_dir / "intermediates" / "pre" / "01-pre" / "output.json"
         assert pre_out.exists(), f"Missing pre output: {pre_out}"
 
         # 验证 review intermediates
-        review_out = output_dir / "intermediates" / "paper-001" / "01-search" / "output.json"
+        review_out = task_dir / "intermediates" / "paper-001" / "01-search" / "output.json"
         assert review_out.exists(), f"Missing review output: {review_out}"
 
         # 验证 post intermediates
-        post_out = output_dir / "intermediates" / "post" / "01-archive" / "output.json"
+        post_out = task_dir / "intermediates" / "post" / "01-archive" / "output.json"
         assert post_out.exists(), f"Missing post output: {post_out}"
 
     def test_review_without_index_returns_ok(self, tmp_path: Path):
@@ -219,5 +229,6 @@ class TestReviewE2E:
             f"review failed:\nstdout:{result.stdout[:500]}\nstderr:{result.stderr[:500]}"
         )
         # 检查 output 产物
-        out = output_dir / "intermediates" / "paper" / "01-check" / "output.json"
+        task_dir = _find_task_dir(output_dir)
+        out = task_dir / "intermediates" / "paper" / "01-check" / "output.json"
         assert out.exists(), f"Missing output: {out}"
