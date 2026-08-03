@@ -40,7 +40,13 @@ class TestMultiSubject:
             pipeline_yaml={
                 "name": "multi",
                 "output_dir": str(output_dir),
-                "review": {"directory": str(steps_dir.absolute())},
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    }
+                ],
             },
             input_path=input_dir,
         )
@@ -79,7 +85,13 @@ class TestMultiSubject:
                 pipeline_yaml={
                     "name": "multi",
                     "output_dir": str(output_dir),
-                    "review": {"directory": str(steps_dir.absolute())},
+                    "phases": [
+                        {
+                            "name": "review",
+                            "mode": "per_subject",
+                            "directory": str(steps_dir.absolute()),
+                        }
+                    ],
                 },
                 input_path=input_dir,
             )
@@ -116,7 +128,13 @@ class TestMultiSubject:
             pipeline_yaml={
                 "name": "empty",
                 "output_dir": str(output_dir),
-                "review": {"directory": str(steps_dir.absolute())},
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    }
+                ],
             },
             input_path=input_dir,
         )
@@ -173,12 +191,16 @@ class TestPrePostPhases:
         yaml_path.write_text(
             f"name: pre-test\n"
             f"output_dir: {output_dir}\n"
-            f"pre:\n"
-            f"  directory: pre-review/\n"
-            f"review:\n"
-            f"  directory: review-pipeline/\n"
-            f"post:\n"
-            f"  directory: post-review/\n"
+            f"phases:\n"
+            f"  - name: pre\n"
+            f"    mode: batch\n"
+            f"    directory: pre-review/\n"
+            f"  - name: review\n"
+            f"    mode: per_subject\n"
+            f"    directory: review-pipeline/\n"
+            f"  - name: post\n"
+            f"    mode: batch\n"
+            f"    directory: post-review/\n"
         )
 
         input_pdf = tmp_path / "subject.pdf"
@@ -200,17 +222,22 @@ class TestPrePostPhases:
         assert (tdir / "post" / "01-archive" / "output.json").exists()
         assert result.success
 
-    def test_pipeline_yaml_pre_review_post_directories(self):
-        """完整三项 pipeline.yaml 解析。"""
+    def test_pipeline_yaml_phases(self):
+        """完整三项 phases 列表解析。"""
         cfg = PipelineConfig.from_dict(
             {
                 "name": "full",
                 "output_dir": "/out",
-                "pre": {"directory": "pre/"},
-                "review": {"directory": "review/"},
-                "post": {"directory": "post/"},
+                "phases": [
+                    {"name": "pre", "mode": "batch", "directory": "pre/"},
+                    {"name": "review", "mode": "per_subject", "directory": "review/"},
+                    {"name": "post", "mode": "batch", "directory": "post/"},
+                ],
             }
         )
-        assert cfg.pre.directory == "pre/"
-        assert cfg.review.directory == "review/"
-        assert cfg.post.directory == "post/"
+        assert cfg.phases[0].directory == "pre/"
+        assert cfg.phases[0].mode == "batch"
+        assert cfg.phases[1].directory == "review/"
+        assert cfg.phases[1].mode == "per_subject"
+        assert cfg.phases[2].directory == "post/"
+        assert cfg.phases[2].mode == "batch"

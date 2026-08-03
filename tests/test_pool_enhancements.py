@@ -20,6 +20,12 @@ from paper_review.orchestrator import (
     run_pipeline,
 )
 
+
+def _phase(**kw):
+    """构建 per_subject 阶段的辅助函数。"""
+    return {"name": "review", "mode": "per_subject", **kw}
+
+
 # ============================================================================
 # #3 — 池配置合理性校验
 # ============================================================================
@@ -36,11 +42,9 @@ class TestPoolConfigValidation:
 
     def test_clamp_workers_below_1(self):
         """workers = 0 触发自动探测；负值被 clamp 到 1。"""
-        # workers=0 触发自动探测（>= 1）
         cfg = PoolConfig(workers=0)
         assert cfg.workers >= 1
         assert cfg.workers <= 64
-        # 负值 clamp 到 1
         cfg = PoolConfig(workers=-5)
         assert cfg.workers == 1
 
@@ -67,28 +71,30 @@ class TestPoolConfigValidation:
             {
                 "name": "validation",
                 "output_dir": "./out",
-                "review": {
-                    "directory": "steps/",
-                    "pool": {"workers": 8, "timeout": 300, "ordered": False},
-                },
+                "phases": [
+                    _phase(
+                        directory="steps/",
+                        pool={"workers": 8, "timeout": 300, "ordered": False},
+                    )
+                ],
             }
         )
-        assert cfg.review.pool.workers == 8
-        assert cfg.review.pool.timeout == 300
-        assert cfg.review.pool.ordered is False
+        assert cfg.phases[0].pool is not None
+        assert cfg.phases[0].pool.workers == 8
+        assert cfg.phases[0].pool.timeout == 300
+        assert cfg.phases[0].pool.ordered is False
 
     def test_pool_config_defaults_in_pipeline(self):
-        """pipeline.yaml 中不指定 pool 时使用默认值。"""
+        """pipeline.yaml 中不指定 pool 时使用 None（无 pool 配置）。"""
         cfg = PipelineConfig.from_dict(
             {
                 "name": "defaults",
                 "output_dir": "./out",
-                "review": {"directory": "steps/"},
+                "phases": [_phase(directory="steps/")],
             }
         )
-        assert cfg.review.pool.workers == 5
-        assert cfg.review.pool.timeout == 0
-        assert cfg.review.pool.ordered is True
+        # 不显式指定 pool 时，pool 为 None
+        assert cfg.phases[0].pool is None
 
 
 # ============================================================================
@@ -100,7 +106,6 @@ class TestPoolAutoDetectWorkers:
     def test_workers_0_resolves_to_auto_default(self):
         """workers=0 触发自动推导。"""
         cfg = PoolConfig(workers=0)
-        # 在测试环境中应 >= 1 且 <= 64
         assert 1 <= cfg.workers <= 64
 
     def test_auto_default_does_not_exceed_64(self, monkeypatch):
@@ -206,17 +211,18 @@ class TestPoolProgress:
             pipeline_yaml={
                 "name": "progress-test",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": str(steps_dir.absolute()),
-                    "pool": {"workers": 2},
-                },
+                "phases": [
+                    _phase(
+                        directory=str(steps_dir.absolute()),
+                        pool={"workers": 2},
+                    )
+                ],
             },
             input_path=pdf_dir,
             pool_progress=progress,
         )
 
-        # 验证 progress 收到事件
-        assert len(progress.events) >= 4  # 2 start + 2 complete
+        assert len(progress.events) >= 4
         subjects_with_start = {
             e.subject for e in progress.events if e.event_type == "subject_start"
         }
@@ -238,21 +244,20 @@ class TestPoolEnvOverride:
     def test_env_workers_does_not_crash(self, monkeypatch):
         """设置 PAPER_REVIEW_POOL_WORKERS 后管线的正常/异常路径都不 crash。"""
         monkeypatch.setenv("PAPER_REVIEW_POOL_WORKERS", "3")
-        # 用真实可走的路径验证 env 覆盖逻辑被触发
         output_dir = Path("/tmp/test-env-override")
-        # noop 路径（无 steps 目录）→ success=True，不 crash
         result = run_pipeline(
             pipeline_yaml={
                 "name": "env-test",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": "/nonexistent",
-                    "pool": {"workers": 5, "timeout": 0},
-                },
+                "phases": [
+                    _phase(
+                        directory="/nonexistent",
+                        pool={"workers": 5, "timeout": 0},
+                    )
+                ],
             },
             input_path=Path("/nonexistent/subject.pdf"),
         )
-        # 验证 run_pipeline 正常完成（不 crash）
         assert result.success
 
     def test_env_timeout_does_not_crash(self, monkeypatch):
@@ -262,10 +267,12 @@ class TestPoolEnvOverride:
             pipeline_yaml={
                 "name": "env-timeout",
                 "output_dir": "/tmp/env-timeout",
-                "review": {
-                    "directory": "/nonexistent",
-                    "pool": {"workers": 1, "timeout": 30},
-                },
+                "phases": [
+                    _phase(
+                        directory="/nonexistent",
+                        pool={"workers": 1, "timeout": 30},
+                    )
+                ],
             },
             input_path=Path("/nonexistent/subject.pdf"),
         )
@@ -278,14 +285,16 @@ class TestPoolEnvOverride:
             pipeline_yaml={
                 "name": "env-bad",
                 "output_dir": "/tmp/bad",
-                "review": {
-                    "directory": "/nonexistent",
-                    "pool": {"workers": 5},
-                },
+                "phases": [
+                    _phase(
+                        directory="/nonexistent",
+                        pool={"workers": 5},
+                    )
+                ],
             },
             input_path=Path("/nonexistent/subject.pdf"),
         )
-        assert result.success  # 不 crash 即通过
+        assert result.success
 
 
 # ============================================================================
@@ -300,7 +309,6 @@ class TestPoolTimeout:
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
 
-        # 脚本 sleep 5s——池 timeout=1s 会截断它，5s 短到不引起 CI flakiness
         (steps_dir / "01-slow.py").write_text(
             "import json, os, time;"
             'd=os.environ["PIPELINE_STEP_DIR"];'
@@ -313,7 +321,7 @@ class TestPoolTimeout:
         pdf_dir = tmp_path / "pdfs"
         pdf_dir.mkdir()
         (pdf_dir / "alpha.pdf").write_text("dummy")
-        (pdf_dir / "beta.pdf").write_text("dummy")  # 两个 subject 触发池模式
+        (pdf_dir / "beta.pdf").write_text("dummy")
 
         progress = PoolProgress()
 
@@ -321,16 +329,17 @@ class TestPoolTimeout:
             pipeline_yaml={
                 "name": "timeout-test",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": str(steps_dir.absolute()),
-                    "pool": {"workers": 2, "timeout": 1},
-                },
+                "phases": [
+                    _phase(
+                        directory=str(steps_dir.absolute()),
+                        pool={"workers": 2, "timeout": 1},
+                    )
+                ],
             },
             input_path=pdf_dir,
             pool_progress=progress,
         )
 
-        # 至少有一个 error 状态的 subject（timeout 标记）
         fail_events = [e for e in progress.events if e.event_type == "subject_fail"]
         assert len(fail_events) >= 1
 
@@ -340,7 +349,6 @@ class TestPoolTimeout:
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
 
-        # 正常快速的脚本
         (steps_dir / "01-fast.py").write_text(
             "import json, os;"
             'd=os.environ["PIPELINE_STEP_DIR"];'
@@ -358,15 +366,16 @@ class TestPoolTimeout:
             pipeline_yaml={
                 "name": "no-block",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": str(steps_dir.absolute()),
-                    "pool": {"workers": 2, "timeout": 1},
-                },
+                "phases": [
+                    _phase(
+                        directory=str(steps_dir.absolute()),
+                        pool={"workers": 2, "timeout": 1},
+                    )
+                ],
             },
             input_path=pdf_dir,
         )
 
-        # 全部应正常完成（无 timeout 触发）
         assert result.success
         assert len(result.step_results) == 3
 
@@ -393,10 +402,12 @@ class TestPoolTimeout:
             pipeline_yaml={
                 "name": "no-timeout",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": str(steps_dir.absolute()),
-                    "pool": {"workers": 2, "timeout": 0},
-                },
+                "phases": [
+                    _phase(
+                        directory=str(steps_dir.absolute()),
+                        pool={"workers": 2, "timeout": 0},
+                    )
+                ],
             },
             input_path=pdf_dir,
         )

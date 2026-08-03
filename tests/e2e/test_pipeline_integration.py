@@ -142,35 +142,39 @@ def _setup_pipeline_steps(pipeline_dir: Path) -> None:
     (pipeline_dir / "pipeline.yaml").write_text("""\
 name: "e2e-test"
 version: "2.0"
-pre:
-  directory: pre-review/
-  manifest_step: "00-convert"
-  duplicate_policy: skip
-  retry:
-    max_attempts: 1
-    on_failure: skip
-review:
-  directory: review-pipeline/
-  subject_source:
-    type: manifest
-    path: "{{ output_dir }}/subject-manifest.json"
-  duplicate_policy: skip
-  retry:
-    max_attempts: 1
-    on_failure: skip
-  subject_order:
-    sort_by: name
-    direction: asc
-  pool:
-    workers: 1
-    timeout: 120
-    ordered: true
-post:
-  directory: post-review/
-  duplicate_policy: skip
-  retry:
-    max_attempts: 1
-    on_failure: skip
+phases:
+  - name: pre
+    mode: batch
+    directory: pre-review/
+    manifest_step: "00-convert"
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+  - name: review
+    mode: per_subject
+    directory: review-pipeline/
+    subject_source:
+      type: manifest
+      path: "{{ output_dir }}/subject-manifest.json"
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+    subject_order:
+      sort_by: name
+      direction: asc
+    pool:
+      workers: 1
+      timeout: 120
+      ordered: true
+  - name: post
+    mode: batch
+    directory: post-review/
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
 """)
 
     # ── pre-review/00-convert.py ──

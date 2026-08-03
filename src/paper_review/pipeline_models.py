@@ -167,12 +167,25 @@ class SubjectOrderConfig:
 
 @dataclass
 class PhaseConfig:
+    """单个管线阶段的配置。
+
+    mode='batch' 的阶段对所有 Subject 批量执行一次；
+    mode='per_subject' 的阶段对每个 Subject 逐个执行，支持 Worker 池并发。
+    """
+
+    name: str = ""
+    mode: str = "batch"  # 'batch' | 'per_subject'
     directory: str = ""
     retry: RetryConfig = field(default_factory=RetryConfig)
-    # manifest_step: 产 manifest 的 step 名称（仅 pre 阶段使用）
-    manifest_step: str = ""
-    # duplicate_policy: 同名 Subject 去重策略
     duplicate_policy: str = "skip"  # 'skip' | 'rename' | 'error'
+
+    # batch-only
+    manifest_step: str = ""
+
+    # per_subject-only
+    subject_source: SubjectSourceConfig | None = None
+    subject_order: SubjectOrderConfig | None = None
+    pool: PoolConfig | None = None
 
 
 @dataclass
@@ -183,11 +196,46 @@ class SubjectSourceConfig:
     path: str = ""  # manifest 文件路径（type=manifest 时有效）
 
 
-@dataclass
-class ReviewPhaseConfig(PhaseConfig):
-    subject_order: SubjectOrderConfig = field(default_factory=SubjectOrderConfig)
-    subject_source: SubjectSourceConfig = field(default_factory=SubjectSourceConfig)
-    pool: PoolConfig = field(default_factory=PoolConfig)
+def _parse_phase(data: dict) -> PhaseConfig:
+    """从字典解析单个 PhaseConfig。"""
+    mode = data.get("mode", "batch")
+    subject_source_data = data.get("subject_source")
+    priority_data = data.get("subject_order", {}).get("priority")
+    pool_data = data.get("pool")
+
+    return PhaseConfig(
+        name=data.get("name", ""),
+        mode=mode,
+        directory=data.get("directory", ""),
+        retry=RetryConfig(
+            max_attempts=data.get("retry", {}).get("max_attempts", 1),
+            on_failure=data.get("retry", {}).get("on_failure", "skip"),
+        ),
+        duplicate_policy=data.get("duplicate_policy", "skip"),
+        manifest_step=data.get("manifest_step", ""),
+        subject_source=(
+            SubjectSourceConfig(
+                type=subject_source_data.get("type", "cli"),
+                path=subject_source_data.get("path", ""),
+            )
+            if subject_source_data
+            else None
+        ),
+        subject_order=SubjectOrderConfig(
+            sort_by=data.get("subject_order", {}).get("sort_by", "name"),
+            direction=data.get("subject_order", {}).get("direction", "asc"),
+            priority=SubjectOrderPriority(**priority_data) if priority_data else None,
+        ),
+        pool=(
+            PoolConfig(
+                workers=pool_data.get("workers", 5),
+                timeout=pool_data.get("timeout", 0),
+                ordered=pool_data.get("ordered", True),
+            )
+            if pool_data
+            else None
+        ),
+    )
 
 
 @dataclass
@@ -195,9 +243,7 @@ class PipelineConfig:
     name: str = "unnamed"
     version: str = "1.0"
     output_dir: Path = Path("./output")
-    pre: PhaseConfig = field(default_factory=PhaseConfig)
-    review: ReviewPhaseConfig = field(default_factory=ReviewPhaseConfig)
-    post: PhaseConfig = field(default_factory=PhaseConfig)
+    phases: list[PhaseConfig] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> PipelineConfig:
@@ -205,62 +251,36 @@ class PipelineConfig:
         version = data.get("version", "1.0")
         output_dir = Path(data.get("output_dir", "./output"))
 
-        pre_data = data.get("pre", {})
-        pre = PhaseConfig(
-            directory=pre_data.get("directory", ""),
-            retry=RetryConfig(
-                max_attempts=pre_data.get("retry", {}).get("max_attempts", 1),
-                on_failure=pre_data.get("retry", {}).get("on_failure", "skip"),
-            ),
-            manifest_step=pre_data.get("manifest_step", ""),
-            duplicate_policy=pre_data.get("duplicate_policy", "skip"),
-        )
-
-        review_data = data.get("review", {"directory": ""})
-        priority_data = review_data.get("subject_order", {}).get("priority")
-        pool_data = review_data.get("pool", {})
-        subject_source_data = review_data.get("subject_source", {})
-        review = ReviewPhaseConfig(
-            directory=review_data.get("directory", ""),
-            retry=RetryConfig(
-                max_attempts=review_data.get("retry", {}).get("max_attempts", 1),
-                on_failure=review_data.get("retry", {}).get("on_failure", "skip"),
-            ),
-            subject_source=SubjectSourceConfig(
-                type=subject_source_data.get("type", "cli"),
-                path=subject_source_data.get("path", ""),
-            ),
-            subject_order=SubjectOrderConfig(
-                sort_by=review_data.get("subject_order", {}).get("sort_by", "name"),
-                direction=review_data.get("subject_order", {}).get("direction", "asc"),
-                priority=SubjectOrderPriority(**priority_data) if priority_data else None,
-            ),
-            pool=PoolConfig(
-                workers=pool_data.get("workers", 5),
-                timeout=pool_data.get("timeout", 0),
-                ordered=pool_data.get("ordered", True),
-            ),
-            duplicate_policy=review_data.get("duplicate_policy", "skip"),
-        )
-
-        post_data = data.get("post", {})
-        post = PhaseConfig(
-            directory=post_data.get("directory", ""),
-            retry=RetryConfig(
-                max_attempts=post_data.get("retry", {}).get("max_attempts", 1),
-                on_failure=post_data.get("retry", {}).get("on_failure", "skip"),
-            ),
-            duplicate_policy=post_data.get("duplicate_policy", "skip"),
-        )
+        phases_data = data.get("phases", [])
+        phases: list[PhaseConfig] = []
+        for pd in phases_data:
+            phase = _parse_phase(pd)
+            phases.append(phase)
 
         return cls(
             name=name,
             version=version,
             output_dir=output_dir,
-            pre=pre,
-            review=review,
-            post=post,
+            phases=phases,
         )
+
+    @classmethod
+    def from_path(cls, path: Path) -> PipelineConfig:
+        """从 YAML 文件或目录加载 PipelineConfig。
+
+        path 可以是 pipeline.yaml 文件路径，或包含 pipeline.yaml 的目录。
+        """
+        if path.is_dir():
+            yaml_file = path / "pipeline.yaml"
+            if yaml_file.exists():
+                raw = _load_yaml(yaml_file)
+            else:
+                raw = {"name": "default", "output_dir": "./output"}
+        elif path.suffix in (".yaml", ".yml"):
+            raw = _load_yaml(path)
+        else:
+            raw = {"name": "default", "output_dir": "./output"}
+        return cls.from_dict(raw)
 
 
 # ============================================================================
@@ -325,7 +345,10 @@ def discover_steps(phase_dir: Path) -> list[StepFile]:
     prefix_re = re.compile(r"^(\d+)")
     for s in steps:
         m = prefix_re.match(s.stem)
-        s.order = int(m.group(1)) if m else 999
+        try:
+            s.order = int(m.group(1)) if m else 999
+        except ValueError:
+            s.order = 999
 
     steps.sort(key=lambda s: (s.order, s.stem))
     return steps

@@ -29,12 +29,13 @@ class TestPipelineConfigParsing:
             {
                 "name": "test",
                 "output_dir": "./output",
-                "review": {"directory": "steps/"},
+                "phases": [{"name": "review", "mode": "per_subject", "directory": "steps/"}],
             }
         )
         assert cfg.name == "test"
         assert cfg.output_dir == Path("./output")
-        assert cfg.review.directory == "steps/"
+        assert cfg.phases[0].directory == "steps/"
+        assert cfg.phases[0].mode == "per_subject"
 
     def test_full_config(self):
         """三项全部配置。"""
@@ -42,28 +43,47 @@ class TestPipelineConfigParsing:
             {
                 "name": "full",
                 "output_dir": "/tmp/review-output",
-                "pre": {
-                    "directory": "pre/",
-                    "retry": {"max_attempts": 2, "on_failure": "abort"},
-                },
-                "review": {
-                    "directory": "review/",
-                    "retry": {"max_attempts": 3, "on_failure": "skip"},
-                    "subject_order": {
-                        "sort_by": "name",
-                        "direction": "desc",
-                        "priority": {"first": [".*urgent.*"], "last": [".*draft.*"]},
+                "phases": [
+                    {
+                        "name": "pre",
+                        "mode": "batch",
+                        "directory": "pre/",
+                        "retry": {"max_attempts": 2, "on_failure": "abort"},
+                        "manifest_step": "00-convert",
                     },
-                },
-                "post": {
-                    "directory": "post/",
-                    "retry": {"max_attempts": 1, "on_failure": "skip"},
-                },
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": "review/",
+                        "retry": {"max_attempts": 3, "on_failure": "skip"},
+                        "subject_order": {
+                            "sort_by": "name",
+                            "direction": "desc",
+                            "priority": {"first": [".*urgent.*"], "last": [".*draft.*"]},
+                        },
+                        "pool": {"workers": 3},
+                    },
+                    {
+                        "name": "post",
+                        "mode": "batch",
+                        "directory": "post/",
+                        "retry": {"max_attempts": 1, "on_failure": "skip"},
+                    },
+                ],
             }
         )
-        assert cfg.pre.retry.max_attempts == 2
-        assert cfg.review.subject_order.sort_by == "name"
-        assert cfg.review.subject_order.priority.first == [".*urgent.*"]
+        pre = cfg.phases[0]
+        review = cfg.phases[1]
+        post = cfg.phases[2]
+        assert pre.retry.max_attempts == 2
+        assert pre.manifest_step == "00-convert"
+        assert review.subject_order is not None
+        assert review.subject_order.sort_by == "name"
+        assert review.subject_order.priority is not None
+        assert review.subject_order.priority.first == [".*urgent.*"]
+        assert review.pool is not None
+        assert review.pool.workers == 3
+        assert post.retry.max_attempts == 1
 
     def test_default_retry_values(self):
         """未指定 retry 时使用默认值。"""
@@ -71,11 +91,11 @@ class TestPipelineConfigParsing:
             {
                 "name": "defaults",
                 "output_dir": "./out",
-                "review": {"directory": "r/"},
+                "phases": [{"name": "review", "mode": "per_subject", "directory": "r/"}],
             }
         )
-        assert cfg.review.retry.max_attempts == 1
-        assert cfg.review.retry.on_failure == "skip"
+        assert cfg.phases[0].retry.max_attempts == 1
+        assert cfg.phases[0].retry.on_failure == "skip"
 
 
 # ============================================================================
@@ -117,7 +137,6 @@ class TestStepDiscovery:
 
         steps = discover_steps(steps_dir)
         names = [s.stem for s in steps]
-        # 01-first 先, 02-second 次之, first 最后
         assert names[0] == "01-first"
         assert names[-1] == "first"
 
@@ -152,7 +171,13 @@ class TestPyStepExecution:
                 pipeline_yaml={
                     "name": "t1",
                     "output_dir": str(output_dir),
-                    "review": {"directory": str(steps_dir.absolute())},
+                    "phases": [
+                        {
+                            "name": "review",
+                            "mode": "per_subject",
+                            "directory": str(steps_dir.absolute()),
+                        }
+                    ],
                 },
                 input_path=tmp_path / "subject-01.pdf",
             )
@@ -166,7 +191,6 @@ class TestPyStepExecution:
         output_dir = tmp_path / "output"
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
-        # 步骤脚本捕获并写入 os.environ 中的关键变量
         (steps_dir / "01-test.py").write_text(
             "import json, os\n"
             "d = os.environ.get('PIPELINE_STEP_DIR', 'not-set')\n"
@@ -182,12 +206,17 @@ class TestPyStepExecution:
             pipeline_yaml={
                 "name": "t1",
                 "output_dir": str(output_dir),
-                "review": {"directory": str(steps_dir.absolute())},
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    }
+                ],
             },
             input_path=tmp_path / "subject-01.pdf",
         )
 
-        # 验证 output.json 中捕获了关键环境变量
         result_dirs = list((output_dir / "result").iterdir())
         assert len(result_dirs) == 1
         task_dir = result_dirs[0]
@@ -203,7 +232,6 @@ class TestPyStepExecution:
         output_dir = tmp_path / "output"
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
-        # 步骤脚本写 output.json 来验证目录已存在
         (steps_dir / "01-test.py").write_text(
             "import json, os\n"
             "step = os.environ['PIPELINE_STEP_DIR']\n"
@@ -216,7 +244,13 @@ class TestPyStepExecution:
             pipeline_yaml={
                 "name": "t1",
                 "output_dir": str(output_dir),
-                "review": {"directory": str(steps_dir.absolute())},
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    }
+                ],
             },
             input_path=tmp_path / "subject-01.pdf",
         )
@@ -237,7 +271,6 @@ class TestFullExecution:
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
 
-        # 写一个真实的 .py 脚本，写入 output.json
         script = """
 import json, os, sys
 step_dir = os.environ.get('PIPELINE_STEP_DIR', sys.argv[1] if len(sys.argv) > 1 else '/tmp')
@@ -251,12 +284,17 @@ with open(os.path.join(step_dir, 'output.json'), 'w') as f:
             pipeline_yaml={
                 "name": "t1",
                 "output_dir": str(output_dir),
-                "review": {"directory": str(steps_dir.absolute())},
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    }
+                ],
             },
             input_path=tmp_path / "subject-01.pdf",
         )
 
-        # 检查 output.json
         expected = result.task_dir / "intermediates" / "subject-01" / "01-test" / "output.json"
         assert expected.exists()
         with open(expected) as f:
@@ -281,7 +319,13 @@ with open(os.path.join(step_dir, 'output.json'), 'w') as f:
             pipeline_yaml={
                 "name": "t1",
                 "output_dir": str(output_dir),
-                "review": {"directory": str(steps_dir.absolute())},
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    }
+                ],
             },
             input_path=tmp_path / "subject-01.pdf",
         )
@@ -304,7 +348,13 @@ class TestErrorScenarios:
             pipeline_yaml={
                 "name": "empty",
                 "output_dir": str(tmp_path / "out"),
-                "review": {"directory": str(tmp_path / "nonexistent")},
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(tmp_path / "nonexistent"),
+                    }
+                ],
             },
             input_path=tmp_path / "subject-01.pdf",
         )
@@ -322,7 +372,13 @@ class TestErrorScenarios:
             pipeline_yaml={
                 "name": "t1",
                 "output_dir": str(output_dir),
-                "review": {"directory": str(steps_dir.absolute())},
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    }
+                ],
             },
             input_path=tmp_path / "subject-01.pdf",
         )
@@ -344,12 +400,7 @@ class TestMdStepFallback:
         md_content = "# step content"
         (steps_dir / "01-review.md").write_text(md_content)
 
-        # 用 PIPELINE_PI_BINARY 指向不存在的二进制
         import os
-
-        env = os.environ.copy()
-        env["PIPELINE_PI_BINARY"] = "/nonexistent/pi-binary"
-
         from unittest.mock import patch
 
         with patch.dict(os.environ, {"PIPELINE_PI_BINARY": "/nonexistent/pi-binary"}):
@@ -357,7 +408,13 @@ class TestMdStepFallback:
                 pipeline_yaml={
                     "name": "pi-fallback",
                     "output_dir": str(output_dir),
-                    "review": {"directory": str(steps_dir.absolute())},
+                    "phases": [
+                        {
+                            "name": "review",
+                            "mode": "per_subject",
+                            "directory": str(steps_dir.absolute()),
+                        }
+                    ],
                 },
                 input_path=tmp_path / "subject-01.pdf",
             )
@@ -379,12 +436,10 @@ class TestPooledExecution:
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
 
-        # 写一个 .py 脚本，记录运行顺序到文件（验证并发）
         script = """
 import json, os, time
 step_dir = os.environ["PIPELINE_STEP_DIR"]
 os.makedirs(step_dir, exist_ok=True)
-# 模拟耗时，让 Worker 有时间并发
 with open(os.path.join(step_dir, "output.json"), "w") as f:
     json.dump({
         "step": "01-test",
@@ -395,7 +450,6 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
 """
         (steps_dir / "01-test.py").write_text(script)
 
-        # 创建 3 个虚拟 PDF
         pdf_dir = tmp_path / "pdfs"
         pdf_dir.mkdir()
         for name in ["alpha", "beta", "gamma"]:
@@ -405,10 +459,14 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
             pipeline_yaml={
                 "name": "pool-test",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": str(steps_dir.absolute()),
-                    "pool": {"workers": 3, "ordered": True},
-                },
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                        "pool": {"workers": 3, "ordered": True},
+                    }
+                ],
             },
             input_path=pdf_dir,
         )
@@ -417,7 +475,6 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
         assert len(result.step_results) == 3
         step_names = [r.step_name for r in result.step_results]
         assert all(n == "01-test" for n in step_names)
-        # 所有 subject 的 intermediates 都存在（现在在 result/{task_id}/ 下）
         for subj in ["alpha", "beta", "gamma"]:
             out_file = result.task_dir / "intermediates" / subj / "01-test" / "output.json"
             assert out_file.exists(), f"Missing {out_file}"
@@ -437,7 +494,6 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
 
         pdf_dir = tmp_path / "pdfs"
         pdf_dir.mkdir()
-        # 故意乱序创建
         for name in ["charlie", "alpha", "bravo"]:
             (pdf_dir / f"{name}.pdf").write_text("dummy")
 
@@ -445,17 +501,19 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
             pipeline_yaml={
                 "name": "order-test",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": str(steps_dir.absolute()),
-                    "pool": {"workers": 3, "ordered": True},
-                },
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                        "pool": {"workers": 3, "ordered": True},
+                    }
+                ],
             },
             input_path=pdf_dir,
         )
 
-        # 顺序应为按名字排序：alpha, bravo, charlie
         assert result.subject == "alpha"
-        # step_results 按 subject 顺序
         subjects_in_results = [r.subject for r in result.step_results]
         assert subjects_in_results == ["alpha", "bravo", "charlie"]
 
@@ -472,15 +530,18 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
             'open(os.path.join(d,"output.json"),"w"))'
         )
 
-        # 单 Subject 单篇模式
         result = run_pipeline(
             pipeline_yaml={
                 "name": "single",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": str(steps_dir.absolute()),
-                    "pool": {"workers": 5, "ordered": True},
-                },
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                        "pool": {"workers": 5, "ordered": True},
+                    }
+                ],
             },
             input_path=tmp_path / "subject-01.pdf",
         )
@@ -510,10 +571,14 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
             pipeline_yaml={
                 "name": "workers1",
                 "output_dir": str(output_dir),
-                "review": {
-                    "directory": str(steps_dir.absolute()),
-                    "pool": {"workers": 1},
-                },
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                        "pool": {"workers": 1},
+                    }
+                ],
             },
             input_path=pdf_dir,
         )
@@ -522,44 +587,31 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
         assert len(result.step_results) == 2
 
     def test_pool_waits_for_running_timed_out_workers(self, tmp_path, monkeypatch):
-        """超时 Subject 的 worker 线程仍在运行时，_run_subjects_pooled 必须等待。
-
-        复现条件：pool.timeout 小于 worker 实际耗时 → pending.discard() 移除
-        → while 循环退出 → executor.shutdown(wait=False) 不等待 → 函数提前 return。
-        此时 Post 阶段拿到不完整的 intermediates 开始生成 Excel，
-        而 worker 线程事后才跑完 pp.review_step_done() 更新计数器。
-        """
+        """超时 Subject 的 worker 线程仍在运行时，池化执行必须等待。"""
         import threading
         import time as _time
 
-        from paper_review.orchestrator import _run_subjects_pooled
+        from paper_review.orchestrator import _execute_per_subject_pooled
         from paper_review.pipeline_models import (
+            PhaseConfig,
             PoolConfig,
             RetryConfig,
-            ReviewPhaseConfig,
             StepFile,
             StepResult,
         )
 
-        # 跟踪每个 subject 完成的 step 数（必须等所有 step 跑完）
         step_count: dict[str, int] = {}
         step_lock = threading.Lock()
 
-        def tracking_run_step(step, step_dir, env, prior_results=None, subject_name="", **kwargs):
-            subject = env.get("PIPELINE_SUBJECT", "unknown")
-            _time.sleep(0.8)  # per-step 耗时；2 steps × 0.8s = 1.6s > 1s timeout
-            with step_lock:
-                step_count[subject] = step_count.get(subject, 0) + 1
-            return StepResult(
-                step_name=step.stem,
-                status="ok",
-                subject=subject,
-            )
+        class SlowExecutor:
+            """Executor that simulates slow steps, injectable via StepExecutor seam."""
 
-        monkeypatch.setattr(
-            "paper_review.orchestrator._run_step",
-            tracking_run_step,
-        )
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                _time.sleep(0.8)
+                with step_lock:
+                    step_count[subject] = step_count.get(subject, 0) + 1
+                return StepResult(step_name=step.stem, status="ok", subject=subject)
 
         steps = [
             StepFile(path=Path("01-test.py"), stem="01-test", step_type="py"),
@@ -568,24 +620,25 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
 
         subjects = ["subj-a", "subj-b"]
 
-        # pool 有 2 workers，timeout 50ms（远小于 worker 的 150ms sleep）
-        phase_config = ReviewPhaseConfig(
+        phase_config = PhaseConfig(
+            name="review",
+            mode="per_subject",
             directory="dummy",
             pool=PoolConfig(workers=2, timeout=1, ordered=False),
             retry=RetryConfig(max_attempts=1, on_failure="skip"),
         )
 
-        all_results = _run_subjects_pooled(
+        all_results = _execute_per_subject_pooled(
+            phase=phase_config,
             steps=steps,
             subjects=subjects,
-            phase_config=phase_config,
             output_dir=tmp_path / "output",
             base_env={},
+            executor=SlowExecutor(),
+            pool_cfg=PoolConfig(workers=2, timeout=1, ordered=False),
         )
 
-        # ★ 关键断言：每个 subject 的所有 step 必须都已完成
         assert step_count == {"subj-a": 2, "subj-b": 2}, (
             f"Expected all steps done, got {step_count}"
         )
-        # 结果必须覆盖所有 subject
         assert len(all_results) == 2

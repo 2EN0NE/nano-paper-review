@@ -223,7 +223,7 @@ class TestMdStepExecution:
                 pipeline_yaml={
                     "name": "t2-test",
                     "output_dir": str(output_dir),
-                    "review": {"directory": str(steps_dir.absolute())},
+                    "phases": [{"name": "review", "mode": "per_subject", "directory": str(steps_dir.absolute())}],
                 },
                 input_path=tmp_path / "subject-01.pdf",
             )
@@ -262,7 +262,7 @@ class TestMdStepExecution:
                 pipeline_yaml={
                     "name": "t2",
                     "output_dir": str(output_dir),
-                    "review": {"directory": str(steps_dir.absolute())},
+                    "phases": [{"name": "review", "mode": "per_subject", "directory": str(steps_dir.absolute())}],
                 },
                 input_path=tmp_path / "subject-01.pdf",
             )

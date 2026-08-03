@@ -52,12 +52,16 @@ def _make_pipeline_dir(base: Path, data_dir: Path) -> tuple[Path, Path]:
     (pipeline_dir / "pipeline.yaml").write_text(
         f"name: e2e-review\n"
         f"output_dir: {output_dir}\n"
-        f"pre:\n"
-        f"  directory: pre-review/\n"
-        f"review:\n"
-        f"  directory: review-pipeline/\n"
-        f"post:\n"
-        f"  directory: post-review/\n"
+        f"phases:\n"
+        f"  - name: pre\n"
+        f"    mode: batch\n"
+        f"    directory: pre-review/\n"
+        f"  - name: review\n"
+        f"    mode: per_subject\n"
+        f"    directory: review-pipeline/\n"
+        f"  - name: post\n"
+        f"    mode: batch\n"
+        f"    directory: post-review/\n"
     )
 
     # Pre 步骤

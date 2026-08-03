@@ -357,7 +357,7 @@ def review(
     phase: str | None = typer.Option(
         None,
         "--phase",
-        help="仅运行指定阶段: pre / review / post",
+        help="仅运行指定阶段（匹配 phases[].name）",
     ),
     step: str | None = typer.Option(
         None,
@@ -421,7 +421,9 @@ def review(
                     {
                         "name": "auto",
                         "output_dir": str(default_output),
-                        "review": {"directory": str(review_dir)},
+                        "phases": [
+                            {"name": "review", "mode": "per_subject", "directory": str(review_dir)}
+                        ],
                     },
                     path,
                     output_dir=default_output,
@@ -651,7 +653,7 @@ _DEFAULT_PIPELINE_YAML = """# ════════════════�
 # 标准论文评审管线配置
 # ═══════════════════════════════════════════════════
 #
-# 管线 = 三个阶段（Pre → Review → Post）
+# 管线 = phases 列表，每个阶段有 mode（batch 或 per_subject）
 # 每个阶段由若干 Step 组成，Step 可以是 .py 脚本或 .md Agent 提示词
 #
 # .md 步骤支持模板变量：
@@ -667,42 +669,46 @@ _DEFAULT_PIPELINE_YAML = """# ════════════════�
 name: "标准论文评审管线"
 version: "2.0"
 
-# ── Pre Phase（批量执行）───────────────────────────
-# 所有 Subject 依次执行每个 Step（不并行）
-pre:
-  directory: pre-review/   # 步骤脚本目录（相对于此 yaml 所在目录）
-  manifest_step: "00-convert"  # 产 subject-manifest.json 的 step
-  duplicate_policy: skip        # skip | rename | error
-  retry:
-    max_attempts: 2        # 失败重试次数
-    on_failure: skip        # skip（跳过）或 abort（终止）
+phases:
+  # ── Pre Phase（批量执行）───────────────────────────
+  # mode=batch: 所有 Subject 依次执行每个 Step（不并行）
+  - name: pre
+    mode: batch
+    directory: pre-review/   # 步骤脚本目录（相对于此 yaml 所在目录）
+    manifest_step: "00-convert"  # 产 subject-manifest.json 的 step
+    duplicate_policy: skip        # skip | rename | error
+    retry:
+      max_attempts: 2        # 失败重试次数
+      on_failure: skip        # skip（跳过）或 abort（终止）
 
-# ── Review Phase（逐篇执行）────────────────────────
-# 每篇论文独立走完所有 Step，支持 Worker 池并发
-review:
-  directory: review-pipeline/  # 步骤脚本目录
-  subject_source:
-    type: manifest             # manifest | cli（默认）
-    path: "{{ output_dir }}/subject-manifest.json"
-  duplicate_policy: skip
-  retry:
-    max_attempts: 1
-    on_failure: skip
-  subject_order:
-    sort_by: name           # name / regex
-    direction: asc          # asc / desc
-  pool:
-    workers: 5              # 并发 Worker 数（1=顺序）
-    timeout: 120            # 单 Subject 超时秒数
-    ordered: true           # 按 Subject 顺序返回结果
+  # ── Review Phase（逐篇执行）────────────────────────
+  # mode=per_subject: 每篇论文独立走完所有 Step，支持 Worker 池并发
+  - name: review
+    mode: per_subject
+    directory: review-pipeline/  # 步骤脚本目录
+    subject_source:
+      type: manifest             # manifest | cli（默认）
+      path: "{{ output_dir }}/subject-manifest.json"
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+    subject_order:
+      sort_by: name           # name / regex
+      direction: asc          # asc / desc
+    pool:
+      workers: 5              # 并发 Worker 数（1=顺序）
+      timeout: 120            # 单 Subject 超时秒数
+      ordered: true           # 按 Subject 顺序返回结果
 
-# ── Post Phase（批量执行）──────────────────────────
-post:
-  directory: post-review/
-  duplicate_policy: skip
-  retry:
-    max_attempts: 2
-    on_failure: skip
+  # ── Post Phase（批量执行）──────────────────────────
+  - name: post
+    mode: batch
+    directory: post-review/
+    duplicate_policy: skip
+    retry:
+      max_attempts: 2
+      on_failure: skip
 """
 
 

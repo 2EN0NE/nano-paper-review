@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 from paper_review.orchestrator import (
+    run_pipeline,
+)
+from paper_review.pipeline_models import (
     SubjectOrderConfig,
     _order_subjects,
-    run_pipeline,
     validate_step_output,
 )
 
@@ -136,9 +138,16 @@ class TestMultiPhaseExecution:
         # pipeline.yaml
         (pipeline_dir / "pipeline.yaml").write_text(
             "name: full\noutput_dir: " + str(output_dir) + "\n"
-            "pre:\n  directory: pre-review/\n"
-            "review:\n  directory: review-pipeline/\n"
-            "post:\n  directory: post-review/\n"
+            "phases:\n"
+            "  - name: pre\n"
+            "    mode: batch\n"
+            "    directory: pre-review/\n"
+            "  - name: review\n"
+            "    mode: per_subject\n"
+            "    directory: review-pipeline/\n"
+            "  - name: post\n"
+            "    mode: batch\n"
+            "    directory: post-review/\n"
         )
 
         input_pdf = tmp_path / "subject.pdf"
@@ -178,8 +187,13 @@ class TestMultiPhaseExecution:
 
         (pipeline_dir / "pipeline.yaml").write_text(
             "name: partial\noutput_dir: " + str(output_dir) + "\n"
-            "pre:\n  directory: pre-review/\n"
-            "review:\n  directory: review-pipeline/\n"
+            "phases:\n"
+            "  - name: pre\n"
+            "    mode: batch\n"
+            "    directory: pre-review/\n"
+            "  - name: review\n"
+            "    mode: per_subject\n"
+            "    directory: review-pipeline/\n"
         )
 
         input_pdf = tmp_path / "subject.pdf"
