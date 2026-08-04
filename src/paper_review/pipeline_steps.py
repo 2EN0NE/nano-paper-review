@@ -199,6 +199,13 @@ class PromptBuilder:
 # AgentRunner — .md 步骤的 subprocess 执行
 # ============================================================================
 
+_ANSI_ESCAPE_RE = __import__("re").compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\]8;.*?\x1b\\\\")
+
+
+def _strip_ansi(text: str) -> str:
+    """移除 ANSI 转义码，保留可读文本。"""
+    return _ANSI_ESCAPE_RE.sub("", text)
+
 
 class AgentRunner:
     """通过 subprocess 调用 pi 执行 Agent 步骤。
@@ -309,7 +316,9 @@ class AgentRunner:
         output_file = step_dir / "output.json"
 
         if proc.returncode != 0:
-            stderr_tail = proc.stderr.strip()[-500:] if proc.stderr.strip() else "<no stderr>"
+            # 清理 pi TUI 的 ANSI 转义码，提取可读错误信息
+            stderr_clean = _strip_ansi(proc.stderr) if proc.stderr else ""
+            stderr_tail = stderr_clean.strip()[-500:] if stderr_clean.strip() else "<no stderr>"
             logger.error(
                 "Agent step %s failed (exit %d): %s",
                 step_stem,

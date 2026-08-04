@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 _MIN_TIMEOUT = 60  # 最小单步超时（秒）
 _MAX_TIMEOUT = 900  # 最大单步超时（秒），对应 15 分钟
 _PY_STEP_TIMEOUT = 60  # .py 步骤固定超时
-_CHARS_PER_SEC_FACTOR = 15  # 每千字符额外超时秒数
+_CHARS_PER_SEC_FACTOR = 30  # 每千字符额外超时秒数（翻倍：实测 5000 字论文 Agent 步需 100-160s）
 _MULTI_SUBJECT_FACTOR = 1.2  # 多 subject 缓冲因子
 
 

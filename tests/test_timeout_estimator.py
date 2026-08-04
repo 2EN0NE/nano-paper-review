@@ -55,7 +55,7 @@ class TestEstimateStepTimeout:
     def test_single_subject_no_buffer(self):
         """单 subject 不乘缓冲因子。"""
         t = estimate_step_timeout(step_type="md", total_chars=5000, subject_count=1)
-        assert t == 135  # 60 + (5000/1000)*15 = 60+75 = 135
+        assert t == 210  # 60 + (5000/1000)*30 = 60+150 = 210
 
     def test_multi_subject_buffer_applied(self):
         """多 subject 时乘以 1.2 缓冲因子。"""
