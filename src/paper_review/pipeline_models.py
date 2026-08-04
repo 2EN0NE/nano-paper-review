@@ -1,4 +1,6 @@
 """
+from __future__ import annotations
+
 管线数据模型
 
 定义 Pipeline 的配置结构、运行时数据类型、Step 发现与排序。
@@ -178,6 +180,7 @@ class PhaseConfig:
     directory: str = ""
     retry: RetryConfig = field(default_factory=RetryConfig)
     duplicate_policy: str = "skip"  # 'skip' | 'rename' | 'error'
+    step_timeout: int = 0  # 单 Step 超时秒数（0=无超时，或从 pool.timeout 继承）
 
     # batch-only
     manifest_step: str = ""
@@ -213,6 +216,7 @@ def _parse_phase(data: dict) -> PhaseConfig:
         ),
         duplicate_policy=data.get("duplicate_policy", "skip"),
         manifest_step=data.get("manifest_step", ""),
+        step_timeout=data.get("step_timeout", 0),
         subject_source=(
             SubjectSourceConfig(
                 type=subject_source_data.get("type", "cli"),
@@ -281,6 +285,71 @@ class PipelineConfig:
         else:
             raw = {"name": "default", "output_dir": "./output"}
         return cls.from_dict(raw)
+
+    @classmethod
+    def discover_all(cls, pipelines_dir: Path) -> list[tuple[str, str]]:
+        """扫描 pipelines/ 子目录，返回 [(目录名, 管线名), ...]。
+
+        Args:
+            pipelines_dir: pipelines/ 根目录路径。
+
+        Returns:
+            (目录名, 管线名) 列表，按目录名排序。目录不存在或无子目录时返回空列表。
+        """
+        if not pipelines_dir.is_dir():
+            return []
+
+        results: list[tuple[str, str]] = []
+        for entry in sorted(pipelines_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            yaml_file = entry / "pipeline.yaml"
+            if not yaml_file.is_file():
+                continue
+            # 从 pipeline.yaml 读取 name 字段作为显示名，fallback 目录名
+            # _load_yaml 内部已捕获 (OSError, yaml.YAMLError)，无额外异常需处理
+            raw = _load_yaml(yaml_file)
+            display_name = raw.get("name", entry.name)
+            results.append((entry.name, display_name))
+
+        return results
+
+
+def resolve_pipeline_dir(
+    data_dir: Path,
+    pipeline_name: str | None = None,
+) -> Path | None:
+    """从 pipelines/ 解析管线目录路径。
+
+    优先项目级 ./.paper-review/，回退用户级 ~/.paper-review/。
+
+    Args:
+        data_dir: 数据目录路径（如 ~/.paper-review）。
+        pipeline_name: 管线名称。为 None 时：
+            - 仅一个管线时自动返回
+            - 多个管线时返回 None（调用方应做交互式选择）
+
+    Returns:
+        管线目录路径，或 None（需要交互选择或无管线）。
+    """
+    pipelines_dir = data_dir / "pipelines"
+    discovered = PipelineConfig.discover_all(pipelines_dir)
+
+    if not discovered:
+        return None
+
+    # 指定名称：精确匹配
+    if pipeline_name is not None:
+        for dir_name, _ in discovered:
+            if dir_name == pipeline_name:
+                return pipelines_dir / dir_name
+        return None
+
+    # 不指定名称：只有唯一一个时自动选择
+    if len(discovered) == 1:
+        return pipelines_dir / discovered[0][0]
+
+    return None  # 多个管线，需交互选择
 
 
 # ============================================================================

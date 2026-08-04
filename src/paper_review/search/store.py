@@ -1,4 +1,6 @@
 """
+from __future__ import annotations
+
 数据模型 + SQLite 持久化层
 
 Store 封装了所有索引数据的 SQLite 存储，包括：

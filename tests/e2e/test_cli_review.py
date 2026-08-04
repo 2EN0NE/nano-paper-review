@@ -41,12 +41,11 @@ def _find_task_dir(output_dir: Path) -> Path:
 
 
 def _make_pipeline_dir(base: Path, data_dir: Path) -> tuple[Path, Path]:
-    """在 base 下创建完整管线目录，返回 (pipeline_dir, output_dir)。"""
-    # 初始化数据目录（创建 index/ 和 output/ 以避免首次运行交互提示）
+    """在 data_dir/pipelines/standard/ 下创建管线，返回 (pipeline_dir, output_dir)。"""
     (data_dir / "index").mkdir(parents=True, exist_ok=True)
     output_dir = data_dir / "output"
 
-    pipeline_dir = base / "pipeline"
+    pipeline_dir = data_dir / "pipelines" / "standard"
     pipeline_dir.mkdir(parents=True)
 
     (pipeline_dir / "pipeline.yaml").write_text(
@@ -149,10 +148,13 @@ class TestReviewE2E:
         """索引不存在时 review 不应崩溃——01-search 应优雅降级返回空引用。"""
         data_dir = tmp_path / "data-no-index"
         # ⚠ 关键：不创建 index/ 目录，模拟 index 尚未建立的场景
-        output_dir = data_dir / "output"
 
-        pipeline_dir = tmp_path / "noindex-review"
+        pipeline_dir = data_dir / "pipelines" / "standard"
         pipeline_dir.mkdir(parents=True)
+        (pipeline_dir / "pipeline.yaml").write_text(
+            "name: test\nphases:\n"
+            "  - name: review\n    mode: per_subject\n    directory: review-pipeline\n"
+        )
 
         steps_dir = pipeline_dir / "review-pipeline"
         steps_dir.mkdir()
@@ -171,7 +173,7 @@ class TestReviewE2E:
             '          open(os.path.join(d,"output.json"),"w"))'
         )
 
-        pdf = pipeline_dir / "paper.pdf"
+        pdf = tmp_path / "paper.pdf"
         pdf.write_text("dummy")
 
         result = subprocess.run(
@@ -217,10 +219,13 @@ class TestReviewE2E:
         """直接传入 PDF 文件路径（免配置模式），使用 --data-dir 避免交互提示。"""
         data_dir = tmp_path / "data"
         (data_dir / "index").mkdir(parents=True)
-        output_dir = data_dir / "output"
 
-        pipeline_dir = tmp_path / "simple-review"
+        pipeline_dir = data_dir / "pipelines" / "standard"
         pipeline_dir.mkdir(parents=True)
+        (pipeline_dir / "pipeline.yaml").write_text(
+            "name: test\nphases:\n"
+            "  - name: review\n    mode: per_subject\n    directory: review-pipeline\n"
+        )
 
         steps_dir = pipeline_dir / "review-pipeline"
         steps_dir.mkdir()
@@ -232,7 +237,7 @@ class TestReviewE2E:
             'open(os.path.join(d,"output.json"),"w"))'
         )
 
-        pdf_path = pipeline_dir / "paper.pdf"
+        pdf_path = tmp_path / "paper.pdf"
         pdf_path.write_text("dummy")
 
         result = subprocess.run(
@@ -253,6 +258,7 @@ class TestReviewE2E:
             f"review failed:\nstdout:{result.stdout[:500]}\nstderr:{result.stderr[:500]}"
         )
         # 检查 output 产物
+        output_dir = data_dir / "output"
         task_dir = _find_task_dir(output_dir)
         out = task_dir / "intermediates" / "paper" / "01-check" / "output.json"
         assert out.exists(), f"Missing output: {out}"

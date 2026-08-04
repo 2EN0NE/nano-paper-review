@@ -1,4 +1,6 @@
 """
+from __future__ import annotations
+
 混合检索管道 —— BM25 + FAISS → RRF → (可选) Cross-Encoder 精排。
 
 提供：

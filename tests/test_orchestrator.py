@@ -97,6 +97,33 @@ class TestPipelineConfigParsing:
         assert cfg.phases[0].retry.max_attempts == 1
         assert cfg.phases[0].retry.on_failure == "skip"
 
+    def test_step_timeout_parsed_from_yaml(self):
+        """YAML 中的 step_timeout 字段被正确解析。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "timeout-test",
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": "r/",
+                        "step_timeout": 180,
+                    },
+                ],
+            }
+        )
+        assert cfg.phases[0].step_timeout == 180
+
+    def test_step_timeout_defaults_to_zero(self):
+        """未指定 step_timeout 时默认为 0（由 run_pipeline 动态估算）。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "no-timeout",
+                "phases": [{"name": "review", "mode": "per_subject", "directory": "r/"}],
+            }
+        )
+        assert cfg.phases[0].step_timeout == 0
+
 
 # ============================================================================
 # Step 发现与排序
@@ -642,3 +669,113 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
             f"Expected all steps done, got {step_count}"
         )
         assert len(all_results) == 2
+
+
+# ============================================================================
+# CLI 树形图渲染
+# ============================================================================
+
+
+class TestCliTree:
+    """_build_cli_tree() 终端树形图输出验证。"""
+
+    def _make_config(self, tmp_path: Path) -> tuple:
+        """创建最小 PipelineConfig + pipeline 目录结构。"""
+        from paper_review.pipeline_models import PipelineConfig
+
+        pipe_dir = tmp_path / "pipelines" / "test"
+        pipe_dir.mkdir(parents=True)
+
+        # 创建 step 文件（任意类型，discover_steps 需要它们存在）
+        for sub in ("pre-review", "review-pipeline", "post-review"):
+            (pipe_dir / sub).mkdir()
+
+        config = PipelineConfig.from_dict(
+            {
+                "name": "test",
+                "phases": [
+                    {"name": "pre", "mode": "batch", "directory": "pre-review"},
+                    {"name": "review", "mode": "per_subject", "directory": "review-pipeline"},
+                    {"name": "post", "mode": "batch", "directory": "post-review"},
+                ],
+            }
+        )
+        return config, pipe_dir
+
+    def test_empty_phases_produces_message(self):
+        """无 phase 时输出提示不抛异常。"""
+        from paper_review.orchestrator import _build_cli_tree
+        from paper_review.pipeline_models import PipelineConfig
+
+        config = PipelineConfig.from_dict({"name": "empty"})
+        tree = _build_cli_tree("id", "empty", config, {}, Path("/tmp"), Path("/tmp/t"))
+        assert "(无 phase)" in tree
+
+    def test_batch_phase_shows_count(self, tmp_path):
+        """batch phase 显示成功/总数。"""
+        from paper_review.orchestrator import _build_cli_tree
+        from paper_review.pipeline_models import StepResult
+
+        config, pipe_dir = self._make_config(tmp_path)
+        all_results = {
+            "pre": {"_batch_": [StepResult(step_name="00-convert", status="ok")]},
+            "review": {},
+            "post": {"_batch_": [StepResult(step_name="02-excel", status="ok")]},
+        }
+        # 添加 step 文件供 discover_steps 发现
+        (pipe_dir / "pre-review" / "00-convert.py").write_text("")
+        (pipe_dir / "post-review" / "02-excel.py").write_text("")
+
+        tree = _build_cli_tree("id", "test", config, all_results, pipe_dir, Path("/tmp/t"))
+        assert "PRE (batch)" in tree
+        assert "1/1" in tree
+
+    def test_per_subject_shows_aggregated_counts(self, tmp_path):
+        """per_subject phase 显示聚合的 ok/error/skipped 计数。"""
+        from paper_review.orchestrator import _build_cli_tree
+        from paper_review.pipeline_models import StepResult
+
+        config, pipe_dir = self._make_config(tmp_path)
+        # 3 个 subject: 2 ok, 1 error
+        review_results = {
+            "subj1": [StepResult(step_name="01-search", status="ok")],
+            "subj2": [StepResult(step_name="01-search", status="ok")],
+            "subj3": [StepResult(step_name="01-search", status="error", error="timeout")],
+        }
+        (pipe_dir / "review-pipeline" / "01-search.py").write_text("")
+
+        tree = _build_cli_tree(
+            "id",
+            "test",
+            config,
+            {"pre": {}, "review": review_results, "post": {}},
+            pipe_dir,
+            Path("/tmp/t"),
+        )
+        assert "2 ok" in tree
+        assert "1 error" in tree
+
+    def test_leaf_output_shows_file_path(self, tmp_path):
+        """终端叶子节点有文件路径数据时展示文件路径。"""
+        from paper_review.orchestrator import _build_cli_tree
+        from paper_review.pipeline_models import StepResult
+
+        config, pipe_dir = self._make_config(tmp_path)
+        post_results = {
+            "_batch_": [
+                StepResult(
+                    step_name="02-excel", status="ok", data={"excel_path": "/tmp/summary.xlsx"}
+                ),
+            ],
+        }
+        (pipe_dir / "post-review" / "02-excel.py").write_text("")
+
+        tree = _build_cli_tree(
+            "id",
+            "test",
+            config,
+            {"pre": {}, "review": {}, "post": post_results},
+            pipe_dir,
+            Path("/tmp/t"),
+        )
+        assert "summary.xlsx" in tree

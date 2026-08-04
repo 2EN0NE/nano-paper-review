@@ -1,4 +1,6 @@
 """
+from __future__ import annotations
+
 配置加载 —— Pydantic 模型 + YAML/环境变量/默认值
 
 优先级：默认值 ← YAML 文件 ← 环境变量（PAPER_REVIEW_XXX）

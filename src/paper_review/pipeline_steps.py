@@ -230,22 +230,51 @@ class AgentRunner:
         prompt_file = step_dir / "prompt.md"
         prompt_file.write_text(prompt, encoding="utf-8")
 
-        # 调用 pi（-p 非交互模式）
+        # 调用 pi（--no-session 一次性执行，-p 非交互模式）
         pi_binary = env.get("PIPELINE_PI_BINARY", "pi")
+        step_timeout = timeout  # default
+        timeout_str = env.get("PIPELINE_STEP_TIMEOUT", "")
+        if timeout_str:
+            try:
+                val = int(timeout_str)
+                if val > 0:
+                    step_timeout = val
+                else:
+                    logger.warning(
+                        "PIPELINE_STEP_TIMEOUT must be >0, got %s; using default %d",
+                        timeout_str,
+                        step_timeout,
+                    )
+            except ValueError:
+                logger.warning(
+                    "Invalid PIPELINE_STEP_TIMEOUT value: %s; using default %d",
+                    timeout_str,
+                    step_timeout,
+                )
+
+        prompt_size_kb = len(prompt) / 1024
+        logger.info(
+            "  [%s] ▶ pi %s --no-session -p @%s (%.1fKB, timeout=%ds)",
+            step_stem,
+            pi_binary,
+            prompt_file,
+            prompt_size_kb,
+            step_timeout,
+        )
         try:
             proc = subprocess.run(  # noqa: S603 — pi_binary is user-configurable
-                [pi_binary, "-p", f"@{prompt_file}"],
+                [pi_binary, "--no-session", "-p", f"@{prompt_file}"],
                 env=step_env,
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=step_timeout,
             )
         except subprocess.TimeoutExpired:
-            logger.error("Agent step %s timed out (%ds)", step_stem, timeout)
+            logger.error("Agent step %s timed out (%ds)", step_stem, step_timeout)
             return StepResult(
                 step_name=step_stem,
                 status="error",
-                error=f"Agent step timed out ({timeout}s)",
+                error=f"Agent step timed out ({step_timeout}s)",
             )
         except FileNotFoundError:
             logger.warning(
@@ -324,6 +353,21 @@ class AgentRunner:
             json.dump(output_json, f, ensure_ascii=False, indent=2)
 
         result_status = output_json["status"]
+
+        # 成功时也输出 pi 的 stdout 预览便于调试
+        stdout_preview = output_text[:200].replace("\n", " ") if output_text else "<empty>"
+        stderr_info = ""
+        if proc.stderr and proc.stderr.strip():
+            stderr_info = f", stderr={len(proc.stderr)}B"
+        logger.info(
+            "  [%s] ✓ pi done (exit=%d, stdout=%dB%s): %s…",
+            step_stem,
+            proc.returncode,
+            len(output_text),
+            stderr_info,
+            stdout_preview,
+        )
+
         return StepResult(
             step_name=step_stem,
             status=result_status,

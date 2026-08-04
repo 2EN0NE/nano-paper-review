@@ -136,8 +136,13 @@ def _find_task_dir(output_dir: Path) -> Path:
     return result_dirs[0]
 
 
-def _setup_pipeline_steps(pipeline_dir: Path) -> None:
-    """在 pipeline_dir 下创建完整的管线目录和所有步骤文件。"""
+def _setup_pipeline_steps(pipelines_dir: Path, name: str = "e2e-test") -> Path:
+    """在 pipelines_dir/{name}/ 下创建完整管线定义。
+
+    返回管线目录路径。
+    """
+    pipeline_dir = pipelines_dir / name
+    pipeline_dir.mkdir(parents=True, exist_ok=True)
     # ── pipeline.yaml ──
     (pipeline_dir / "pipeline.yaml").write_text("""\
 name: "e2e-test"
@@ -299,6 +304,8 @@ phases:
     if src_excel.exists():
         shutil.copy(src_excel, post_dir / "02-generate-excel.py")
 
+    return pipeline_dir
+
 
 # ============================================================================
 # 场景 1: 单 PDF 文件
@@ -318,7 +325,7 @@ class TestPipelineSinglePDF:
         # pipeline 放在 input 目录下（CLI 从此处发现 pipeline.yaml）
         input_dir = tmp_path / "input"
         input_dir.mkdir()
-        _setup_pipeline_steps(input_dir)
+        _setup_pipeline_steps(data_dir / "pipelines")
 
         # Mock pandoc
         mock_bin = tmp_path / "mock-bin"
@@ -392,7 +399,7 @@ class TestPipelineSingleDocx:
         # pipeline 和 docx 放在同一目录
         input_dir = tmp_path / "input"
         input_dir.mkdir()
-        _setup_pipeline_steps(input_dir)
+        _setup_pipeline_steps(data_dir / "pipelines")
 
         # Mock pandoc
         mock_bin = tmp_path / "mock-bin"
@@ -463,7 +470,7 @@ class TestPipelineMixedDirectory:
         # pipeline 和输入文件放在同一目录
         input_dir = tmp_path / "input"
         input_dir.mkdir()
-        _setup_pipeline_steps(input_dir)
+        _setup_pipeline_steps(data_dir / "pipelines")
 
         mock_bin = tmp_path / "mock-bin"
         mock_bin.mkdir()
@@ -547,7 +554,7 @@ class TestPipelinePDFDirectory:
         # pipeline 和 PDF 放在同一目录
         input_dir = tmp_path / "input"
         input_dir.mkdir()
-        _setup_pipeline_steps(input_dir)
+        _setup_pipeline_steps(data_dir / "pipelines")
 
         mock_bin = tmp_path / "mock-bin"
         mock_bin.mkdir()
@@ -629,7 +636,7 @@ class TestPipelineDocNoLibreoffice:
         # pipeline 和 .doc 放在同一目录
         input_dir = tmp_path / "input"
         input_dir.mkdir()
-        _setup_pipeline_steps(input_dir)
+        _setup_pipeline_steps(data_dir / "pipelines")
 
         # 不创建 mock pandoc，也不安装 libreoffice
         # 只放一个 .doc 文件
@@ -684,7 +691,7 @@ class TestExcelSkipSingleSubject:
 
         input_dir = tmp_path / "input"
         input_dir.mkdir()
-        _setup_pipeline_steps(input_dir)
+        _setup_pipeline_steps(data_dir / "pipelines")
 
         mock_bin = tmp_path / "mock-bin"
         mock_bin.mkdir()

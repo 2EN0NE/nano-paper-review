@@ -105,4 +105,27 @@ _Avoid_: Pipeline runner, executor, engine
 
 **Output Root**:
 评审产出的根目录。由 `data_dir` 推导为 `{data_dir}/output/`，也可通过 `pipeline.yaml` 的 `output_dir` 字段覆盖（优先级更高）。
-所有 intermediates、reports、日志均在此目录下按 Subject 名称组织。
+所有 intermediates、reports、日志均在此目录下按 task_id 组织。
+
+**Pipelines Directory**:
+管线定义文件的存放目录。位于 `{data_dir}/pipelines/{name}/`，每个管线一个子目录，内含 `pipeline.yaml` 和 Phase 子目录（`pre-review/`、`review-pipeline/`、`post-review/`）。
+_Avoid_: Pipeline home, pipeline store
+
+**Pipeline Name**:
+管线的唯一标识符，等于 `pipelines/` 下的子目录名。用于 CLI 选择和产物路径命名。
+_Avoid_: Pipeline id, pipeline key
+
+**Pipeline Discovery**:
+CLI 自动扫描 `{data_dir}/pipelines/` 子目录以发现可用管线。多管线时提供交互式选择，单管线自动使用，零管线时报错。
+优先扫描项目级 `./.paper-review/pipelines/`，回退到用户级 `~/.paper-review/pipelines/`。
+_Avoid_: Pipeline scan, pipeline listing
+
+**Pipeline Metadata**:
+`config.yaml` 中可选的管线元数据段，用于覆盖目录名作为显示名、补充描述。管线自发现不受 metadata 是否存在的限制。格式：
+
+```yaml
+pipelines:
+  standard:
+    name: "标准论文评审"
+    description: "默认双维度评审管线"
+```

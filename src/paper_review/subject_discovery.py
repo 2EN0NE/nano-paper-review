@@ -1,4 +1,6 @@
 """
+from __future__ import annotations
+
 Subject 发现模块
 
 从 manifest JSON 或 CLI PDF 扫描发现 Subject 列表，

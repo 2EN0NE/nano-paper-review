@@ -1,4 +1,6 @@
 """
+from __future__ import annotations
+
 Model discovery — scan local caches for ready-to-use ONNX models.
 
 Supports discovery inside:

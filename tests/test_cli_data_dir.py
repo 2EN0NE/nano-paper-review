@@ -9,6 +9,7 @@ CLI --data-dir 全局选项测试
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
@@ -90,6 +91,23 @@ class TestOpenStoreDataDir:
 class TestReviewWithDataDir:
     """paper-review review 与 data_dir 的联动"""
 
+    @staticmethod
+    def _make_pipeline_dir(data_dir: Path) -> None:
+        """在 data_dir 下创建 pipelines/standard/ 管线结构。"""
+        pipe_dir = data_dir / "pipelines" / "standard"
+        pipe_dir.mkdir(parents=True)
+        (pipe_dir / "pipeline.yaml").write_text(
+            'name: test\nversion: "1.0"\n'
+            "phases:\n"
+            "  - name: review\n"
+            "    mode: per_subject\n"
+            "    directory: review-pipeline\n"
+        )
+        review_dir = pipe_dir / "review-pipeline"
+        review_dir.mkdir()
+        (review_dir / "01-test.md").write_text("# test")
+        (data_dir / ".first-use-hint-shown").touch()
+
     @patch("paper_review.cli.run_pipeline")
     @patch("paper_review.cli.open_store")
     def test_review_data_dir_to_orchestrator(self, mock_open_store, mock_run, tmp_path):
@@ -97,27 +115,19 @@ class TestReviewWithDataDir:
         mock_store = MagicMock()
         mock_store.state_summary.return_value = {}
         mock_open_store.return_value = mock_store
-
         mock_run.return_value = MagicMock(success=True, subject="test", step_results=[])
 
-        # 创建一个含 review-pipeline/ 的临时目录
-        tmp = tmp_path / "review-test"
-        tmp.mkdir(parents=True)
-        (tmp / "review-pipeline").mkdir()
-        (tmp / "review-pipeline" / "01-test.md").write_text("# test")
-
-        # 创建 first-use 标记文件避免交互提示
-        (tmp / "data-dir").mkdir(parents=True, exist_ok=True)
-        (tmp / "data-dir" / ".first-use-hint-shown").touch()
+        dd = tmp_path / "data-dir"
+        dd.mkdir()
+        self._make_pipeline_dir(dd)
 
         runner.invoke(
             app,
-            ["--data-dir", str(tmp / "data-dir"), "review", str(tmp), "--skip-warnings"],
+            ["--data-dir", str(dd), "review", str(tmp_path), "--skip-warnings"],
         )
 
-        # 验证 run_pipeline 收到了 data_dir
         _, kwargs = mock_run.call_args
-        assert kwargs.get("data_dir") == str(tmp / "data-dir")
+        assert kwargs.get("data_dir") == str(dd)
 
     @patch("paper_review.cli.run_pipeline")
     @patch("paper_review.cli.open_store")
@@ -130,14 +140,10 @@ class TestReviewWithDataDir:
 
         dot = tmp_path / ".paper-review"
         dot.mkdir(parents=True)
-        (tmp_path / "review-pipeline").mkdir()
-        (tmp_path / "review-pipeline" / "01-test.md").write_text("# test")
-        # 创建 first-use 标记文件避免交互提示
-        (dot / ".first-use-hint-shown").touch()
+        self._make_pipeline_dir(dot)
 
         with patch("pathlib.Path.cwd", return_value=tmp_path):
             runner.invoke(app, ["review", str(tmp_path), "--skip-warnings"])
 
-        # 当 .paper-review 存在时，自动解析到该目录
         _, kwargs = mock_run.call_args
         assert kwargs.get("data_dir") == str(dot)

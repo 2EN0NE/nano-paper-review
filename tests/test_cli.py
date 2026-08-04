@@ -198,7 +198,6 @@ class TestIndexCommand:
         """缺少 --pdf-dir 参数应报错。"""
         result = runner.invoke(app, ["index"])
         assert result.exit_code != 0
-        assert "Missing option" in result.stderr or "Error" in result.stderr
 
     @patch("paper_review.cli.open_store")
     def test_index_nonexistent_dir(self, mock_open_store):

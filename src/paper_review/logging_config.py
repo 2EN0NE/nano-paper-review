@@ -1,4 +1,6 @@
 """
+from __future__ import annotations
+
 日志配置 —— 集中管理日志输出级别、路径与轮转策略
 
 配置来源（优先级递增）：

@@ -1,4 +1,6 @@
 """
+from __future__ import annotations
+
 模板引擎 —— .md Agent 步骤的变量替换与前缀生成
 
 变量语法: {variable.name} 或 {intermediates.STEPNAME.data.KEY}
@@ -175,8 +177,11 @@ def build_agent_prefix(
             parts.append(f"- **{r.step_name}** {status_icon} status=`{r.status}`")
             if r.data:
                 snippet = json.dumps(r.data, ensure_ascii=False)
+                # 安全截断：超过 200 字符时，在自然边界（逗号/空格后）截断
                 if len(snippet) > 200:
-                    snippet = snippet[:200] + "..."
+                    cut = snippet[:200]
+                    last_good = max(cut.rfind(","), cut.rfind(" "), 0)
+                    snippet = snippet[:last_good] + "…[truncated]"
                 parts.append(f"  data: {snippet}")
         parts.append("")
 

@@ -8,6 +8,8 @@ Orchestrator —— 评审流水线执行引擎
 Step 执行 → pipeline_steps.py
 Subject 发现 → subject_discovery.py
 """
+from __future__ import annotations
+
 
 from __future__ import annotations
 
@@ -37,6 +39,7 @@ from paper_review.pipeline_steps import (
 )
 from paper_review.progress import PipelineProgress
 from paper_review.subject_discovery import discover_subjects
+from paper_review.timeout_estimator import estimate_step_timeout
 
 logger = get_logger("orchestrator")
 
@@ -54,42 +57,60 @@ def _retry_step(
     subject_name: str,
     retry_cfg: RetryConfig,
     executor: StepExecutor,
+    step_timeout: int = 0,
 ) -> StepResult:
     """执行一个 Step，按 RetryConfig 重试。
 
     唯一的重试实现点——_execute_batch 和 _execute_per_subject 都调用此函数。
+    step_timeout 通过 env['PIPELINE_STEP_TIMEOUT'] 传递给 executor。
     """
+    timed_env = {**env, "PIPELINE_STEP_TIMEOUT": str(step_timeout)}
     result: StepResult | None = None
+    t0 = time.monotonic()
+
     for attempt in range(1, retry_cfg.max_attempts + 1):
-        logger.debug(
-            "  [%s] step %s attempt %d/%d",
+        logger.info(
+            "  [%s] ▶ step '%s' attempt %d/%d (timeout=%ds)",
             subject_name,
             step.stem,
             attempt,
             retry_cfg.max_attempts,
+            step_timeout,
         )
 
         try:
-            result = executor.execute(step, step_dir, env, prior_results, subject_name)
+            result = executor.execute(step, step_dir, timed_env, prior_results, subject_name)
+            elapsed = time.monotonic() - t0
             result.subject = subject_name
             result.attempt = attempt
 
             if result.status in ("ok", "skipped"):
+                logger.info(
+                    "  [%s] ✓ step '%s' %s in %.1fs (attempt %d)",
+                    subject_name,
+                    step.stem,
+                    result.status,
+                    elapsed,
+                    attempt,
+                )
                 return result
 
             logger.warning(
-                "  [%s] step %s attempt %d failed: %s",
+                "  [%s] ✗ step '%s' attempt %d failed (%.1fs elapsed): %s",
                 subject_name,
                 step.stem,
                 attempt,
+                elapsed,
                 result.error,
             )
         except Exception as e:
+            elapsed = time.monotonic() - t0
             logger.error(
-                "  [%s] step %s attempt %d raised: %s",
+                "  [%s] ✗ step '%s' attempt %d crashed (%.1fs elapsed): %s",
                 subject_name,
                 step.stem,
                 attempt,
+                elapsed,
                 e,
             )
             result = StepResult(
@@ -122,6 +143,7 @@ def _execute_batch(
     base_env: dict,
     executor: StepExecutor,
     pp: PipelineProgress | None = None,
+    step_timeout: int = 0,
 ) -> dict[str, list[StepResult]]:
     """批量模式：所有 Step 对 sentinel subject _batch_ 执行一次。
 
@@ -149,6 +171,7 @@ def _execute_batch(
             subject_name="_batch_",
             retry_cfg=phase.retry,
             executor=executor,
+            step_timeout=step_timeout,
         )
         results.append(result)
 
@@ -180,6 +203,7 @@ def _execute_per_subject(
     executor: StepExecutor,
     pool_progress: PoolProgress | None = None,
     pp: PipelineProgress | None = None,
+    step_timeout: int = 0,
 ) -> dict[str, list[StepResult]]:
     """逐 Subject 模式：每个 Subject 顺序执行所有 Step。
 
@@ -199,6 +223,7 @@ def _execute_per_subject(
             pool_cfg=pool_cfg,  # type: ignore[arg-type]  # guard above
             pool_progress=pool_progress,
             pp=pp,
+            step_timeout=step_timeout,
         )
 
     # 顺序执行
@@ -223,6 +248,7 @@ def _execute_per_subject(
             base_env=base_env,
             executor=executor,
             pp=pp,
+            step_timeout=step_timeout,
         )
         all_results[subject] = subject_results
 
@@ -240,13 +266,18 @@ def _run_steps_for_subject(
     base_env: dict,
     executor: StepExecutor,
     pp: PipelineProgress | None = None,
+    step_timeout: int = 0,
 ) -> list[StepResult]:
     """对单个 Subject 执行全部 Step（顺序）。"""
     subject_results: list[StepResult] = []
     result_base = base_env.get("PIPELINE_RESULT_DIR", str(output_dir))
+    t0 = time.monotonic()
+
+    logger.info(
+        "  [%s] ▶ starting %d step(s) (timeout=%ds/step)", subject, len(steps), step_timeout
+    )
 
     for step in steps:
-        logger.info("  [%s] step '%s' starting", subject, step.stem)
         step_dir = Path(result_base) / "intermediates" / subject / step.stem
         env = {
             **base_env,
@@ -265,6 +296,7 @@ def _run_steps_for_subject(
             subject_name=subject,
             retry_cfg=phase.retry,
             executor=executor,
+            step_timeout=step_timeout,
         )
         subject_results.append(result)
 
@@ -275,6 +307,8 @@ def _run_steps_for_subject(
             logger.error("Aborting pipeline for %s due to %s failure", subject, step.stem)
             break
 
+    elapsed = time.monotonic() - t0
+    logger.info("  [%s] ✓ all %d step(s) done (%.1fs total)", subject, len(steps), elapsed)
     return subject_results
 
 
@@ -305,15 +339,17 @@ def _execute_per_subject_pooled(
     pool_cfg: PoolConfig,
     pool_progress: PoolProgress | None = None,
     pp: PipelineProgress | None = None,
+    step_timeout: int = 0,
 ) -> dict[str, list[StepResult]]:
     """Worker 池并发处理多个 Subject。"""
     actual_workers = min(pool_cfg.workers, len(subjects))
     per_subject_timeout = pool_cfg.timeout if pool_cfg.timeout > 0 else None
 
     logger.info(
-        "Pool mode: %d worker(s) processing %d subject(s)",
+        "Pool mode: %d worker(s) processing %d subject(s) (step_timeout=%ds)",
         actual_workers,
         len(subjects),
+        step_timeout,
     )
 
     all_results: dict[str, list[StepResult]] = {}
@@ -334,6 +370,7 @@ def _execute_per_subject_pooled(
                 base_env,
                 executor,
                 pp,
+                step_timeout,
             )
             future_map[fut] = s
             start_times[s] = time.monotonic()
@@ -403,6 +440,11 @@ def _execute_per_subject_pooled(
                 all_results[subject] = results
                 elapsed = time.monotonic() - start_times[subject]
                 logger.info("  [%s] ✓ completed after timeout in %.0fs", subject, elapsed)
+                # 恢复完成后同步 pool_progress 和 errors 列表
+                if pool_progress:
+                    pool_progress.on_subject_complete(subject, results)
+                if subject in errors:
+                    errors.remove(subject)
             except (CancelledError, Exception) as e:
                 logger.debug("  [%s] timed-out future resolved with %s", subject, type(e).__name__)
 
@@ -413,6 +455,219 @@ def _execute_per_subject_pooled(
         logger.warning("Pool mode finished with %d failed subject(s): %s", len(errors), errors)
 
     return all_results
+
+
+# ============================================================================
+# CLI 树形图 + 叶子输出
+# ============================================================================
+
+
+def _build_cli_tree(
+    task_id: str,
+    pipeline_name: str,
+    config: PipelineConfig,
+    all_phase_results: dict[str, dict[str, list[StepResult]]],
+    pipeline_dir: Path,
+    task_dir: Path,
+) -> str:
+    """构建 CLI 管线树形图、过程统计、叶子节点输出。"""
+    lines: list[str] = []
+    phases = config.phases
+
+    # ── 全局统计 ──
+    all_steps: list[StepResult] = []
+    for pr in all_phase_results.values():
+        for subj_results in pr.values():
+            all_steps.extend(subj_results)
+
+    total = len(all_steps)
+    ok_count = sum(1 for r in all_steps if r.status == "ok")
+    err_count = sum(1 for r in all_steps if r.status == "error")
+
+    lines.append(f"📊 Pipeline: {pipeline_name}  ·  Task: {task_id}")
+    lines.append(f"   合计 {total} 步（✅ {ok_count}  /  ❌ {err_count}）")
+    lines.append("")
+
+    # ── 终端 phase 判定（phases 列表最后一项）──
+    if not phases:
+        lines.append("(无 phase)")
+        return "\n".join(lines)
+    terminal_phase = phases[-1]
+
+    # ── step_type 查表 + 缓存 step 顺序（避免重复 I/O）──
+    step_type_map: dict[tuple[str, str], str] = {}
+    phase_step_names: dict[str, list[str]] = {}  # phase.name → ordered step stems
+    for phase in phases:
+        step_files = discover_steps(pipeline_dir / phase.directory)
+        phase_step_names[phase.name] = [sf.stem for sf in step_files]
+        for sf in step_files:
+            step_type_map[(phase.name, sf.stem)] = sf.step_type
+
+    # ── 逐 phase 渲染 ──
+    for i, phase in enumerate(phases):
+        phase_results = all_phase_results.get(phase.name, {})
+        is_last_phase = i == len(phases) - 1
+        phase_prefix = "└──" if is_last_phase else "├──"
+        indent = "    " if is_last_phase else "│   "
+
+        # Phase 概览
+        if phase.mode == "batch":
+            batch = phase_results.get("_batch_", [])
+            b_ok = sum(1 for r in batch if r.status == "ok")
+            b_err = sum(1 for r in batch if r.status == "error")
+            icon = "✅" if b_err == 0 else "❌"
+            lines.append(f"{phase_prefix} {phase.name.upper()} (batch) {icon} {b_ok}/{len(batch)}")
+        else:
+            subjects_in_phase = [s for s in phase_results if s != "_batch_"]
+            lines.append(
+                f"{phase_prefix} {phase.name.upper()} (per_subject) "
+                f"{len(subjects_in_phase)} subject(s)"
+            )
+
+        # 从缓存获取该 phase 的 step 顺序（无重复 I/O）
+        step_names = phase_step_names.get(phase.name, [])
+
+        for j, step_name in enumerate(step_names):
+            is_last_step = j == len(step_names) - 1
+            step_prefix = indent + ("└──" if is_last_step else "├──")
+            out_indent = indent + ("    " if is_last_step else "│   ")
+
+            s_type = step_type_map.get((phase.name, step_name), "py")
+
+            # per-subject 统计
+            subj_stats = {"ok": 0, "error": 0, "skipped": 0}
+            for subj_results in phase_results.values():
+                for sr in subj_results:
+                    if sr.step_name == step_name:
+                        if sr.status == "ok":
+                            subj_stats["ok"] += 1
+                        elif sr.status == "error":
+                            subj_stats["error"] += 1
+                        else:
+                            subj_stats["skipped"] += 1
+
+            icon = "❌" if subj_stats["error"] > 0 else ("⚠️" if subj_stats["ok"] == 0 else "✅")
+            if phase.mode == "batch":
+                lines.append(
+                    f"{step_prefix} {step_name} ({s_type}) {icon} {subj_stats['ok']} ok"
+                    f"{' / ❌ ' + str(subj_stats['error']) if subj_stats['error'] else ''}"
+                )
+            else:
+                parts = []
+                if subj_stats["ok"]:
+                    parts.append(f"✅ {subj_stats['ok']} ok")
+                if subj_stats["skipped"]:
+                    parts.append(f"⚠️ {subj_stats['skipped']} skipped")
+                if subj_stats["error"]:
+                    parts.append(f"❌ {subj_stats['error']} error")
+                lines.append(f"{step_prefix} {step_name} ({s_type})  {' / '.join(parts)}")
+
+            # ── 叶子节点输出 ──
+            is_terminal = phase == terminal_phase
+            is_leaf_in_phase = (phase.mode == "batch" and is_last_step) or (
+                phase.mode == "per_subject"
+            )
+            if is_terminal and is_leaf_in_phase and subj_stats["ok"] > 0:
+                leaf_lines = _render_leaf_outputs(
+                    phase, step_name, phase_results, task_dir, out_indent
+                )
+                lines.extend(leaf_lines)
+
+        lines.append("")
+
+    lines.append(f"完整报告: {task_dir / 'report.md'}")
+    return "\n".join(lines)
+
+
+# ── 已知文件键后缀（后缀匹配，避免误匹配 profile / empathy 等）──
+_FILE_KEY_SUFFIXES = ("_path", "_file", "_dir")
+
+
+def _render_leaf_outputs(
+    phase: PhaseConfig,
+    step_name: str,
+    phase_results: dict[str, list[StepResult]],
+    task_dir: Path,
+    out_indent: str,
+) -> list[str]:
+    """渲染叶子步骤的输出内容（文字 + 文件路径）。"""
+    out_lines: list[str] = []
+
+    if phase.mode == "batch":
+        batch = phase_results.get("_batch_", [])
+        candidates = [r for r in batch if r.step_name == step_name and r.status == "ok"]
+    else:
+        candidates = []
+        for subj, subj_results in phase_results.items():
+            if subj == "_batch_":
+                continue
+            for sr in subj_results:
+                if sr.step_name == step_name and sr.status == "ok":
+                    candidates.append(sr)
+
+    if not candidates:
+        return out_lines
+
+    # ── 从 output.json 提取数据和文件路径 ──
+    if phase.mode == "batch":
+        for sr in candidates[:1]:  # batch 只取一条
+            data = sr.data
+            if not data:
+                continue
+            # 文件路径（严格后缀匹配：_path / _file / _dir）
+            file_keys = [k for k in data if k.endswith(_FILE_KEY_SUFFIXES)]
+            for fk in file_keys:
+                val = data[fk]
+                if isinstance(val, str) and val:
+                    out_lines.append(f"{out_indent}→ 文件: {val}")
+                elif isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, str):
+                            out_lines.append(f"{out_indent}→ 文件: {v}")
+            # 报告目录等约定路径
+            if "archived_subjects" in data:
+                out_lines.append(
+                    f"{out_indent}→ 归档 {data.get('total', len(data['archived_subjects']))} 篇: "
+                    f"{task_dir.parent / 'reports'}"
+                )
+            # 非文件标的文本数据
+            text_keys = [
+                k
+                for k in data
+                if k not in file_keys
+                and k != "archived_subjects"
+                and k != "total"
+                and isinstance(data[k], (str, int, float, bool))
+            ]
+            for tk in text_keys:
+                val = data[tk]
+                out_lines.append(f"{out_indent}→ {tk}: {val}")
+    else:
+        # per_subject: 每 subject 显示一行摘要
+        for sr in candidates:
+            subj = sr.subject or "?"
+            data = sr.data
+            if not data:
+                continue
+            # 文件路径优先（严格后缀匹配）
+            file_keys = [k for k in data if k.endswith(_FILE_KEY_SUFFIXES)]
+            shown = False
+            for fk in file_keys:
+                val = data[fk]
+                if isinstance(val, str) and val:
+                    out_lines.append(f"{out_indent}  [{subj}] → {val}")
+                    shown = True
+            if not shown:
+                # 显示关键文本
+                text_keys = [
+                    k
+                    for k in data
+                    if k not in file_keys and isinstance(data[k], (str, int, float, bool))
+                ]
+                for tk in text_keys[:2]:  # 最多显示 2 个字段
+                    out_lines.append(f"{out_indent}  [{subj}] → {tk}: {data[tk]}")
+
+    return out_lines
 
 
 # ============================================================================
@@ -428,10 +683,17 @@ def _generate_report(
     all_step_results: list[StepResult],
     success: bool,
 ) -> str:
-    """生成最终报告 markdown 文件，返回 CLI 可输出的结论摘要。"""
+    """生成最终报告 markdown 文件，返回 CLI 可输出的结构化结论摘要。"""
     import datetime
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── 统计 ──
+    total = len(all_step_results)
+    ok_count = sum(1 for r in all_step_results if r.status == "ok")
+    skipped_count = sum(1 for r in all_step_results if r.status == "skipped")
+    error_count = sum(1 for r in all_step_results if r.status == "error")
+
     lines = [
         "# 论文评审报告",
         "",
@@ -439,16 +701,40 @@ def _generate_report(
         f"- **Pipeline**: {pipeline_name}",
         f"- **时间**: {now}",
         f"- **状态**: {'✅ 通过' if success else '❌ 有错误'}",
+        f"- **步骤统计**: {total} 步（✅ {ok_count} / ⚠️ {skipped_count} / ❌ {error_count}）",
         "",
     ]
 
-    conclusion_parts: list[str] = []
+    # ── 结论部件（按 subject 聚合）──
+    subject_summaries: dict[str, dict] = {}  # subject → {status, steps, errors}
+    for phase_name, phase_results in all_phase_results.items():
+        for subject_name, subj_results in phase_results.items():
+            if subject_name == "_batch_":
+                continue
+            if subject_name not in subject_summaries:
+                subject_summaries[subject_name] = {
+                    "phase": phase_name,
+                    "steps": [],
+                    "ok": 0,
+                    "error": 0,
+                    "skipped": 0,
+                }
+            for sr in subj_results:
+                subject_summaries[subject_name]["steps"].append(sr)
+                if sr.status == "ok":
+                    subject_summaries[subject_name]["ok"] += 1
+                elif sr.status == "error":
+                    subject_summaries[subject_name]["error"] += 1
+                else:
+                    subject_summaries[subject_name]["skipped"] += 1
 
+    # ── 按阶段输出详情 ──
     for phase_name, phase_results in all_phase_results.items():
         lines.append(f"## {phase_name.upper()} 阶段")
         lines.append("")
         for subject_name, subj_results in phase_results.items():
-            if subject_name != "_batch_":
+            is_batch = subject_name == "_batch_"
+            if not is_batch:
                 lines.append(f"### {subject_name}")
                 lines.append("")
             for sr in subj_results:
@@ -456,14 +742,13 @@ def _generate_report(
                 lines.append(f"- {status_icon} **{sr.step_name}**: {sr.status}")
                 if sr.error:
                     lines.append(f"  - 错误: {sr.error}")
-                raw = sr.data.get("raw_output", "")
-                if raw and isinstance(raw, str) and len(raw) > 10:
-                    lines.append("")
-                    lines.append(raw)
-                    lines.append("")
-                    conclusion_parts.append(raw.strip())
-                elif sr.data and any(v for v in sr.data.values() if v):
-                    lines.append(f"  - 数据: {json.dumps(sr.data, ensure_ascii=False, indent=4)}")
+                if sr.data and any(v for v in sr.data.values() if v):
+                    # 跳过 raw_output 避免报告臃肿（可到 intermediates 目录查看原文）
+                    slim_data = {k: v for k, v in sr.data.items() if k != "raw_output" and v}
+                    if slim_data:
+                        lines.append(
+                            f"  - 数据: {json.dumps(slim_data, ensure_ascii=False, indent=4)}"
+                        )
             lines.append("")
 
     lines.append("---")
@@ -474,10 +759,42 @@ def _generate_report(
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
-    conclusion = "\n".join(conclusion_parts).strip()
-    if len(conclusion) > 500:
-        conclusion = conclusion[:500] + "..."
-    return conclusion
+    # ── CLI 结论：简洁的 per-subject 汇总 ──
+    conclusion_lines = []
+    subject_count = 0
+    for subject_name, info in subject_summaries.items():
+        subject_count += 1
+        icon = "✅" if info["error"] == 0 else "❌"
+        parts = [f"  {icon} {subject_name}"]
+        detail_parts = []
+        if info["ok"]:
+            detail_parts.append(f"{info['ok']} ok")
+        if info["skipped"]:
+            detail_parts.append(f"{info['skipped']} skipped")
+        if info["error"]:
+            detail_parts.append(f"{info['error']} error")
+        if detail_parts:
+            parts.append(f"（{', '.join(detail_parts)}）")
+        conclusion_lines.append("".join(parts))
+
+    # 批量阶段
+    for phase_name, phase_results in all_phase_results.items():
+        if "_batch_" in phase_results:
+            batch = phase_results["_batch_"]
+            batch_ok = sum(1 for r in batch if r.status == "ok")
+            batch_err = sum(1 for r in batch if r.status == "error")
+            status_icon = "✅" if batch_err == 0 else "❌"
+            conclusion_lines.insert(
+                0, f"{phase_name.upper()}: {status_icon} {batch_ok}/{len(batch)} 步通过"
+            )
+
+    summary = f"共 {len(all_step_results)} 步（✅ {ok_count} / ❌ {error_count}）"
+    if subject_count:
+        summary += f"，{subject_count} 篇论文"
+    conclusion_lines.insert(0, summary)
+    conclusion_lines.append(f"\n完整报告: {report_path}")
+
+    return "\n".join(conclusion_lines)
 
 
 # ============================================================================
@@ -592,13 +909,16 @@ def run_pipeline(
 
     if not active_phases:
         logger.warning("No active phases — nothing to run")
-        conclusion = _generate_report(
+        _generate_report(
             task_dir / "report.md",
             task_id,
             config.name,
             all_phase_results,
             all_step_results,
             overall_success,
+        )
+        conclusion = _build_cli_tree(
+            task_id, config.name, config, all_phase_results, pipeline_dir, task_dir
         )
         return PipelineResult(
             subject="",
@@ -661,6 +981,8 @@ def run_pipeline(
     pp.start()
 
     # ── 阶段遍历 ──
+    # 估算阶段超时：从 phase.step_timeout 或动态计算
+
     for phase in active_phases:
         phase_dir = pipeline_dir / phase.directory
         steps = discover_steps(phase_dir)
@@ -669,8 +991,29 @@ def run_pipeline(
         if not steps:
             continue
 
+        # 决定该阶段每 step 的超时
+        phase_timeout = phase.step_timeout
+        if phase_timeout == 0:
+            # 动态估算：统计 .md 步骤的文本负载
+            md_steps = [s for s in steps if s.step_type == "md"]
+            if md_steps:
+                # batch 模式处理全部 subject，per_subject 模式每步仅一个 subject
+                estimated_chars = len(subjects) * 5000 if phase.mode == "batch" else 5000
+                phase_timeout = estimate_step_timeout(
+                    step_type="md",
+                    total_chars=estimated_chars,
+                    subject_count=len(subjects),
+                )
+            else:
+                phase_timeout = estimate_step_timeout(step_type="py")
+
         if phase.mode == "batch":
-            logger.info("Phase [%s] batch — %d step(s)", phase.name, len(steps))
+            logger.info(
+                "Phase [%s] batch — %d step(s) (timeout=%ds/step)",
+                phase.name,
+                len(steps),
+                phase_timeout,
+            )
             phase_results = _execute_batch(
                 phase=phase,
                 steps=steps,
@@ -678,6 +1021,7 @@ def run_pipeline(
                 base_env=base_env,
                 executor=_make_executor(py_runner, md_executor),
                 pp=pp,
+                step_timeout=phase_timeout,
             )
             # manifest_step 验证
             if phase.manifest_step:
@@ -705,10 +1049,11 @@ def run_pipeline(
 
         elif phase.mode == "per_subject":
             logger.info(
-                "Phase [%s] per_subject — %d step(s), %d subject(s)",
+                "Phase [%s] per_subject — %d step(s), %d subject(s) (timeout=%ds/step)",
                 phase.name,
                 len(steps),
                 len(subjects),
+                phase_timeout,
             )
             phase_results = _execute_per_subject(
                 phase=phase,
@@ -719,6 +1064,7 @@ def run_pipeline(
                 executor=_make_executor(py_runner, md_executor),
                 pool_progress=pool_progress,
                 pp=pp,
+                step_timeout=phase_timeout,
             )
         else:
             logger.warning("Unknown mode '%s' for phase '%s' — skipping", phase.mode, phase.name)
@@ -734,13 +1080,16 @@ def run_pipeline(
     # ── 完成 ──
     pp.finish()
 
-    conclusion = _generate_report(
+    _generate_report(
         task_dir / "report.md",
         task_id,
         config.name,
         all_phase_results,
         all_step_results,
         overall_success,
+    )
+    conclusion = _build_cli_tree(
+        task_id, config.name, config, all_phase_results, pipeline_dir, task_dir
     )
 
     task_meta = {
