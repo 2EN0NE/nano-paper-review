@@ -145,22 +145,34 @@ class PipelineProgress:
     # ── Internal: logging mute ──
 
     def _mute_console_logging(self):
-        """Suppress paper_review stderr logging during progress display.
+        """彻底静默 paper_review 的 stderr 输出——包括 logging 和直接 print。
 
-        The progress box uses ANSI cursor positioning on stderr.  Any
-        logger output to the same stream corrupts positioning.
+        进度条使用 ANSI 光标定位在 stderr 上绘制。任何其他 stderr
+        输出都会把光标推偏，导致残影。
         """
+        # 1) 提升 paper_review logger 级别
         root = logging.getLogger("paper_review")
-        # Walk all handlers; also try the root logger
-        for logger_obj in (root, logging.getLogger()):
-            for h in logger_obj.handlers[:]:
-                if isinstance(h, logging.StreamHandler) and h.stream in (sys.stderr, sys.stdout):
-                    self._saved_handler_levels.append((h, h.level))
-                    h.setLevel(logging.ERROR)
-        # Also suppress direct-print noise from third-party libs
-        logging.getLogger().handlers[:]  # ensure root handlers are captured
+        self._saved_level = root.level
+        root.setLevel(logging.WARNING)
+        # 2) 禁用 propagation 防止冒泡到 root logger
+        self._saved_propagate = root.propagate
+        root.propagate = False
+        # 3) 逐个 handler 提高到 ERROR
+        for h in root.handlers[:]:
+            self._saved_handler_levels.append((h, h.level))
+            h.setLevel(logging.ERROR)
+        # 4) 也管 root logger 以防万一
+        root_logger = logging.getLogger()
+        for h in root_logger.handlers[:]:
+            key = (h, h.level)
+            if key not in self._saved_handler_levels:
+                self._saved_handler_levels.append(key)
+            h.setLevel(logging.ERROR)
 
     def _restore_console_logging(self):
+        root = logging.getLogger("paper_review")
+        root.setLevel(self._saved_level)
+        root.propagate = self._saved_propagate
         for h, lvl in self._saved_handler_levels:
             h.setLevel(lvl)
         self._saved_handler_levels.clear()
@@ -241,7 +253,7 @@ class PipelineProgress:
             sys.stderr.write(f"\033[{self._line_count}A")
 
         for line in lines:
-            sys.stderr.write(line + "\033[K\n")  # \033[K clears to end of line
+            sys.stderr.write(line + "\033[2K\n")  # \033[2K clears entire line (not just from cursor)
         sys.stderr.flush()
         self._line_count = len(lines)
 
