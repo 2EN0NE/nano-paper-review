@@ -196,7 +196,7 @@ class TestAgentPrefixBuilding:
 
 class TestMdStepExecution:
     def test_md_step_calls_pi_subprocess(self, tmp_path):
-        """.md 步骤调用 subprocess.run(["pi", "-m", ...])。"""
+        """.md 步骤调用 subprocess.Popen(["pi", "--no-session", ...])。"""
         output_dir = tmp_path / "output"
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
@@ -213,28 +213,34 @@ class TestMdStepExecution:
             "open(os.path.join(d,'output.json'),'w'))"
         )
 
-        with patch("paper_review.pipeline_steps.subprocess.run") as mock_subprocess:
-            mock_subprocess.return_value = MagicMock(
-                returncode=0,
-                stdout='{"step":"02-novelty","status":"ok","data":{"score":0.85}}',
+        with patch("paper_review.pipeline_steps.subprocess.Popen") as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.communicate.return_value = (
+                '{"step":"02-novelty","status":"ok","data":{"score":0.85}}',
+                "",
             )
+            mock_proc.returncode = 0
+            mock_proc.args = ["pi", "--no-session", "-p", "@dummy"]
+            mock_popen.return_value = mock_proc
 
             result = run_pipeline(
                 pipeline_yaml={
                     "name": "t2-test",
                     "output_dir": str(output_dir),
-                    "phases": [{"name": "review", "mode": "per_subject", "directory": str(steps_dir.absolute())}],
+                    "phases": [
+                        {
+                            "name": "review",
+                            "mode": "per_subject",
+                            "directory": str(steps_dir.absolute()),
+                        }
+                    ],
                 },
                 input_path=tmp_path / "subject-01.pdf",
             )
 
         # 验证 pi 调用
-        assert mock_subprocess.called
-        args, kwargs = mock_subprocess.call_args
-        cmd = args[0]
-        # 最后一次调用应该是 .md 步骤
-        # 检查 pi 是否在任意次调用中
-        pi_calls = [a for a, _ in mock_subprocess.call_args_list if "pi" in a[0]]
+        assert mock_popen.called
+        pi_calls = [c for c in mock_popen.call_args_list if "pi" in c[0][0][0]]
 
         # 输出路径
         md_step_dir = result.task_dir / "intermediates" / "subject-01" / "02-novelty"
@@ -254,21 +260,33 @@ class TestMdStepExecution:
         md_content = "论文名称: {subject.name}"
         (steps_dir / "01-review.md").write_text(md_content)
 
-        with patch("paper_review.pipeline_steps.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout='{"step":"01-review","status":"ok","data":{}}'
+        with patch("paper_review.pipeline_steps.subprocess.Popen") as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.communicate.return_value = (
+                '{"step":"01-review","status":"ok","data":{}}',
+                "",
             )
+            mock_proc.returncode = 0
+            mock_proc.args = ["pi", "--no-session", "-p", "@dummy"]
+            mock_popen.return_value = mock_proc
+
             run_pipeline(
                 pipeline_yaml={
                     "name": "t2",
                     "output_dir": str(output_dir),
-                    "phases": [{"name": "review", "mode": "per_subject", "directory": str(steps_dir.absolute())}],
+                    "phases": [
+                        {
+                            "name": "review",
+                            "mode": "per_subject",
+                            "directory": str(steps_dir.absolute()),
+                        }
+                    ],
                 },
                 input_path=tmp_path / "subject-01.pdf",
             )
 
         # 检查传递给 pi 的 prompt 中包含已替换的变量
-        args, kwargs = mock_run.call_args
+        args, kwargs = mock_popen.call_args
         cmd = args[0]
         if "pi" in cmd[0]:
             # 检查 -p 参数后面的 @file 路径中是否包含已替换的内容

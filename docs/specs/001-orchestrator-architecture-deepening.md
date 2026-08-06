@@ -117,8 +117,14 @@ A `Protocol` class defines the seam:
 
 ```python
 class StepExecutor(Protocol):
-    def execute(self, step: StepFile, step_dir: Path, env: dict,
-                prior_results: list[StepResult], subject_name: str) -> StepResult: ...
+    def execute(
+        self,
+        step: StepFile,
+        step_dir: Path,
+        env: dict,
+        prior_results: list[StepResult],
+        subject_name: str,
+    ) -> StepResult: ...
 ```
 
 Three implementations:

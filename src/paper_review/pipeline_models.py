@@ -106,20 +106,43 @@ class PoolProgress:
 
 
 @dataclass
+class IndexConfig:
+    """Auto-Index 配置——pipeline.yaml 的 index 段。
+
+    Attributes:
+        store_dir: 搜索引擎数据目录（SQLite + FAISS），留空 → {data_dir}/index/。
+        reference_dir: 参考论文 PDF 归档目录，留空 → {data_dir}/origin/pdf/。
+        auto_index: 首次运行时自动对 reference_dir 做批量索引。
+        copy_subjects: 将 review 的 subjects PDF 复制到 reference_dir。
+    """
+
+    store_dir: Path | None = None
+    reference_dir: Path | None = None
+    auto_index: bool = True
+    copy_subjects: bool = True
+
+
+@dataclass
 class PoolConfig:
     """Worker 池化配置——Review Phase 中多 Subject 并行处理。
 
     Attributes:
-        workers: 最大并发 Worker 数。
+        workers: 初始并发 Worker 数（fixed 模式的固定值，dynamic 模式的起始值）。
                  设为 0 自动根据 CPU 核数推导（上限 64）。
                  设为 1 退化为顺序执行。
         timeout: 单个 Subject 超时秒数（0 = 无超时）。
         ordered: 是否按 Subject 原始顺序返回结果（默认 True）。
+        profile: 并发策略。'fixed' 固定 workers 数，'dynamic' 根据 API 限流/错误自适应调整。
+        workers_min: dynamic 模式下的最小 worker 数（默认 1）。
+        workers_max: dynamic 模式下的最大 worker 数（默认取 workers 值，上限 64）。
     """
 
     workers: int = 5
     timeout: int = 0
     ordered: bool = True
+    profile: str = "fixed"  # 'fixed' | 'dynamic'
+    workers_min: int = 1
+    workers_max: int = 0  # 0 = 和 workers 相同
 
     def __post_init__(self):
         # 自动推导：workers=0 时根据 CPU 核数
@@ -142,6 +165,14 @@ class PoolConfig:
                 _POOL_WORKERS_MAX,
             )
             self.workers = _POOL_WORKERS_MAX
+
+        # workers_max 默认和 workers 相同
+        if self.workers_max < 1:
+            self.workers_max = self.workers
+
+        # 约束 workers_min / workers_max
+        self.workers_min = max(1, self.workers_min)
+        self.workers_max = max(self.workers_min, min(self.workers_max, _POOL_WORKERS_MAX))
 
 
 @dataclass
@@ -235,6 +266,9 @@ def _parse_phase(data: dict) -> PhaseConfig:
                 workers=pool_data.get("workers", 5),
                 timeout=pool_data.get("timeout", 0),
                 ordered=pool_data.get("ordered", True),
+                profile=pool_data.get("profile", "fixed"),
+                workers_min=pool_data.get("workers_min", 1),
+                workers_max=pool_data.get("workers_max", 0),
             )
             if pool_data
             else None

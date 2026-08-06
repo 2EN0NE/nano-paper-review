@@ -97,11 +97,12 @@ src/paper_review/
 ├── config.py           # Pydantic 配置加载
 └── cli.py              # paper-review CLI（Typer）
 
-pipeline/
-├── pipeline.yaml       # 管线编排定义
-├── pre-review/         # .py / .md 批量执行
-├── review-pipeline/    # .py / .md 逐篇 Agent 步骤
-└── post-review/        # .py / .md 批量执行
+src/paper_review/templates/   # Scaffold Template —— init 生成脚本的唯一权威内容源
+├── config.yaml           # 默认 config.yaml
+├── pipeline.yaml         # 默认管线编排定义
+├── pre-review/           # .py 批量执行
+├── review-pipeline/      # .py / .md 逐篇 Agent 步骤
+└── post-review/          # .py 批量执行
 ```
 
 测试 mirrors src —— `tests/test_store.py`、`tests/test_orchestrator.py` 等。

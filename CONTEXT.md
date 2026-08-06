@@ -12,6 +12,28 @@ _Avoid_: Paper under review, target, current paper
 从历史池中检索出来，与 Subject 对比打分的已索引论文。
 _Avoid_: Baseline, historical paper, comparison target
 
+### 索引子系统
+
+**Reference Index**:
+历史论文的全文检索引擎（SQLite FTS5 BM25 + FAISS 向量索引 + Cross-Encoder 精排）。Review Phase 的 01-search 步骤依赖此索引检索与 Subject 相似的 Reference。
+_Avoid_: Search index, knowledge base, paper database
+
+**Origin Directory**:
+原始 PDF 文件的存放目录。位于 `{data_dir}/origin/pdf/`，用作参考论文的持久化归档。由 `pipeline.yaml` 的 `index.reference_dir` 字段指向。
+_Avoid_: pdfs/, pdf directory, source folder
+
+**Auto-Index**:
+Review 管线 Pre Phase 中自动建立索引的机制。由 `01-auto-index.py` 步骤实现：(a) 首次运行时对 Origin Directory 全部 PDF 做一次性批量索引，(b) 每次运行对当前 Subjects 自动索引，带 SHA-256 内容去重。通过 `pipeline.yaml` 的 `index` 配置段控制开关。
+_Avoid_: Automatic indexing, lazy index, on-demand index
+
+**Index Sentinel**:
+标记"首次批量索引已执行"的哨兵文件。位于 `{data_dir}/.auto-index-done`。不存在时触发一次性全量索引 Origin Directory；删除后下次 review 会重新执行。
+_Avoid_: Lock file, flag file, first-run marker
+
+**Subject Copy**:
+将 review 的 Subject PDF 复制到 Origin Directory 的行为。默认开启（`index.copy_subjects: true`），使审过的论文成为后续 review 的潜在 Reference。复制时检测同名冲突：同 SHA-256 跳过，不同则重命名为 `{stem}_{YYYYMMDD_HHmmss}_{hash[:8]}.pdf`。
+_Avoid_: PDF import, paper archive, file mirroring
+
 **Review Pipeline**:
 从 Subject 输入到评审报告输出的端到端流程，由 Pre Phase → Review Phase → Post Phase 三个顺序阶段组成。
 _Avoid_: Review workflow, orchestrator, pipeline definition
@@ -26,8 +48,8 @@ _Avoid_: Review session, review job
 _Avoid_: Stage
 
 **Pre Phase**:
-格式归一化阶段。对输入目录批量处理：doc/docx → PDF（外部脚本），可选调用 paper-review index 命令将 PDF 建索引到 pending pool。
-输出：处理结果目录、成功/失败条目、下一阶段所需元数据。
+格式归一化与索引建立阶段。对输入目录批量处理：doc/docx → PDF（00-convert），随后自动建立 Reference Index（01-auto-index：首次批量索引历史参考文章 + 索引当前 Subjects）。
+输出：subject-manifest.json、索引状态（新增/去重跳过/冲突重命名）。
 
 **Review Phase**:
 核心单篇评审阶段。对每个 Subject 顺序执行一组 Step。所有 Step 共享 Subject 的同一份提取全文（原文约 5000 字，无需裁剪）。
@@ -108,8 +130,12 @@ _Avoid_: Pipeline runner, executor, engine
 所有 intermediates、reports、日志均在此目录下按 task_id 组织。
 
 **Pipelines Directory**:
-管线定义文件的存放目录。位于 `{data_dir}/pipelines/{name}/`，每个管线一个子目录，内含 `pipeline.yaml` 和 Phase 子目录（`pre-review/`、`review-pipeline/`、`post-review/`）。
+管线定义文件的存放目录。位于 `{data_dir}/pipelines/{name}/`，每个管线一个子目录，内含 `pipeline.yaml` 和 Phase 子目录（`pre-review/`、`review-pipeline/`、`post-review/`）。由 Scaffold Template 生成，生成后用户可自由编辑，不再与源同步。
 _Avoid_: Pipeline home, pipeline store
+
+**Scaffold Template**:
+`init` 生成 Pipelines Directory 时使用的默认内容源，即包内 `src/paper_review/templates/`（唯一权威源，含 `config.yaml`、`pipeline.yaml`、全部默认 step 文件）。与 Pipelines Directory 的区别：前者是包内固定不变的"默认蓝图"，后者是用户实例化到 data_dir 后的可编辑副本；`init` 不带 `--reset` 时只补缺失文件，`--reset` 用 Scaffold Template 全量覆盖已存在文件（会先列出受影响文件并要求确认，已存在的文件会自动备份为 `<文件名>.bak-<时间戳>`）。
+_Avoid_: Template source, default pipeline, boilerplate
 
 **Pipeline Name**:
 管线的唯一标识符，等于 `pipelines/` 下的子目录名。用于 CLI 选择和产物路径命名。

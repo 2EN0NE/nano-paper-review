@@ -32,6 +32,48 @@ def _phase(**kw):
 
 
 class TestPoolConfigValidation:
+    def test_dynamic_profile_defaults(self):
+        """profile='dynamic' 时 workers_max 默认等于 workers。"""
+        cfg = PoolConfig(workers=3, profile="dynamic")
+        assert cfg.profile == "dynamic"
+        assert cfg.workers_max == 3
+        assert cfg.workers_min == 1
+
+    def test_dynamic_profile_min_clamped(self):
+        """workers_min < 1 被 clamp 到 1。"""
+        cfg = PoolConfig(workers=3, profile="dynamic", workers_min=0)
+        assert cfg.workers_min == 1
+
+    def test_dynamic_profile_max_clamped_to_64(self):
+        """workers_max > 64 被 clamp 到 64。"""
+        cfg = PoolConfig(workers=5, profile="dynamic", workers_max=100)
+        assert cfg.workers_max == 64
+
+    def test_dynamic_profile_parsed_from_yaml(self):
+        """profile/workers_min/workers_max 从 pipeline yaml 正确解析。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "dynamic",
+                "output_dir": "./out",
+                "phases": [
+                    _phase(
+                        directory="steps/",
+                        pool={
+                            "workers": 3,
+                            "profile": "dynamic",
+                            "workers_min": 1,
+                            "workers_max": 8,
+                        },
+                    )
+                ],
+            }
+        )
+        pool = cfg.phases[0].pool
+        assert pool is not None
+        assert pool.profile == "dynamic"
+        assert pool.workers_min == 1
+        assert pool.workers_max == 8
+
     def test_default_pool_config(self):
         """默认 PoolConfig 使用合理值。"""
         cfg = PoolConfig()

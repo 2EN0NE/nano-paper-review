@@ -34,7 +34,7 @@ where = ["src"]
 target-version = "py310"
 line-length = 100
 src = ["src", "tests"]
-exclude = ["prototype/", "scripts/", "pipeline/"]
+exclude = ["prototype/", "scripts/"]
 
 [tool.ruff.format]
 quote-style = "double"

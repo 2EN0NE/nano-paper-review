@@ -8,8 +8,6 @@ Orchestrator —— 评审流水线执行引擎
 Step 执行 → pipeline_steps.py
 Subject 发现 → subject_discovery.py
 """
-from __future__ import annotations
-
 
 from __future__ import annotations
 
@@ -17,8 +15,10 @@ import json
 import os
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from pathlib import Path
 
+from paper_review.dynamic_pool import DynamicPool, _is_productive_timeout, _is_rate_or_server_error
 from paper_review.logging_config import get_logger
 from paper_review.pipeline_models import (
     PhaseConfig,
@@ -267,8 +267,12 @@ def _run_steps_for_subject(
     executor: StepExecutor,
     pp: PipelineProgress | None = None,
     step_timeout: int = 0,
+    dyn_pool: DynamicPool | None = None,
 ) -> list[StepResult]:
-    """对单个 Subject 执行全部 Step（顺序）。"""
+    """对单个 Subject 执行全部 Step（顺序）。
+
+    dyn_pool 不为 None 时，每个 step 完成后向 DynamicPool 报告观测结果。
+    """
     subject_results: list[StepResult] = []
     result_base = base_env.get("PIPELINE_RESULT_DIR", str(output_dir))
     t0 = time.monotonic()
@@ -278,27 +282,49 @@ def _run_steps_for_subject(
     )
 
     for step in steps:
-        step_dir = Path(result_base) / "intermediates" / subject / step.stem
-        env = {
-            **base_env,
-            "PIPELINE_PHASE": phase.name,
-            "PIPELINE_SUBJECT": subject,
-            "PIPELINE_STEP_NAME": step.stem,
-            "PIPELINE_INTERMEDIATES": str(Path(result_base) / "intermediates"),
-            "PIPELINE_DUPLICATE_POLICY": phase.duplicate_policy,
-        }
+        # 动态池：用 with 保护槽位生命周期，异常时自动释放
+        slot_cm = dyn_pool.worker_slot() if dyn_pool else nullcontext()
 
-        result = _retry_step(
-            step=step,
-            step_dir=step_dir,
-            env=env,
-            prior_results=subject_results,
-            subject_name=subject,
-            retry_cfg=phase.retry,
-            executor=executor,
-            step_timeout=step_timeout,
-        )
-        subject_results.append(result)
+        # 动态池超时乘数：productive timeout 后自动上调后续 step 的时限
+        adjusted_timeout = step_timeout
+        if dyn_pool is not None and dyn_pool.timeout_multiplier > 1.0:
+            adjusted_timeout = int(step_timeout * dyn_pool.timeout_multiplier)
+
+        with slot_cm:
+            step_dir = Path(result_base) / "intermediates" / subject / step.stem
+            env = {
+                **base_env,
+                "PIPELINE_PHASE": phase.name,
+                "PIPELINE_SUBJECT": subject,
+                "PIPELINE_STEP_NAME": step.stem,
+                "PIPELINE_INTERMEDIATES": str(Path(result_base) / "intermediates"),
+                "PIPELINE_DUPLICATE_POLICY": phase.duplicate_policy,
+            }
+
+            result = _retry_step(
+                step=step,
+                step_dir=step_dir,
+                env=env,
+                prior_results=subject_results,
+                subject_name=subject,
+                retry_cfg=phase.retry,
+                executor=executor,
+                step_timeout=adjusted_timeout,
+            )
+            subject_results.append(result)
+
+        # 槽位已释放，安全上报观测
+        if dyn_pool is not None:
+            is_429_503 = _is_rate_or_server_error(result.error)
+            is_prod_timeout = _is_productive_timeout(result.error)
+            is_success = result.status in ("ok", "skipped")
+            dyn_pool.observe(is_429_503, is_prod_timeout, is_success)
+            if pp:
+                pp.update_dynamic_workers(
+                    active=dyn_pool.active_workers,
+                    current=dyn_pool.current_workers,
+                    timeout_multiplier=dyn_pool.timeout_multiplier,
+                )
 
         if pp:
             pp.review_step_done(subject)
@@ -341,16 +367,40 @@ def _execute_per_subject_pooled(
     pp: PipelineProgress | None = None,
     step_timeout: int = 0,
 ) -> dict[str, list[StepResult]]:
-    """Worker 池并发处理多个 Subject。"""
-    actual_workers = min(pool_cfg.workers, len(subjects))
+    """Worker 池并发处理多个 Subject。
+
+    profile='dynamic' 时启用基于贝叶斯估计的自适应并发控制。
+    """
+    is_dynamic = pool_cfg.profile == "dynamic"
+
+    # dynamic 模式：线程池用 workers_max，DynamicPool 控制实际并发
+    if is_dynamic:
+        actual_workers = pool_cfg.workers_max
+        total_steps = len(subjects) * len(steps)
+        dyn_pool = DynamicPool(pool_cfg, total_steps)
+    else:
+        actual_workers = min(pool_cfg.workers, len(subjects))
+        dyn_pool = None
+
     per_subject_timeout = pool_cfg.timeout if pool_cfg.timeout > 0 else None
 
-    logger.info(
-        "Pool mode: %d worker(s) processing %d subject(s) (step_timeout=%ds)",
-        actual_workers,
-        len(subjects),
-        step_timeout,
-    )
+    if is_dynamic:
+        logger.info(
+            "Pool mode: dynamic (initial=%d, min=%d, max=%d), %d subject(s), %d step(s)/subject (step_timeout=%ds)",
+            pool_cfg.workers,
+            pool_cfg.workers_min,
+            pool_cfg.workers_max,
+            len(subjects),
+            len(steps),
+            step_timeout,
+        )
+    else:
+        logger.info(
+            "Pool mode: %d worker(s) processing %d subject(s) (step_timeout=%ds)",
+            actual_workers,
+            len(subjects),
+            step_timeout,
+        )
 
     all_results: dict[str, list[StepResult]] = {}
     errors: list[str] = []
@@ -371,6 +421,7 @@ def _execute_per_subject_pooled(
                 executor,
                 pp,
                 step_timeout,
+                dyn_pool,
             )
             future_map[fut] = s
             start_times[s] = time.monotonic()
@@ -895,6 +946,35 @@ def run_pipeline(
         "PIPELINE_RESULT_DIR": str(task_dir),
         "PIPELINE_INPUT_PATH": str(input_path.absolute()),
     }
+
+    # ── Index 配置注入 step 环境变量 ──
+    from paper_review.auto_index import resolve_index_config
+
+    raw_yaml: dict | None = None
+    if isinstance(pipeline_yaml, (str, Path)):
+        yaml_path = Path(pipeline_yaml)
+        if yaml_path.is_dir():
+            yaml_file = yaml_path / "pipeline.yaml"
+        elif yaml_path.suffix in (".yaml", ".yml"):
+            yaml_file = yaml_path
+        else:
+            yaml_file = None
+        if yaml_file and yaml_file.exists():
+            import yaml as _yaml
+
+            raw_yaml = _yaml.safe_load(yaml_file.read_text())
+    elif isinstance(pipeline_yaml, dict):
+        raw_yaml = pipeline_yaml
+
+    idx_cfg = resolve_index_config(raw_yaml, Path(resolved_data_dir))
+    base_env.update(
+        {
+            "PIPELINE_INDEX_STORE_DIR": str(idx_cfg.store_dir),
+            "PIPELINE_INDEX_REFERENCE_DIR": str(idx_cfg.reference_dir),
+            "PIPELINE_INDEX_AUTO_INDEX": "1" if idx_cfg.auto_index else "0",
+            "PIPELINE_INDEX_COPY_SUBJECTS": "1" if idx_cfg.copy_subjects else "0",
+        }
+    )
 
     # ── 生效的阶段 ──
     active_phases = (

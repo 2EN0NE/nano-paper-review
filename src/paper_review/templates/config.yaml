@@ -6,7 +6,8 @@
 # data_dir 优先由 CLI --data-dir 指定，或自动使用 ./.paper-review/ / ~/.paper-review/
 # 以下路径留空则从 data_dir 自动推导
 index_dir: "" # 索引目录（默认: {data_dir}/index）
-pdf_dir: "" # PDF 源文件目录（默认: {data_dir}/pdfs）
+pdf_dir: "" # PDF 源文件目录（默认: {data_dir}/origin/pdf/）
+# 注：参考论文归档目录的权威配置在 pipelines/{name}/pipeline.yaml 的 index.reference_dir 字段
 
 # ── 分块参数 ──
 chunk_size: 512 # 每个 Chunk 的字符数
@@ -30,6 +31,8 @@ embedding_model: "BAAI/bge-small-zh-v1.5"
 reranker_model: "BAAI/bge-reranker-v2-m3"
 vector_dim: 512
 
-# ── Worker 池 ──
-pool_workers: 5 # 并发 Worker 数（0=自动，1=顺序执行）
-pool_timeout: 0 # 单 Subject 超时秒数（0=无超时）
+# ── Worker 池全局默认值 ──
+# 管线级别的并发配置（profile / workers_min / workers_max / timeout）在
+# pipelines/{name}/pipeline.yaml 的 review.pool 段设置，会覆盖此处的全局默认值
+pool_workers: 5 # 默认并发 Worker 数（0=自动，1=顺序执行）
+pool_timeout: 0 # 默认单 Subject 超时秒数（0=无超时）

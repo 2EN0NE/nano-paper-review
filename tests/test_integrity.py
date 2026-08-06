@@ -9,8 +9,8 @@ import hashlib
 import pytest
 
 from helpers import make_fake_content, make_mock_chunk_vecs, make_paper
-from paper_review.search.chunker import chunk_paper
 from paper_review.config import Config
+from paper_review.search.chunker import chunk_paper
 from paper_review.search.store import Paper, PaperMeta, Store
 
 pytestmark = pytest.mark.integration

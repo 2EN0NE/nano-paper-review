@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import runpy
 import subprocess
 import threading
@@ -207,6 +208,51 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
+def _classify_stderr_error(stderr_clean: str, step_timeout: int) -> str:
+    """根据 pi stderr 内容识别具体错误类型，返回更精确的错误描述。
+
+    返回的错误消息中会包含 429/503 状态码，供 DynamicPool 识别。
+    """
+    if not stderr_clean:
+        return f"Agent step timed out ({step_timeout}s) — no output from pi"
+
+    # API 认证不可用（视为 503）
+    if "auth_unavailable" in stderr_clean or "no auth available" in stderr_clean:
+        provider_info = ""
+
+        m = re.search(r"providers=([^,)]+)", stderr_clean)
+        if m:
+            provider_info = f" (provider: {m.group(1)})"
+        return f"API auth unavailable (503){provider_info} — check DeepSeek proxy credentials"
+
+    # 429 速率限制（优先级高于 503，因为可能同时出现）
+    if (
+        "429" in stderr_clean
+        or "rate_limit" in stderr_clean.lower()
+        or "too many requests" in stderr_clean.lower()
+    ):
+        return f"API rate limited (429){_extract_error_message(stderr_clean)}"
+
+    # 503 服务端错误
+    if "503" in stderr_clean:
+        return f"API server error (503){_extract_error_message(stderr_clean)}"
+
+    # 兜底：截取 stderr 尾部作为参考
+    stderr_tail = stderr_clean.strip()[-200:] if stderr_clean.strip() else ""
+    if stderr_tail:
+        return f"Agent step timed out ({step_timeout}s) — stderr tail: {stderr_tail}"
+    return f"Agent step timed out ({step_timeout}s)"
+
+
+def _extract_error_message(stderr_clean: str) -> str:
+    """从 stderr 中提取 JSON 错误消息。"""
+
+    m = re.search(r'"message"\s*:\s*"([^"]+)"', stderr_clean)
+    if m:
+        return f": {m.group(1)}"
+    return ""
+
+
 class AgentRunner:
     """通过 subprocess 调用 pi 执行 Agent 步骤。
 
@@ -268,20 +314,39 @@ class AgentRunner:
             prompt_size_kb,
             step_timeout,
         )
+        proc = None
         try:
-            proc = subprocess.run(  # noqa: S603 — pi_binary is user-configurable
+            proc = subprocess.Popen(  # noqa: S603 — pi_binary is user-configurable
                 [pi_binary, "--no-session", "-p", f"@{prompt_file}"],
                 env=step_env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=step_timeout,
+            )
+            stdout_data, stderr_data = proc.communicate(timeout=step_timeout)
+            # 构造兼容 subprocess.run 返回值的 CompletedProcess
+            result = subprocess.CompletedProcess(
+                args=proc.args,
+                returncode=proc.returncode,
+                stdout=stdout_data or "",
+                stderr=stderr_data or "",
             )
         except subprocess.TimeoutExpired:
-            logger.error("Agent step %s timed out (%ds)", step_stem, step_timeout)
+            if proc is not None:
+                proc.kill()
+                stdout_data, stderr_data = proc.communicate()
+            else:
+                stdout_data, stderr_data = "", ""
+
+            # 检查 stderr 中的已知错误模式，提供更精确的失败原因
+            stderr_clean = _strip_ansi(stderr_data) if stderr_data else ""
+            error_detail = _classify_stderr_error(stderr_clean, step_timeout)
+
+            logger.error("Agent step %s timed out (%ds): %s", step_stem, step_timeout, error_detail)
             return StepResult(
                 step_name=step_stem,
                 status="error",
-                error=f"Agent step timed out ({step_timeout}s)",
+                error=error_detail,
             )
         except FileNotFoundError:
             logger.warning(
@@ -304,7 +369,7 @@ class AgentRunner:
                 error=f"pi binary '{pi_binary}' not found",
             )
 
-        return self._parse_output(proc, step_stem, step_dir)
+        return self._parse_output(result, step_stem, step_dir)
 
     def _parse_output(
         self,

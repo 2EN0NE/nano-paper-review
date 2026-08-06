@@ -13,9 +13,18 @@ from unittest.mock import patch
 
 from paper_review.orchestrator import (
     PipelineConfig,
+    _execute_batch,
+    _retry_step,
     discover_steps,
     run_pipeline,
 )
+from paper_review.pipeline_models import (
+    PhaseConfig,
+    RetryConfig,
+    StepFile,
+    StepResult,
+)
+from paper_review.pipeline_steps import InMemoryExecutor
 
 # ============================================================================
 # pipeline.yaml 解析
@@ -452,6 +461,110 @@ class TestMdStepFallback:
 
 
 # ============================================================================
+# Retry + abort 策略行为测试
+# ============================================================================
+
+
+class TestRetryAbort:
+    """_retry_step 中 on_failure=abort 的行为验证。"""
+
+    def test_retry_exhausts_attempts_with_skip(self, tmp_path):
+        """on_failure=skip：重试次数用尽后返回最后的 error 结果。"""
+        executor = InMemoryExecutor(
+            {"01-test": StepResult(step_name="01-test", status="error", error="fail")}
+        )
+        step = StepFile(path=tmp_path / "01-test.py", stem="01-test", step_type="py")
+        retry_cfg = RetryConfig(max_attempts=3, on_failure="skip")
+
+        result = _retry_step(
+            step=step,
+            step_dir=tmp_path / "step",
+            env={},
+            prior_results=[],
+            subject_name="test",
+            retry_cfg=retry_cfg,
+            executor=executor,
+        )
+
+        assert result.status == "error"
+        assert result.attempt == 3
+
+    def test_abort_stops_batch_phase_on_first_error(self, tmp_path):
+        """on_failure=abort：第一步失败后 Phase 立即停止，后续 step 不执行。"""
+        # 两个 step：第一个返回 error，第二个不应被调用
+        call_log = []
+
+        results_map = {
+            "01-bad": StepResult(step_name="01-bad", status="error", error="fail"),
+            "02-good": StepResult(step_name="02-good", status="ok"),
+        }
+
+        class LoggingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                call_log.append(step.stem)
+                return results_map[step.stem]
+
+        steps = [
+            StepFile(path=tmp_path / "01-bad.py", stem="01-bad", step_type="py"),
+            StepFile(path=tmp_path / "02-good.py", stem="02-good", step_type="py"),
+        ]
+
+        phase = PhaseConfig(
+            name="pre",
+            mode="batch",
+            directory="dummy",
+            retry=RetryConfig(max_attempts=1, on_failure="abort"),
+        )
+
+        results = _execute_batch(
+            phase=phase,
+            steps=steps,
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=LoggingExecutor(),
+        )
+
+        # 第二个 step 从未被调用
+        assert call_log == ["01-bad"]
+        batch_results = results["_batch_"]
+        assert len(batch_results) == 1
+        assert batch_results[0].step_name == "01-bad"
+        assert batch_results[0].status == "error"
+
+    def test_retry_success_after_failures(self, tmp_path):
+        """重试：前几次失败，最后一次成功 → 返回 ok + attempt 计数正确。"""
+        call_count = [0]
+
+        class FlakyThenOkExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                call_count[0] += 1
+                if call_count[0] < 3:
+                    return StepResult(
+                        step_name=step.stem,
+                        status="error",
+                        error=f"attempt {call_count[0]} fail",
+                    )
+                return StepResult(step_name=step.stem, status="ok", data={"done": True})
+
+        step = StepFile(path=tmp_path / "01-test.py", stem="01-test", step_type="py")
+        retry_cfg = RetryConfig(max_attempts=3, on_failure="skip")
+
+        result = _retry_step(
+            step=step,
+            step_dir=tmp_path / "step",
+            env={},
+            prior_results=[],
+            subject_name="test",
+            retry_cfg=retry_cfg,
+            executor=FlakyThenOkExecutor(),
+        )
+
+        assert result.status == "ok"
+        assert result.attempt == 3
+        assert result.data == {"done": True}
+
+
+# ============================================================================
 # Pool 模式测试
 # ============================================================================
 
@@ -669,6 +782,178 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
             f"Expected all steps done, got {step_count}"
         )
         assert len(all_results) == 2
+
+
+# ============================================================================
+# Dynamic Profile — profile=dynamic 池化路径
+# ============================================================================
+
+
+class TestDynamicProfile:
+    """profile=dynamic 时 DynamicPool 集成路径验证。"""
+
+    def test_dynamic_profile_completes_all_subjects(self, tmp_path):
+        """dynamic 模式下多 Subject 完整跑通，产物齐全。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        (steps_dir / "01-test.py").write_text(
+            "import json, os;"
+            'd=os.environ["PIPELINE_STEP_DIR"];'
+            "os.makedirs(d, exist_ok=True);"
+            'json.dump({"step":"01-test","status":"ok","error":None,"data":{}},'
+            'open(os.path.join(d,"output.json"),"w"))'
+        )
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        for name in ["alpha", "beta", "gamma"]:
+            (pdf_dir / f"{name}.pdf").write_text("dummy")
+
+        result = run_pipeline(
+            pipeline_yaml={
+                "name": "dyn-test",
+                "output_dir": str(output_dir),
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                        "pool": {
+                            "workers": 3,
+                            "profile": "dynamic",
+                            "workers_min": 1,
+                            "workers_max": 4,
+                            "ordered": True,
+                        },
+                    }
+                ],
+            },
+            input_path=pdf_dir,
+        )
+
+        assert result.success
+        assert len(result.step_results) == 3
+        for subj in ["alpha", "beta", "gamma"]:
+            out_file = result.task_dir / "intermediates" / subj / "01-test" / "output.json"
+            assert out_file.exists(), f"Missing {out_file}"
+
+    def test_dynamic_profile_429_triggers_downgrade(self, tmp_path, caplog):
+        """dynamic 模式下 429 错误驱动降级（通过 DynamicPool 日志验证）。"""
+        import logging
+
+        from paper_review.orchestrator import _execute_per_subject_pooled
+        from paper_review.pipeline_models import (
+            PhaseConfig,
+            PoolConfig,
+            RetryConfig,
+            StepFile,
+            StepResult,
+        )
+
+        class RateLimitedExecutor:
+            """所有 step 返回 429 错误（通过 StepExecutor seam 注入）。"""
+
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                return StepResult(
+                    step_name=step.stem,
+                    status="error",
+                    error="API rate limited (429): too many requests",
+                    subject=subject_name,
+                )
+
+        steps = [StepFile(path=Path("01-test.py"), stem="01-test", step_type="py")]
+        subjects = ["s1", "s2", "s3", "s4"]
+        pool_cfg = PoolConfig(
+            workers=3,
+            profile="dynamic",
+            workers_min=1,
+            workers_max=4,
+            ordered=False,
+        )
+        phase_config = PhaseConfig(
+            name="review",
+            mode="per_subject",
+            directory="dummy",
+            pool=pool_cfg,
+            retry=RetryConfig(max_attempts=1, on_failure="skip"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="paper_review.dynamic_pool"):
+            all_results = _execute_per_subject_pooled(
+                phase=phase_config,
+                steps=steps,
+                subjects=subjects,
+                output_dir=tmp_path / "output",
+                base_env={},
+                executor=RateLimitedExecutor(),
+                pool_cfg=pool_cfg,
+            )
+
+        # 全部 Subject 完成（全部 error），无死锁
+        assert len(all_results) == 4
+        for r_list in all_results.values():
+            assert all(r.status == "error" for r in r_list)
+
+        # 连续 429 应触发至少一次降级（workers=3 → 2 或更低）
+        downgrade_logs = [r for r in caplog.records if "DynamicPool: workers=" in r.message]
+        assert downgrade_logs, "Expected at least one DynamicPool downgrade log"
+        final_workers = int(downgrade_logs[-1].message.split("workers=")[1].split(" ")[0])
+        assert final_workers < 3
+
+    def test_dynamic_profile_success_does_not_downgrade(self, tmp_path, caplog):
+        """全成功场景不触发降级，worker 保持初始值。"""
+        import logging
+
+        from paper_review.orchestrator import _execute_per_subject_pooled
+        from paper_review.pipeline_models import (
+            PhaseConfig,
+            PoolConfig,
+            RetryConfig,
+            StepFile,
+            StepResult,
+        )
+
+        class OkExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        steps = [StepFile(path=Path("01-test.py"), stem="01-test", step_type="py")]
+        subjects = ["s1", "s2"]
+        pool_cfg = PoolConfig(
+            workers=2,
+            profile="dynamic",
+            workers_min=1,
+            workers_max=4,
+            ordered=False,
+        )
+        phase_config = PhaseConfig(
+            name="review",
+            mode="per_subject",
+            directory="dummy",
+            pool=pool_cfg,
+            retry=RetryConfig(max_attempts=1, on_failure="skip"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="paper_review.dynamic_pool"):
+            all_results = _execute_per_subject_pooled(
+                phase=phase_config,
+                steps=steps,
+                subjects=subjects,
+                output_dir=tmp_path / "output",
+                base_env={},
+                executor=OkExecutor(),
+                pool_cfg=pool_cfg,
+            )
+
+        assert all(r.status == "ok" for r_list in all_results.values() for r in r_list)
+        # 允许上浮（log10 节奏 checkpoint 触发），但绝不降级到初始值以下
+        worker_changes = [
+            int(r.message.split("workers=")[1].split(" ")[0])
+            for r in caplog.records
+            if "DynamicPool: workers=" in r.message
+        ]
+        assert all(w >= 2 for w in worker_changes)
 
 
 # ============================================================================

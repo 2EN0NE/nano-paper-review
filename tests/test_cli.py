@@ -9,11 +9,115 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import yaml
 from typer.testing import CliRunner
 
 from paper_review.cli import app
 
 runner = CliRunner()
+
+
+class TestInitCommand:
+    """paper-review init —— Scaffold Template 单一真源。"""
+
+    def test_init_generates_dynamic_pool_profile(self, tmp_path):
+        """全新 data_dir 下 init 生成的 pipeline.yaml 使用 dynamic 并发降级配置。"""
+        dd = tmp_path / "data"
+        result = runner.invoke(app, ["--data-dir", str(dd), "init"])
+        assert result.exit_code == 0
+
+        pipeline_yaml = dd / "pipelines" / "standard" / "pipeline.yaml"
+        config = yaml.safe_load(pipeline_yaml.read_text(encoding="utf-8"))
+
+        review_phase = next(p for p in config["phases"] if p["name"] == "review")
+        pool = review_phase["pool"]
+        assert pool["profile"] == "dynamic"
+        assert pool["workers_min"] == 1
+        assert pool["workers_max"] == 5
+
+    def test_init_generates_all_default_step_files(self, tmp_path):
+        """全新 data_dir 下 init 生成全部 9 个默认 step 文件。"""
+        dd = tmp_path / "data"
+        result = runner.invoke(app, ["--data-dir", str(dd), "init"])
+        assert result.exit_code == 0
+
+        pipeline_dir = dd / "pipelines" / "standard"
+        expected = {
+            "pre-review": ["00-convert.py", "01-auto-index.py"],
+            "review-pipeline": [
+                "01-search.py",
+                "02-extract-keywords.py",
+                "03-direct-scoring.md",
+                "04-indirect-scoring.md",
+                "05-summarize.py",
+            ],
+            "post-review": ["01-archive-reports.py", "02-generate-excel.py"],
+        }
+        for subdir, filenames in expected.items():
+            for filename in filenames:
+                assert (pipeline_dir / subdir / filename).is_file(), f"missing {subdir}/{filename}"
+
+    def test_init_errors_when_scaffold_template_missing(self, tmp_path):
+        """Scaffold Template 目录找不到时（安装损坏），init 报错退出，不写任何旧内容。"""
+        dd = tmp_path / "data"
+        missing = tmp_path / "does-not-exist"
+        with patch("paper_review.cli._resolve_templates_dir", return_value=missing):
+            result = runner.invoke(app, ["--data-dir", str(dd), "init"])
+
+        assert result.exit_code != 0
+        assert not (dd / "config.yaml").exists()
+        assert not (dd / "pipelines" / "standard" / "pipeline.yaml").exists()
+
+
+class TestInitResetCommand:
+    """paper-review init --reset —— 重置语义 + 确认 + 备份安全网。"""
+
+    def test_force_flag_no_longer_exists(self, tmp_path):
+        """旧的 --force/-f 不再存在，改用 --reset/-r。"""
+        dd = tmp_path / "data"
+        result = runner.invoke(app, ["--data-dir", str(dd), "init", "--force"])
+        assert result.exit_code != 0
+
+    def test_reset_without_yes_prompts_and_lists_files(self, tmp_path):
+        """已有 scaffold 时跑 --reset（无 --yes），列出覆盖清单并要求确认；输入 n 不做任何改动。"""
+        dd = tmp_path / "data"
+        runner.invoke(app, ["--data-dir", str(dd), "init"])
+        pipeline_yaml = dd / "pipelines" / "standard" / "pipeline.yaml"
+        original = pipeline_yaml.read_text(encoding="utf-8")
+
+        result = runner.invoke(app, ["--data-dir", str(dd), "init", "--reset"], input="n\n")
+
+        assert "config.yaml" in result.stdout
+        assert "pipeline.yaml" in result.stdout
+        assert pipeline_yaml.read_text(encoding="utf-8") == original
+        assert not list(dd.glob("config.yaml.bak-*"))
+
+    def test_reset_confirmed_backs_up_before_overwrite(self, tmp_path):
+        """确认重置后，每个已存在文件先备份为 <文件名>.bak-<时间戳>，内容与覆盖前一致。"""
+        dd = tmp_path / "data"
+        runner.invoke(app, ["--data-dir", str(dd), "init"])
+        config_path = dd / "config.yaml"
+        original = config_path.read_text(encoding="utf-8")
+        config_path.write_text("# 用户自定义内容\n" + original, encoding="utf-8")
+        customized = config_path.read_text(encoding="utf-8")
+
+        result = runner.invoke(app, ["--data-dir", str(dd), "init", "--reset"], input="y\n")
+        assert result.exit_code == 0
+
+        backups = list(dd.glob("config.yaml.bak-*"))
+        assert len(backups) == 1, f"expected exactly 1 backup, got {backups}"
+        assert backups[0].read_text(encoding="utf-8") == customized
+        # 重置后 config.yaml 回到 Scaffold Template 最新内容
+        assert config_path.read_text(encoding="utf-8") == original
+
+    def test_reset_with_yes_skips_confirmation(self, tmp_path):
+        """--reset --yes 跳过交互确认，无 stdin 输入也能正常完成。"""
+        dd = tmp_path / "data"
+        runner.invoke(app, ["--data-dir", str(dd), "init"])
+
+        result = runner.invoke(app, ["--data-dir", str(dd), "init", "--reset", "--yes"])
+        assert result.exit_code == 0
+        assert list(dd.glob("config.yaml.bak-*"))
 
 
 class TestHelp:
@@ -194,15 +298,16 @@ class TestIndexCommand:
     """paper-review index"""
 
     @patch("paper_review.cli.open_store")
-    def test_index_no_pdf_dir(self, mock_open_store):
-        """缺少 --pdf-dir 参数应报错。"""
+    def test_index_no_source_dir_uses_default(self, mock_open_store):
+        """无 --source-dir 时使用默认路径 origin/pdf/。"""
         result = runner.invoke(app, ["index"])
+        # 默认目录不存在 → 报错退出
         assert result.exit_code != 0
 
     @patch("paper_review.cli.open_store")
-    def test_index_nonexistent_dir(self, mock_open_store):
-        """不存在的 --pdf-dir 应报错。"""
-        result = runner.invoke(app, ["index", "--pdf-dir", "/nonexistent/path"])
+    def test_index_nonexistent_source_dir(self, mock_open_store):
+        """不存在的 --source-dir 应报错。"""
+        result = runner.invoke(app, ["index", "--source-dir", "/nonexistent/path"])
         assert result.exit_code != 0
 
 

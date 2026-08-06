@@ -13,6 +13,7 @@ CLI 入口 —— 论文检索服务的命令行接口
 
 import hashlib
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional  # noqa: F401 # needed by Typer get_type_hints()
 
@@ -68,18 +69,18 @@ paper-review 的核心是【评审管线】（Pipeline）——
 @app.callback(invoke_without_command=True)
 def _main_callback(
     ctx: typer.Context,
-    data_dir: Optional[str] = typer.Option(
+    data_dir: str | None = typer.Option(
         None,
         "--data-dir",
         help="数据目录（默认: ./.paper-review/ 存在则用，否则 ~/.paper-review/）",
         envvar="PAPER_REVIEW_DATA_DIR",
     ),
-    log_level: Optional[str] = typer.Option(
+    log_level: str | None = typer.Option(
         None,
         "--log-level",
         help="日志级别: DEBUG / INFO / WARNING / ERROR（默认 INFO）",
     ),
-    log_dir: Optional[str] = typer.Option(
+    log_dir: str | None = typer.Option(
         None,
         "--log-dir",
         help="日志输出目录（默认: {data_dir}/logs）",
@@ -102,6 +103,12 @@ def _main_callback(
         data_dir=str(dd),
     )
 
+    # 一次性目录迁移：pdfs/ → origin/pdf/
+    from paper_review.auto_index import migrate_legacy_pdfs_dir
+
+    if migrate_legacy_pdfs_dir(dd):
+        logging.getLogger("paper_review").info("Migrated: pdfs/ → origin/pdf/")
+
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
         typer.echo("\n" + "─" * 50)
@@ -119,11 +126,11 @@ def _get_data_dir(ctx: typer.Context) -> str | None:
 @app.command()
 def index(
     ctx: typer.Context,
-    pdf_dir: Path = typer.Option(
-        ...,
-        "--pdf-dir",
-        help="包含 PDF 论文的目录",
-        exists=True,
+    source_dir: str = typer.Option(
+        "",
+        "--source-dir",
+        help="包含 PDF 论文的目录（默认: {data_dir}/origin/pdf/）",
+        exists=False,
         file_okay=False,
         dir_okay=True,
     ),
@@ -137,13 +144,21 @@ def index(
     """
     从 PDF 目录批量建索引（内存友好版）。
 
-    遍历 pdf_dir 下的所有 PDF 文件，提取文本 → 分块 → 建索引。
+    遍历 source_dir 下的所有 PDF 文件，提取文本 → 分块 → 建索引。
     使用 Epoch 分批处理：每批结束后保存 FAISS 到磁盘并释放内存，
     避免大数据量 OOM。
 
     --epoch-size 控制每批论文数（越小越省内存）。
     """
-    typer.echo(f"索引目录: {pdf_dir} [pool={pool}]")
+    dd = resolve_data_dir(_get_data_dir(ctx))
+    if not source_dir:
+        source_path: Path = dd / "origin" / "pdf"
+    else:
+        source_path = Path(source_dir)
+    if not source_path.is_dir():
+        typer.echo(f"源目录不存在: {source_path}\n  请先放入 PDF 或用 --source-dir 指定目录")
+        raise typer.Exit(1)
+    typer.echo(f"索引目录: {source_path} [pool={pool}]")
 
     from paper_review.extractor import count_pages, extract_meta, extract_pdf
     from paper_review.search.indexer import build_index
@@ -161,7 +176,7 @@ def index(
 
     db_path = str(resolve_data_dir(_get_data_dir(ctx)) / "index" / "index.sqlite")
 
-    pdf_files = sorted(pdf_dir.glob("*.pdf"))
+    pdf_files = sorted(source_path.glob("*.pdf"))
     if not pdf_files:
         typer.echo("  ✗ 未找到 PDF 文件")
         raise typer.Exit(1)
@@ -263,7 +278,7 @@ def index(
 def search(
     ctx: typer.Context,
     query: str = typer.Argument(..., help="检索查询"),
-    pool_filter: Optional[str] = typer.Option(
+    pool_filter: str | None = typer.Option(
         None, "--pool", "-p", help="限定搜索池: history / pending"
     ),
     limit: int = typer.Option(5, "--limit", "-n", help="返回条数"),
@@ -359,18 +374,18 @@ def review(
         help="输入路径：单篇 PDF 或包含 PDF 的目录",
         exists=True,
     ),
-    pipeline: Optional[str] = typer.Option(
+    pipeline: str | None = typer.Option(
         None,
         "--pipeline",
         "-p",
         help="管线名称（pipelines/ 子目录名）或直接路径",
     ),
-    phase: Optional[str] = typer.Option(
+    phase: str | None = typer.Option(
         None,
         "--phase",
         help="仅运行指定阶段（匹配 phases[].name）",
     ),
-    step: Optional[str] = typer.Option(
+    step: str | None = typer.Option(
         None,
         "--step",
         "-s",
@@ -536,49 +551,6 @@ def _read_template(name: str) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
-def _get_default_pipeline_source(subdir: str = "review-pipeline") -> Path | None:
-    """找到默认管线步骤脚本的源目录。
-
-    对于 editable install（-e .），步骤文件位于项目根目录的 pipeline/ 下。
-    路径：{项目根}/pipeline/{subdir}/
-
-    subdir: 'review-pipeline' | 'pre-review' | 'post-review'
-    """
-    try:
-        import paper_review
-
-        mod_file = paper_review.__file__  # src/paper_review/__init__.py
-        repo_root = Path(mod_file).resolve().parent.parent.parent  # 项目根
-        candidate = repo_root / "pipeline" / subdir
-        if candidate.is_dir():
-            return candidate
-    except Exception:
-        logger.debug("pipeline source dir not found under project root (non-editable install)")
-    return None
-
-
-def _copy_default_pipeline_steps(target_dir: Path, force: bool) -> list[Path]:
-    """从包源码复制默认管线步骤到 target_dir。"""
-    src = _get_default_pipeline_source()
-    if src is None:
-        typer.echo("  ⚠ 未找到默认步骤源——跳过复制 (非 editable install 时需手动复制)")
-        return []
-
-    created: list[Path] = []
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    for f in sorted(src.iterdir()):
-        if not f.is_file() or f.suffix not in (".py", ".md"):
-            continue
-        dest = target_dir / f.name
-        if dest.exists() and not force:
-            continue
-        dest.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
-        created.append(dest)
-
-    return created
-
-
 def _maybe_show_first_use_hint(data_dir: Path, skip_warnings: bool = False) -> None:
     """首次执行 review 时打印重提示"""
     hint_sentinel = data_dir / ".first-use-hint-shown"
@@ -602,13 +574,18 @@ def _maybe_show_first_use_hint(data_dir: Path, skip_warnings: bool = False) -> N
 def _maybe_warn_empty_index(data_dir: Path, skip_warnings: bool = False) -> None:
     """检查索引是否为空，交互式提醒。"""
     db_path = data_dir / "index" / "index.sqlite"
-    pdf_dir = str(data_dir / "pdfs")  # 实际 PDF 目录路径
     if not db_path.exists():
         if skip_warnings:
             return
-        typer.echo("\n⚠ 索引数据库不存在。确保已至少建过一次索引。")
-        typer.echo(f"  建议先运行: paper-review index --pdf-dir {pdf_dir}")
-        if not typer.confirm("  继续执行？", default=False):
+        typer.echo("\n⚠ 索引数据库尚未建立。")
+        typer.echo()
+        typer.echo("  影响：评审时将没有历史参考文章用于相似度比对，")
+        typer.echo("        01-search 步骤将返回空结果。")
+        typer.echo()
+        typer.echo("  Pre Phase 的 01-auto-index 步骤将自动建立索引。")
+        typer.echo("  也可通过 paper-review index 命令提前建立")
+        typer.echo("  （详见 paper-review index --help）。")
+        if not typer.confirm("\n  继续执行？", default=True):
             raise typer.Exit(0)
         typer.echo("")
         return
@@ -618,7 +595,6 @@ def _maybe_warn_empty_index(data_dir: Path, skip_warnings: bool = False) -> None
 
     try:
         conn = sqlite3.connect(str(db_path))
-        # 先检查 schema 是否已初始化
         table_exists = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='papers'"
         ).fetchone()
@@ -629,129 +605,36 @@ def _maybe_warn_empty_index(data_dir: Path, skip_warnings: bool = False) -> None
             count = 0
         conn.close()
     except sqlite3.Error:
-        # 数据库损坏或无法打开，按空索引处理
         typer.echo("\n⚠ 无法读取索引数据库（可能已损坏）。")
         count = 0
 
     if count == 0 and not skip_warnings:
         typer.echo("\n⚠ 索引中尚无论文。检索步骤将返回空结果。")
-        typer.echo(f"  建议先运行: paper-review index --pdf-dir {pdf_dir}")
-        typer.echo("  （通过 --skip-warnings 可跳过此警告）")
-        if not typer.confirm("  继续执行？", default=False):
+        typer.echo("  Pre Phase 的 01-auto-index 步骤将自动建立索引。")
+        typer.echo("  也可通过 paper-review index 命令提前建立")
+        typer.echo("  （详见 paper-review index --help）。")
+        if not typer.confirm("  继续执行？", default=True):
             raise typer.Exit(0)
         typer.echo("")
 
 
 # ── init 命令 ──────────────────────────────────────
 
-_DEFAULT_CONFIG_YAML = """# paper-review 配置文件
-# 搜索路径（高→低）：此文件 > cwd/config.yaml > 默认值
-# 环境变量覆盖：PAPER_REVIEW_XXX（如 PAPER_REVIEW_CHUNK_SIZE=256）
-
-# ── 目录配置 ──
-# data_dir 优先由 CLI --data-dir 指定，或自动使用 ./.paper-review/ / ~/.paper-review/
-# 以下路径留空则从 data_dir 自动推导
-index_dir: ""          # 索引目录（默认: {data_dir}/index）
-pdf_dir: ""            # PDF 源文件目录（默认: {data_dir}/pdfs）
-
-# ── 分块参数 ──
-chunk_size: 512          # 每个 Chunk 的字符数
-chunk_overlap: 128       # Chunk 间重叠字符数
-
-# ── 文档向量加权 Mean Pooling 参数 ──
-# 按文档位置三段加权：头部（标题/摘要）、正文、尾部（结论）
-head_weight: 5.0         # 头部权重
-body_weight: 2.0         # 正文权重
-tail_weight: 4.0         # 尾部权重
-head_ratio: 0.15         # 头部占比（文档前 15%）
-tail_ratio: 0.10         # 尾部占比（文档后 10%）
-
-# ── 检索参数 ──
-recall_k: 50             # RRF 融合前的候选集大小
-final_top_n: 5           # 最终返回结果数
-rrf_k: 60                # 倒数排序融合（RRF）常数
-
-# ── 模型 ──
-embedding_model: "BAAI/bge-small-zh-v1.5"
-reranker_model: "BAAI/bge-reranker-v2-m3"
-vector_dim: 512
-
-# ── Worker 池 ──
-pool_workers: 5          # 并发 Worker 数（0=自动，1=顺序执行）
-pool_timeout: 0          # 单 Subject 超时秒数（0=无超时）
-"""
-
-_DEFAULT_PIPELINE_YAML = """# ═══════════════════════════════════════════════════
-# 标准论文评审管线配置
-# ═══════════════════════════════════════════════════
-#
-# 管线 = phases 列表，每个阶段有 mode（batch 或 per_subject）
-# 每个阶段由若干 Step 组成，Step 可以是 .py 脚本或 .md Agent 提示词
-#
-# .md 步骤支持模板变量：
-#   {subject.name}          —— 论文文件名
-#   {subject.text}          —— 论文全文
-#   {intermediates.XX.data}  —— 前置步骤的输出
-#
-# 解析时变量（在 pipeline.yaml 中使用）：
-#   {{ output_dir }}        —— 输出根目录
-#
-# ═══════════════════════════════════════════════════
-
-name: "标准论文评审管线"
-version: "2.0"
-
-phases:
-  # ── Pre Phase（批量执行）───────────────────────────
-  # mode=batch: 所有 Subject 依次执行每个 Step（不并行）
-  - name: pre
-    mode: batch
-    directory: pre-review/   # 步骤脚本目录（相对于此 yaml 所在目录）
-    manifest_step: "00-convert"  # 产 subject-manifest.json 的 step
-    duplicate_policy: skip        # skip | rename | error
-    retry:
-      max_attempts: 2        # 失败重试次数
-      on_failure: skip        # skip（跳过）或 abort（终止）
-
-  # ── Review Phase（逐篇执行）────────────────────────
-  # mode=per_subject: 每篇论文独立走完所有 Step，支持 Worker 池并发
-  - name: review
-    mode: per_subject
-    directory: review-pipeline/  # 步骤脚本目录
-    subject_source:
-      type: manifest             # manifest | cli（默认）
-      path: "{{ output_dir }}/subject-manifest.json"
-    duplicate_policy: skip
-    retry:
-      max_attempts: 1
-      on_failure: skip
-    subject_order:
-      sort_by: name           # name / regex
-      direction: asc          # asc / desc
-    pool:
-      workers: 5              # 并发 Worker 数（1=顺序）
-      timeout: 120            # 单 Subject 超时秒数
-      ordered: true           # 按 Subject 顺序返回结果
-
-  # ── Post Phase（批量执行）──────────────────────────
-  - name: post
-    mode: batch
-    directory: post-review/
-    duplicate_policy: skip
-    retry:
-      max_attempts: 2
-      on_failure: skip
-"""
-
 
 @app.command()
 def init(
     ctx: typer.Context,
-    force: bool = typer.Option(
+    reset: bool = typer.Option(
         False,
-        "--force",
-        "-f",
-        help="覆盖已有的配置文件",
+        "--reset",
+        "-r",
+        help="重置为 Scaffold Template 最新内容（覆盖已有文件，旧文件会先备份）",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="配合 --reset：跳过覆盖前的确认提示",
     ),
 ):
     """
@@ -762,7 +645,9 @@ def init(
       - pipelines/standard/pipeline.yaml      （管线编排定义）
       - pipelines/standard/{pre,review-pipeline,post}-review/  （默认步骤）
 
-    运行此命令不会覆盖已有文件，除非指定 --force。
+    不带 --reset：只补齐缺失文件，已存在的文件不动。
+    带 --reset：无条件重置为 Scaffold Template 最新内容，已存在的文件会先备份成
+    <文件名>.bak-<时间戳>，再覆盖（需交互确认，--yes 跳过）。
     """
     # ── 交互式选择：项目级 or 用户级 ──
     cwd_dot = Path.cwd() / ".paper-review"
@@ -784,22 +669,64 @@ def init(
             dd = resolve_data_dir(str(cwd_dot))
     else:
         dd = resolve_data_dir(data_dir_str)
-    dd.mkdir(parents=True, exist_ok=True)
 
-    # 标准管线目录
+    # ── Scaffold Template 完整性检查（先于任何写入）──
+    templates_dir = _resolve_templates_dir()
+    if templates_dir is None or not templates_dir.is_dir():
+        typer.echo("  ✗ 未找到 Scaffold Template，安装可能不完整。")
+        typer.echo("    请检查 src/paper_review/templates/ 是否随包安装。")
+        raise typer.Exit(1)
+
+    config_content = _read_template("config.yaml")
+    pipeline_content = _read_template("pipeline.yaml")
+    if config_content is None or pipeline_content is None:
+        typer.echo("  ✗ Scaffold Template 缺少 config.yaml 或 pipeline.yaml，安装可能损坏。")
+        raise typer.Exit(1)
+
     pipeline_dir = dd / "pipelines" / "standard"
+    phase_dirs = ["pre-review", "review-pipeline", "post-review"]
+
+    # ── --reset：列出将被覆盖的已存在文件，确认后逐个备份 ──
+    if reset:
+        existing: list[Path] = []
+        if (dd / "config.yaml").exists():
+            existing.append(dd / "config.yaml")
+        if (pipeline_dir / "pipeline.yaml").exists():
+            existing.append(pipeline_dir / "pipeline.yaml")
+        for subdir in phase_dirs:
+            src_dir = templates_dir / subdir
+            if not src_dir.is_dir():
+                continue
+            for f in sorted(src_dir.iterdir()):
+                if not f.is_file() or f.name.startswith("."):
+                    continue
+                dest = pipeline_dir / subdir / f.name
+                if dest.exists():
+                    existing.append(dest)
+
+        if existing:
+            typer.echo("  --reset 将覆盖以下已存在文件（旧文件会先备份为 <文件名>.bak-<时间戳>）：")
+            for f in existing:
+                typer.echo(f"    - {f}")
+            if not yes and not typer.confirm("  确认重置？", default=False):
+                typer.echo("  已取消，未做任何改动。")
+                raise typer.Exit(0)
+
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            for f in existing:
+                backup = f.with_name(f"{f.name}.bak-{timestamp}")
+                backup.write_bytes(f.read_bytes())
+                typer.echo(f"  ✓ 备份 {f} → {backup}")
+
+    dd.mkdir(parents=True, exist_ok=True)
     pipeline_dir.mkdir(parents=True, exist_ok=True)
 
     cfg_changed = False
 
     # config.yaml（不变，仍在 data_dir 顶层）
     config_path = dd / "config.yaml"
-    config_content = _read_template("config.yaml")
-    if config_content is None:
-        config_content = _DEFAULT_CONFIG_YAML
-
-    if config_path.exists() and not force:
-        typer.echo(f"  ⚠ {config_path} 已存在（使用 --force 覆盖）")
+    if config_path.exists() and not reset:
+        typer.echo(f"  ⚠ {config_path} 已存在（使用 --reset 重置）")
     else:
         config_path.write_text(config_content)
         typer.echo(f"  ✓ 创建 {config_path}")
@@ -807,29 +734,24 @@ def init(
 
     # pipeline.yaml → pipelines/standard/
     pipeline_yaml = pipeline_dir / "pipeline.yaml"
-    pipeline_content = _read_template("pipeline.yaml")
-    if pipeline_content is None:
-        pipeline_content = _DEFAULT_PIPELINE_YAML
-
-    if pipeline_yaml.exists() and not force:
-        typer.echo(f"  ⚠ {pipeline_yaml} 已存在（使用 --force 覆盖）")
+    if pipeline_yaml.exists() and not reset:
+        typer.echo(f"  ⚠ {pipeline_yaml} 已存在（使用 --reset 重置）")
     else:
         pipeline_yaml.write_text(pipeline_content)
         typer.echo(f"  ✓ 创建 {pipeline_yaml}")
         cfg_changed = True
 
-    # 各 phase 子目录（相对 pipeline_dir）
-    phase_dirs = ["pre-review", "review-pipeline", "post-review"]
+    # 各 phase 子目录（相对 pipeline_dir，源自 Scaffold Template）
     for subdir in phase_dirs:
-        src = _get_default_pipeline_source(subdir)
+        src_dir = templates_dir / subdir
         target = pipeline_dir / subdir
         phase_changed = False
-        if src and src.is_dir() and list(src.iterdir()):
-            for f in sorted(src.iterdir()):
+        if src_dir.is_dir():
+            for f in sorted(src_dir.iterdir()):
                 if not f.is_file() or f.name.startswith("."):
                     continue
                 dest = target / f.name
-                if dest.exists() and not force:
+                if dest.exists() and not reset:
                     continue
                 target.mkdir(parents=True, exist_ok=True)
                 dest.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
@@ -837,14 +759,6 @@ def init(
                 phase_changed = True
         elif not target.exists():
             target.mkdir(parents=True, exist_ok=True)
-
-        # review-pipeline 的额外默认步骤（来自模板）
-        if subdir == "review-pipeline":
-            copied = _copy_default_pipeline_steps(target, force)
-            if copied:
-                for step_path in copied:
-                    typer.echo(f"  ✓ 创建 {step_path}")
-                phase_changed = True
 
         if phase_changed:
             cfg_changed = True
@@ -857,9 +771,12 @@ def init(
     typer.echo(f"管线定义: {pipeline_dir}")
     typer.echo()
     typer.echo("快速体验：")
-    typer.echo("  paper-review index --pdf-dir ./data/history")
-    typer.echo(f"    （或放入 {dd / 'pdfs'} 后执行 index）")
+    typer.echo("  将 PDF 放入 origin/pdf/ 后直接运行 review 即可自动索引。")
+    typer.echo(f"  （或放入 {dd / 'origin' / 'pdf'} 后执行 review）")
     typer.echo("  paper-review review ./待审论文.pdf")
+    typer.echo()
+    typer.echo("高级：")
+    typer.echo("  paper-review index    （显式建索引，支持 --source-dir 自定义）")
 
 
 @app.command()

@@ -29,7 +29,7 @@ class Config(BaseModel):
     # --- 目录配置 ---
     data_dir: str = ""  # 空字符串 = 自动解析（见 resolve_data_dir()）
     index_dir: str = ""  # 空 = 自动推导为 {data_dir}/index
-    pdf_dir: str = ""  # 空 = 自动推导为 {data_dir}/pdfs
+    pdf_dir: str = ""  # 空 = 自动推导为 {data_dir}/origin/pdf/
     model_cache_dir: str = str(Path.home() / ".cache" / "paper-review" / "models")
 
     # --- 分块参数 ---
@@ -86,7 +86,7 @@ class Config(BaseModel):
         if not resolved.index_dir:
             resolved.index_dir = str(dd / "index")
         if not resolved.pdf_dir:
-            resolved.pdf_dir = str(dd / "pdfs")
+            resolved.pdf_dir = str(dd / "origin" / "pdf")
         return resolved
 
     def weight_config_str(self) -> str:

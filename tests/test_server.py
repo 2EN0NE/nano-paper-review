@@ -15,8 +15,8 @@ import pytest
 
 from helpers import make_mock_chunk_vecs, make_sample_paper
 from paper_review.search.chunker import chunk_paper
-from paper_review.server import create_app
 from paper_review.search.store import Store
+from paper_review.server import create_app
 
 pytestmark = pytest.mark.integration
 

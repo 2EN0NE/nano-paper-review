@@ -76,7 +76,7 @@ class TestConfigResolve:
         cfg = Config(index_dir="", pdf_dir="")
         resolved = cfg.resolve(data_dir_override=str(dd))
         assert resolved.index_dir == str(dd / "index")
-        assert resolved.pdf_dir == str(dd / "pdfs")
+        assert resolved.pdf_dir == str(dd / "origin" / "pdf")
 
     def test_explicit_paths_survive_resolve(self, tmp_path):
         """显式设置的 index_dir/pdf_dir 不被覆盖。"""
@@ -112,7 +112,7 @@ class TestConfigResolve:
         with patch("pathlib.Path.cwd", return_value=tmp_path):
             resolved = cfg.resolve()
         assert resolved.index_dir == str(dot / "index")
-        assert resolved.pdf_dir == str(dot / "pdfs")
+        assert resolved.pdf_dir == str(dot / "origin" / "pdf")
 
 
 class TestLoadConfigDataDir:
@@ -126,7 +126,7 @@ class TestLoadConfigDataDir:
         dd.mkdir(parents=True)
         cfg = load_config(path=_EXPLICIT_NONE_PATH, data_dir=str(dd))
         assert cfg.index_dir == str(dd / "index")
-        assert cfg.pdf_dir == str(dd / "pdfs")
+        assert cfg.pdf_dir == str(dd / "origin" / "pdf")
         assert cfg.model_cache_dir == str(Path.home() / ".cache" / "paper-review" / "models")
 
     def test_load_config_no_data_dir_auto(self, tmp_path):
@@ -138,7 +138,7 @@ class TestLoadConfigDataDir:
         with patch("pathlib.Path.cwd", return_value=tmp_path):
             cfg = load_config(path=_EXPLICIT_NONE_PATH)
         assert cfg.index_dir == str(dot / "index")
-        assert cfg.pdf_dir == str(dot / "pdfs")
+        assert cfg.pdf_dir == str(dot / "origin" / "pdf")
 
     def test_load_config_fallback_auto_create(self, tmp_path):
         """load_config() fallback 到 ~/.paper-review/ 时自动创建。"""
@@ -166,7 +166,7 @@ class TestLoadConfigDataDir:
         cfg = load_config(path=str(yaml_path), data_dir=str(dd))
         assert cfg.index_dir == "/custom/from/yaml"
         # pdf_dir 空 → 自动推导
-        assert cfg.pdf_dir == str(dd / "pdfs")
+        assert cfg.pdf_dir == str(dd / "origin" / "pdf")
 
     def test_load_config_yaml_data_dir_field_sets_derived_paths(self, tmp_path):
         """YAML 中 data_dir 字段被 load_config() 读取，自动推导子路径。"""
@@ -179,7 +179,7 @@ class TestLoadConfigDataDir:
         cfg = load_config(path=str(yaml_path))
         # index_dir/pdf_dir 应从 YAML 的 data_dir 推导
         assert cfg.index_dir == str(dd / "index")
-        assert cfg.pdf_dir == str(dd / "pdfs")
+        assert cfg.pdf_dir == str(dd / "origin" / "pdf")
 
     def test_load_config_yaml_data_dir_with_explicit_index(self, tmp_path):
         """YAML 中同时指定 data_dir 和 index_dir，index_dir 优先。"""
@@ -192,4 +192,4 @@ class TestLoadConfigDataDir:
         cfg = load_config(path=str(yaml_path))
         assert cfg.index_dir == "/custom/index"
         # pdf_dir 应来自 data_dir 推导
-        assert cfg.pdf_dir == str(dd / "pdfs")
+        assert cfg.pdf_dir == str(dd / "origin" / "pdf")
