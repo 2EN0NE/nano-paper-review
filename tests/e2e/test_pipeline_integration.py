@@ -731,3 +731,194 @@ class TestExcelSkipSingleSubject:
         )
         if excel_data["status"] == "ok":
             assert excel_data["data"]["subject_count"] == 1
+
+
+# ============================================================================
+# 场景 6: 进度卡片渲染验证（PAPER_REVIEW_FORCE_TTY）
+# ============================================================================
+
+
+class TestProgressCardRendering:
+    """E2E 验证：进度卡片在终端环境中的渲染。
+
+    这是 Layer 3 测试——验证真实 CLI 进程中 stderr 的进度卡输出。
+    """
+
+    def test_force_tty_produces_progress_box_in_stderr(self, tmp_path: Path):
+        """PAPER_REVIEW_FORCE_TTY=1 时 stderr 包含完整进度 box。
+
+        关键回归：确保进度卡在非 TTY 环境（如 CI）中也能通过
+        PAPER_REVIEW_FORCE_TTY=1 强制渲染。
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "index").mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _setup_pipeline_steps(data_dir / "pipelines")
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        _make_mock_pandoc(mock_bin)
+
+        pdf = input_dir / "test-paper.pdf"
+        _make_pdf(pdf, "Test paper for progress card")
+
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+        env["PAPER_REVIEW_FORCE_TTY"] = "1"
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(pdf),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, (
+            f"Pipeline failed:\nSTDOUT:{result.stdout[:800]}\nSTDERR:{result.stderr[:500]}"
+        )
+
+        # 验证 stderr 包含进度 box 边框字符
+        stderr = result.stderr
+        assert "┌" in stderr, f"Progress box should have top border '┌' in stderr:\n{stderr[:500]}"
+        assert "└" in stderr, (
+            f"Progress box should have bottom border '└' in stderr:\n{stderr[:500]}"
+        )
+        assert "┐" in stderr, "Progress box should have top-right corner"
+        assert "┘" in stderr, "Progress box should have bottom-right corner"
+
+        # 验证包含三阶段名称
+        assert "Pre" in stderr, "Progress box should show Pre phase"
+        assert "Review" in stderr, "Progress box should show Review phase"
+        assert "Post" in stderr, "Progress box should show Post phase"
+
+        # 验证包含总进度行
+        assert "总进度" in stderr, "Progress box should show summary line"
+
+        # 验证 ANSI escape 序列存在
+        assert "\033[" in stderr, "Progress box should contain ANSI escape codes"
+
+    def test_without_force_tty_stderr_has_plain_text(self, tmp_path: Path):
+        """未设置 FORCE_TTY 时（非 TTY 环境），stderr 输出纯文本阶段摘要。
+
+        这是进度卡"不出现"问题的另一面——确认回退路径也是可读的。
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "index").mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _setup_pipeline_steps(data_dir / "pipelines")
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        _make_mock_pandoc(mock_bin)
+
+        pdf = input_dir / "test-paper.pdf"
+        _make_pdf(pdf, "Test paper for plain text progress")
+
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+        # 不设置 PAPER_REVIEW_FORCE_TTY —— 默认用 sys.stderr.isatty()
+        # subprocess.run 捕获输出，所以 stderr 不是 TTY
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(pdf),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, (
+            f"Pipeline failed:\nSTDOUT:{result.stdout[:800]}\nSTDERR:{result.stderr[:500]}"
+        )
+
+        stderr = result.stderr
+        # 非 TTY 模式：不应有 box 边框
+        assert "┌" not in stderr, (
+            f"Without FORCE_TTY, stderr should NOT have box border:\n{stderr[:500]}"
+        )
+
+        # 但应有纯文本阶段摘要
+        assert "[进度]" in stderr or "Pre" in stderr, (
+            f"Non-TTY should have plain text progress summary:\n{stderr[:500]}"
+        )
+
+        # 不应有 ANSI escape
+        assert "\033[" not in stderr, f"Non-TTY should not have ANSI escapes:\n{stderr[:500]}"
+
+    def test_force_tty_progress_card_updates_during_run(self, tmp_path: Path):
+        """进度卡在管线运行过程中有多次更新（spinner 帧变化）。
+
+        验证 stderr 中至少有 2 个不同的 spinner 帧，证明 in-place 刷新在运行。
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "index").mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _setup_pipeline_steps(data_dir / "pipelines")
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        _make_mock_pandoc(mock_bin)
+
+        pdf = input_dir / "test-paper.pdf"
+        _make_pdf(pdf, "Test paper for progress updates")
+
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+        env["PAPER_REVIEW_FORCE_TTY"] = "1"
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(pdf),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0
+
+        # 收集所有唯一的 spinner 帧
+        import re
+
+        spinners = set(re.findall(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]", result.stderr))
+        # 通常运行过程中至少会看到 2+ 个不同的 spinner 帧
+        assert len(spinners) >= 2, (
+            f"Expected at least 2 spinner frames in progress output, got {len(spinners)}:\n"
+            f"{result.stderr[:800]}"
+        )

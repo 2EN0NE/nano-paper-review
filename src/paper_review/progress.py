@@ -17,6 +17,7 @@ Layout:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -69,6 +70,11 @@ class PipelineProgress:
         self._review_done_subjects: int = 0
         self._review_running_subjects: set[str] = set()
         self._subject_step_done: dict[str, int] = {}
+
+        # 动态池信息
+        self._dyn_active: int = 0
+        self._dyn_current: int = 0
+        self._dyn_timeout_mult: float = 1.0
         self.subject_step_done = self._subject_step_done
 
         self._spinner_idx = 0
@@ -76,17 +82,41 @@ class PipelineProgress:
         self._finished = False
         self._lock = threading.Lock()
         self._tty = sys.stderr.isatty()
+        # PAPER_REVIEW_FORCE_TTY=1 强制 ANSI 渲染（用于 TTY 检测误判的环境）
+        if os.environ.get("PAPER_REVIEW_FORCE_TTY") == "1":
+            self._tty = True
         self._start_time: float = 0.0
         self._line_count = 0  # number of lines the box occupies
         self._saved_handler_levels: list[tuple[logging.Handler, int]] = []
+        self._saved_level = logging.NOTSET
+        self._saved_propagate = True
 
     # ── Public API ──
 
     def start(self):
         """Show initial progress box, mute console logging, start spinner."""
-        if not self._tty:
-            return
         self._start_time = time.time()
+
+        if not self._tty:
+            # 非 TTY 环境：静默日志 + 打印简单文本进度
+            self._mute_console_logging()
+            self._started = True
+            sys.stderr.write(
+                f"[进度] Pre {self._pre.total} steps / "
+                f"Review {self._review_subjects}×{self._review_steps_per} steps / "
+                f"Post {self._post.total} steps\n"
+            )
+            sys.stderr.flush()
+            return
+
+        # 强制刷新所有日志缓冲，确保 ANSI cursor movement 不被滞后数据损坏
+        for h in list(logging.getLogger().handlers) + list(
+            logging.getLogger("paper_review").handlers
+        ):
+            if hasattr(h, "flush"):
+                h.flush()
+        sys.stderr.flush()
+
         self._mute_console_logging()
         self._started = True
         self._render_first()
@@ -103,6 +133,14 @@ class PipelineProgress:
             self._review_running_subjects.add(subject)
             self._review.running = len(self._review_running_subjects)
             self._subject_step_done.setdefault(subject, 0)
+            self._render()
+
+    def update_dynamic_workers(self, active: int, current: int, timeout_multiplier: float = 1.0):
+        """更新动态池 worker 信息（供 CLI 进度卡显示）。"""
+        with self._lock:
+            self._dyn_active = active
+            self._dyn_current = current
+            self._dyn_timeout_mult = timeout_multiplier
             self._render()
 
     def review_step_done(self, subject: str):
@@ -133,46 +171,34 @@ class PipelineProgress:
 
     def finish(self):
         """Final render and restore logging."""
-        if not self._tty:
-            return
         self._finished = True
-        time.sleep(0.15)  # let last spinner frame render
-        self._render(final=True)
+        if self._tty:
+            time.sleep(0.15)  # let last spinner frame render
+            self._render(final=True)
+            sys.stderr.write("\n\n")
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(f"[完成] 总耗时 {self._elapsed_str()}\n")
+            sys.stderr.flush()
         self._restore_console_logging()
-        sys.stderr.write("\n\n")
-        sys.stderr.flush()
 
     # ── Internal: logging mute ──
 
     def _mute_console_logging(self):
-        """彻底静默 paper_review 的 stderr 输出——包括 logging 和直接 print。
+        """只禁 stderr 输出，保留文件日志。
 
         进度条使用 ANSI 光标定位在 stderr 上绘制。任何其他 stderr
-        输出都会把光标推偏，导致残影。
+        输出都会把光标推偏，导致残影。但 FileHandler（日志文件）不受影响——
+        DynamicPool 调整、超时诊断等关键日志仍然写入 paper-review.log。
         """
-        # 1) 提升 paper_review logger 级别
-        root = logging.getLogger("paper_review")
-        self._saved_level = root.level
-        root.setLevel(logging.WARNING)
-        # 2) 禁用 propagation 防止冒泡到 root logger
-        self._saved_propagate = root.propagate
-        root.propagate = False
-        # 3) 逐个 handler 提高到 ERROR
-        for h in root.handlers[:]:
-            self._saved_handler_levels.append((h, h.level))
-            h.setLevel(logging.ERROR)
-        # 4) 也管 root logger 以防万一
-        root_logger = logging.getLogger()
-        for h in root_logger.handlers[:]:
-            key = (h, h.level)
-            if key not in self._saved_handler_levels:
-                self._saved_handler_levels.append(key)
-            h.setLevel(logging.ERROR)
+        for lg_name in ("paper_review", ""):  # paper_review + root
+            lg = logging.getLogger(lg_name)
+            for h in lg.handlers[:]:
+                if isinstance(h, logging.StreamHandler) and h.stream is sys.stderr:
+                    self._saved_handler_levels.append((h, h.level))
+                    h.setLevel(logging.ERROR)
 
     def _restore_console_logging(self):
-        root = logging.getLogger("paper_review")
-        root.setLevel(self._saved_level)
-        root.propagate = self._saved_propagate
         for h, lvl in self._saved_handler_levels:
             h.setLevel(lvl)
         self._saved_handler_levels.clear()
@@ -253,7 +279,9 @@ class PipelineProgress:
             sys.stderr.write(f"\033[{self._line_count}A")
 
         for line in lines:
-            sys.stderr.write(line + "\033[2K\n")  # \033[2K clears entire line (not just from cursor)
+            sys.stderr.write(
+                "\033[2K" + line + "\n"
+            )  # \033[2K clears line before writing, then newline
         sys.stderr.flush()
         self._line_count = len(lines)
 
@@ -261,12 +289,18 @@ class PipelineProgress:
         spinner = _SPINNER[self._spinner_idx]
 
         # Review extra info
+        parts = []
         if self._review.running > 0:
-            review_extra = f"{self._review_done_subjects}/{self._review_subjects} done, {self._review.running} running"
+            parts.append(
+                f"{self._review_done_subjects}/{self._review_subjects} done, {self._review.running} running"
+            )
+            if self._dyn_active > 0:
+                parts.append(f"workers={self._dyn_active}/{self._dyn_current}")
+            if self._dyn_timeout_mult > 1.01:
+                parts.append(f"×{self._dyn_timeout_mult:.1f}")
         elif self._review.total > 0 and self._review.done >= self._review.total:
-            review_extra = f"{self._review_subjects}/{self._review_subjects} done"
-        else:
-            review_extra = ""
+            parts.append(f"{self._review_subjects}/{self._review_subjects} done")
+        review_extra = " · ".join(parts)
 
         # Summary line
         if self._finished:
@@ -278,11 +312,23 @@ class PipelineProgress:
             elapsed = self._elapsed_str()
             summary = f"  总进度 {spinner} {self._total_done()}/{self._total_steps()} ({self._pct()}%)    {ts}  已耗时 {elapsed}"
 
+        safe = self._safe_line
         return [
             "┌" + "─" * _BOX_WIDTH + "┐",
-            self._phase_line(self._pre).ljust(_BOX_WIDTH),
-            self._phase_line(self._review, review_extra).ljust(_BOX_WIDTH),
-            self._phase_line(self._post).ljust(_BOX_WIDTH),
-            summary.ljust(_BOX_WIDTH),
+            safe(self._phase_line(self._pre), _BOX_WIDTH),
+            safe(self._phase_line(self._review, review_extra), _BOX_WIDTH),
+            safe(self._phase_line(self._post), _BOX_WIDTH),
+            safe(summary, _BOX_WIDTH),
             "└" + "─" * _BOX_WIDTH + "┘",
         ]
+
+    @staticmethod
+    def _safe_line(text: str, width: int) -> str:
+        """Ensure line fits exactly within width.
+
+        Truncates if text is too long; pads with spaces if too short.
+        This is the render safety net — every line must pass through here.
+        """
+        if len(text) > width:
+            return text[:width]
+        return text.ljust(width)
