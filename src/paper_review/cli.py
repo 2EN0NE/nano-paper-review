@@ -1,6 +1,4 @@
 # ruff: noqa: UP007
-from __future__ import annotations
-
 """
 CLI 入口 —— 论文检索服务的命令行接口
 
@@ -10,6 +8,8 @@ CLI 入口 —— 论文检索服务的命令行接口
 - status: 查看索引状态
 - serve: 启动 HTTP 服务
 """
+
+from __future__ import annotations
 
 import hashlib
 import logging
@@ -299,12 +299,35 @@ def search(
     s = store.state_summary()
     if s["papers"] == 0 and not skip_warnings:
         typer.echo("\n⚠ 索引中尚无论文。检索将返回空结果。")
-        typer.echo("  建议先运行: paper-review index --pdf-dir ./data/history")
+        typer.echo("  建议先运行: paper-review index --source-dir ./data/history")
         if not typer.confirm("  继续搜索？", default=False):
             raise typer.Exit(0)
         typer.echo("")
 
-    results = store.search(query, pool_filter=pool_filter, with_rerank=not no_rerank)
+    # 加载 embedding 模型（与 index 时一致的向量编码，保证 FAISS 向量检索语义对齐）
+    # 若 ONNX 模型不可用则退化为哈希降级 + 非阻断警告
+    from paper_review.search.models import EmbeddingModelManager
+
+    logger = logging.getLogger("paper_review")
+    embed_model: EmbeddingModelManager | None = None
+    try:
+        mgr = EmbeddingModelManager()
+        mgr.load()
+        if mgr._embedder is not None:
+            embed_model = mgr
+        # _embedder is None → load() 内部已 warning 过 ONNX 模型路径，CLI 层不再重复
+    except Exception as e:
+        logger.warning(
+            "Failed to load embedding model (%s) — query vector falls back to deterministic hash.",
+            e,
+        )
+
+    results = store.search(
+        query,
+        pool_filter=pool_filter,
+        with_rerank=not no_rerank,
+        embed_model=embed_model,
+    )
 
     if not results:
         typer.echo("无匹配结果")

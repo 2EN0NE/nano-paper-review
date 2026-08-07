@@ -298,9 +298,9 @@ class TestIndexCommand:
     """paper-review index"""
 
     @patch("paper_review.cli.open_store")
-    def test_index_no_source_dir_uses_default(self, mock_open_store):
-        """无 --source-dir 时使用默认路径 origin/pdf/。"""
-        result = runner.invoke(app, ["index"])
+    def test_index_no_source_dir_uses_default(self, mock_open_store, tmp_path):
+        """无 --source-dir 时使用默认路径 {data_dir}/origin/pdf/。"""
+        result = runner.invoke(app, ["--data-dir", str(tmp_path), "index"])
         # 默认目录不存在 → 报错退出
         assert result.exit_code != 0
 

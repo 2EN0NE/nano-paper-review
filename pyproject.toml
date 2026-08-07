@@ -50,9 +50,12 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "src/paper_review/cli.py" = ["UP007"]
 "src/paper_review/orchestrator.py" = ["S603"]
-"tests/*.py" = ["S108"]                       # allow temp paths in tests
-"tests/e2e/*.py" = ["S603", "S607"]           # subprocess calls for CLI smoke test
-"src/paper_review/config.py" = ["UP045"]      # pre-existing: Optional[X] style
+"src/paper_review/templates/pre-review/00-convert.py" = [
+  "S603",
+] # pandoc/libreoffice via shutil.which, 本地路径参数
+"tests/*.py" = ["S108"] # allow temp paths in tests
+"tests/e2e/*.py" = ["S603", "S607"] # subprocess calls for CLI smoke test
+"src/paper_review/config.py" = ["UP045"] # pre-existing: Optional[X] style
 # (models.py and reranker.py no longer use lazy type imports)
 [tool.pytest.ini_options]
 testpaths = ["tests"]

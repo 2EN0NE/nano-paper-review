@@ -60,13 +60,11 @@ def extract_keywords(text: str) -> list[str]:
 def main():
     subject = os.environ.get("PIPELINE_SUBJECT", "")
     step_dir = os.environ.get("PIPELINE_STEP_DIR", ".")
-    output_dir = os.environ.get("PIPELINE_OUTPUT_DIR", ".")
     intermediates_dir = os.environ.get("PIPELINE_INTERMEDIATES", ".")
 
     # 读取前序步骤（search）的输出
     search_output = os.path.join(intermediates_dir, subject, "01-search", "output.json")
     references = []
-    subject_text = ""
 
     if os.path.exists(search_output):
         with open(search_output) as f:

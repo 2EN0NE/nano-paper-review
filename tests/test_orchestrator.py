@@ -7,9 +7,12 @@ Core Engine 测试 (T1): pipeline.yaml 解析 + Step 发现 + .py 执行
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from paper_review.orchestrator import (
     PipelineConfig,
@@ -792,6 +795,21 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
 
 class TestDynamicProfile:
     """profile=dynamic 时 DynamicPool 集成路径验证。"""
+
+    @pytest.fixture(autouse=True)
+    def _ensure_dynamic_pool_log_propagates(self):
+        """确保 caplog 能捕获 paper_review.dynamic_pool 日志。
+
+        setup_logging() 会将 paper_review logger 设为 propagate=False（避免控制台
+        重复输出）。若同进程内更早的测试通过 CliRunner 调过 setup_logging()，
+        该全局状态会残留，导致本类依赖 caplog 的测试变得顺序依赖。
+        此处为本类单独恢复 propagate=True，测试后还原。
+        """
+        logger = logging.getLogger("paper_review")
+        original = logger.propagate
+        logger.propagate = True
+        yield
+        logger.propagate = original
 
     def test_dynamic_profile_completes_all_subjects(self, tmp_path):
         """dynamic 模式下多 Subject 完整跑通，产物齐全。"""

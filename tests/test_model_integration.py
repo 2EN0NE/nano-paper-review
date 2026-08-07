@@ -102,8 +102,8 @@ class TestRealEmbedding:
         embedder = OnnxEmbedder(str(model.path))
         embedder.load()
 
-        v1 = embedder.encode(["文本A"])[0]
-        v2 = embedder.encode(["文本B"])[0]
+        v1 = embedder.encode(["深度学习是机器学习的一个分支"])[0]
+        v2 = embedder.encode(["今天天气很好适合出去散步"])[0]
         cosine = float(np.dot(v1, v2))
         assert cosine < 0.999
 
@@ -140,8 +140,15 @@ class TestRealReranker:
         ]
         results = reranker.rerank(query, candidates, top_n=3)
         assert len(results) <= 3
-        scores = [r.score for r in results]
-        assert scores[0] >= scores[-1]
+        # rerank() 按相关性降序返回 Paper 列表，不附加 score
+        # 验证语义排序：第一篇应高度相关，不相关论文不在 top-3 中
+        top_texts = [r.raw_text for r in results]
+        relevant = ["深度学习", "Transformer", "自然语言处理"]
+        assert any(kw in top_texts[0] for kw in relevant), f"第一篇应为相关文献: {top_texts[0]}"
+        # 天气和苹果这两篇显然无关，不应排进 top-3
+        assert all("天气" not in t and "苹果" not in t for t in top_texts), (
+            f"不相关论文不应进入 top-3: {top_texts}"
+        )
 
 
 # ── Mock embedding tests (always run) ──

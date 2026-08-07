@@ -20,15 +20,16 @@ def _inject_mock_modules():
     any test runs, so ``patch()`` can resolve its targets.  Individual
     tests/fixtures then replace the mock with their own controlled version.
     """
+    import importlib
     import sys
 
     mods_added = []
-    if "onnxruntime" not in sys.modules:
-        sys.modules["onnxruntime"] = MagicMock()
-        mods_added.append("onnxruntime")
-    if "tokenizers" not in sys.modules:
-        sys.modules["tokenizers"] = MagicMock()
-        mods_added.append("tokenizers")
+    for name in ("onnxruntime", "tokenizers"):
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            sys.modules[name] = MagicMock()
+            mods_added.append(name)
 
     yield
 

@@ -126,13 +126,13 @@ class EmbeddingModelManager:
         Returns:
             np.ndarray of shape ``(len(texts), dim)``, float32, L2-normalized.
         """
+        self.load()
         if self._embedder is not None and self._embedder.is_loaded:
             return self._embedder.encode(texts)
 
         # Fallback: deterministic hash
         from paper_review.search.store import deterministic_hash_vector
 
-        self.load()
         return np.array([deterministic_hash_vector(t, self._dim) for t in texts], dtype=np.float32)
 
 

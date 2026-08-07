@@ -1175,6 +1175,14 @@ def run_pipeline(
                         logger.info(
                             "Manifest step '%s' completed successfully", phase.manifest_step
                         )
+                        # 刷新 Subject 列表：discover_subjects() 在循环开始前已调用过一次，
+                        # 彼时 manifest 尚未生成，per_subject 阶段若以 manifest 为 subject_source
+                        # 会静默 fallback 到 CLI 目录扫描（只认 .pdf，漏掉 docx/doc 转换产物）。
+                        # manifest_step 跑完后用真实 manifest 重新发现一次，纠正后续阶段用到的列表。
+                        subjects = discover_subjects(config, input_path, config.output_dir)
+                        primary_subject = subjects[0] if subjects else ""
+                        # 同步更新进度条：subject 列表变化后总量需要重新计算
+                        pp.set_subject_count(len(subjects))
                 else:
                     logger.warning(
                         "manifest_step '%s' not found in phase '%s'. Available: %s",

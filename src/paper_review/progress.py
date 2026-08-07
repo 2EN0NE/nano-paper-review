@@ -123,6 +123,16 @@ class PipelineProgress:
         self._spinner_thread = threading.Thread(target=self._spin, daemon=True)
         self._spinner_thread.start()
 
+    def set_subject_count(self, n: int):
+        """更新 review subject 总数（在 manifest 生成后 subject 列表可能变化时调用）。
+
+        此时进度条已启动，_review.running 和 _review.done 皆以旧 subject 列表为基准——
+        此处仅重算总量，不重置进度（已完成步骤不回溯）。
+        """
+        with self._lock:
+            self._review_subjects = n
+            self._review.total = n * self._review_steps_per
+
     def pre_step_done(self):
         with self._lock:
             self._pre.done += 1

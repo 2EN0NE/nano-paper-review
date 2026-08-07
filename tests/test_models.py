@@ -13,66 +13,71 @@ from paper_review.search.models import EmbeddingModelManager
 
 
 class TestEmbeddingModelManagerFallback:
-    """当 ONNX 模型不存在时，EmbeddingModelManager 降级到确定性哈希。"""
+    """当 ONNX 模型不存在时，EmbeddingModelManager 降级到确定性哈希。
 
-    def test_load_fallback_no_onnx(self):
+    用指向空 tmp_path 的 model_cache_dir 隔离真实机器上可能已下载的 ONNX 模型，
+    确保“无模型降级”场景在任何机器上都能确定复现。
+    """
+
+    def _mgr(self, tmp_path) -> EmbeddingModelManager:
+        return EmbeddingModelManager(config=Config(model_cache_dir=str(tmp_path)))
+
+    def test_load_fallback_no_onnx(self, tmp_path):
         """无 ONNX 模型时 load 不抛异常，返回 True。"""
-        mgr = EmbeddingModelManager()
-        # 默认 model_cache_dir 下没有 ONNX 模型
+        mgr = self._mgr(tmp_path)
         result = mgr.load()
         assert result is True
 
-    def test_is_loaded_false_without_onnx(self):
-        """加载后 embedder 不会为 None（用哈希降级）。"""
-        mgr = EmbeddingModelManager()
+    def test_is_loaded_false_without_onnx(self, tmp_path):
+        """无 ONNX 模型时降级：_embedder 仍为 None（没创建 OnnxEmbedder）。"""
+        mgr = self._mgr(tmp_path)
         mgr.load()
-        # 降级模式下 _embedder 仍为 None（没创建 OnnxEmbedder）
         assert mgr._embedder is None
 
-    def test_encode_returns_ndarray_fallback(self):
+    def test_encode_returns_ndarray_fallback(self, tmp_path):
         """哈希降级时 encode 返回正确 shape 的 ndarray。"""
-        mgr = EmbeddingModelManager()
+        mgr = self._mgr(tmp_path)
         result = mgr.encode(["测试文本"])
         assert isinstance(result, np.ndarray)
         assert result.shape == (1, 512)
         assert result.dtype == np.float32
 
-    def test_encode_multiple_texts_fallback(self):
+    def test_encode_multiple_texts_fallback(self, tmp_path):
         """多条文本降级编码。"""
-        mgr = EmbeddingModelManager()
+        mgr = self._mgr(tmp_path)
         result = mgr.encode(["文本A", "文本B"])
         assert result.shape == (2, 512)
 
-    def test_encode_empty_list_fallback(self):
+    def test_encode_empty_list_fallback(self, tmp_path):
         """空列表返回空数组。"""
-        mgr = EmbeddingModelManager()
+        mgr = self._mgr(tmp_path)
         result = mgr.encode([])
         assert isinstance(result, np.ndarray)
 
-    def test_encode_deterministic_fallback(self):
+    def test_encode_deterministic_fallback(self, tmp_path):
         """哈希降级是确定性的（相同输入、相同输出）。"""
-        mgr = EmbeddingModelManager()
+        mgr = self._mgr(tmp_path)
         r1 = mgr.encode(["hello"])
         r2 = mgr.encode(["hello"])
         assert np.allclose(r1, r2)
 
-    def test_encode_different_inputs_different_vectors(self):
+    def test_encode_different_inputs_different_vectors(self, tmp_path):
         """不同文本得到不同向量。"""
-        mgr = EmbeddingModelManager()
+        mgr = self._mgr(tmp_path)
         r1 = mgr.encode(["hello"])
         r2 = mgr.encode(["world"])
         assert not np.allclose(r1, r2)
 
-    def test_properties_fallback(self):
+    def test_properties_fallback(self, tmp_path):
         """降级模式下属性值正确。"""
-        mgr = EmbeddingModelManager()
+        mgr = self._mgr(tmp_path)
         assert mgr.model_name == "BAAI/bge-small-zh-v1.5"
         assert mgr.dim == 512
         assert "bge-small-zh-v1.5" in mgr.embed_fingerprint
 
-    def test_encode_l2_normalized_fallback(self):
+    def test_encode_l2_normalized_fallback(self, tmp_path):
         """哈希降级输出是 L2 归一化的。"""
-        mgr = EmbeddingModelManager()
+        mgr = self._mgr(tmp_path)
         result = mgr.encode(["测试"])
         norms = np.linalg.norm(result, axis=1)
         assert np.allclose(norms, 1.0, atol=1e-5)
