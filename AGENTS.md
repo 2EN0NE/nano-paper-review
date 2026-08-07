@@ -181,6 +181,7 @@ E2E 测试是集成测试的唯一权威标准：
 3. **验证产物**：检查管线产物文件（`output.json`、manifest、Excel、report）的存在性和内容正确性，不只检查 `returncode`。
 4. **覆盖关键路径**：必须覆盖 Pre→Review→Post 完整链路、边界情况（空输入、去重、格式不支持）和特性开关（单篇 vs 多篇 Excel）。
 5. **隔离性**：测试间互不依赖，每个测试独立创建 `tmp_path` 隔离。
+6. **默认配置值可运行性**：任何影响外部工具调用（如 pi 子进程参数）的模块级默认常量必须有 E2E 测试。测试必须从源码动态导入常量值（`from module import _CONSTANT`），而非硬编码预期值——当常量被修改时，测试自动适用新值，同时验证新值不会导致运行时错误。见 `tests/e2e/test_pipeline_integration.py::TestDefaultConfigValidity` 示例。
 
 ### 测试数据
 

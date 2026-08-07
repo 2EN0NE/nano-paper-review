@@ -43,6 +43,54 @@ from paper_review.timeout_estimator import estimate_step_timeout
 
 logger = get_logger("orchestrator")
 
+# PDF 文件大小到文本字符数的经验比例（中文技术文章约 1 字节 PDF → 0.25-0.5 字符）
+_PDF_BYTE_TO_CHAR_RATIO = 0.35
+# 当无法读取 PDF 文件大小时的兜底估算（字符数）
+_FALLBACK_CHARS = 5000
+
+
+def _estimate_subject_chars(subjects: list[str], output_dir: Path) -> list[int]:
+    """根据 manifest 中的 pdf_path 估算每个 subject 的文本字符数。
+
+    读取 subject-manifest.json，取每个 subject 的 pdf_path，
+    用文件大小 × _PDF_BYTE_TO_CHAR_RATIO 近似文本量。
+    文件不存在时使用 _FALLBACK_CHARS 兜底。
+    """
+    manifest_path = output_dir / "subject-manifest.json"
+    subject_chars: list[int] = []
+    pdf_map: dict[str, Path] = {}
+
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for entry in manifest.get("subjects", []):
+                name = entry.get("name", "")
+                pdf = entry.get("pdf_path", "")
+                if name and pdf:
+                    pdf_map[name] = Path(pdf)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    for subject in subjects:
+        pdf_path = pdf_map.get(subject)
+        if pdf_path and pdf_path.exists():
+            try:
+                size_bytes = pdf_path.stat().st_size
+                chars = max(int(size_bytes * _PDF_BYTE_TO_CHAR_RATIO), _FALLBACK_CHARS // 2)
+            except OSError:
+                chars = _FALLBACK_CHARS
+        else:
+            chars = _FALLBACK_CHARS
+        subject_chars.append(chars)
+        logger.debug(
+            "Subject '%s': estimated %d chars (pdf=%s)",
+            subject,
+            chars,
+            pdf_path if pdf_path and pdf_path.exists() else "<not found>",
+        )
+
+    return subject_chars
+
 
 # ============================================================================
 # _retry_step — 共享重试逻辑
@@ -1077,12 +1125,20 @@ def run_pipeline(
             # 动态估算：统计 .md 步骤的文本负载
             md_steps = [s for s in steps if s.step_type == "md"]
             if md_steps:
-                # batch 模式处理全部 subject，per_subject 模式每步仅一个 subject
-                estimated_chars = len(subjects) * 5000 if phase.mode == "batch" else 5000
+                # 从 PDF 文件大小估算实际字数（经验比例：1 字节 PDF ≈ 0.35 字符文本）
+                # per_subject 模式用最大单篇，batch 模式用总和
+                subject_chars_list = _estimate_subject_chars(subjects, config.output_dir)
+                if not subject_chars_list:
+                    # 无 subject 时用 0（estimate_step_timeout 返回 base 60s）
+                    total_chars = 0
+                elif phase.mode == "per_subject":
+                    total_chars = max(subject_chars_list)
+                else:
+                    total_chars = sum(subject_chars_list)
                 phase_timeout = estimate_step_timeout(
                     step_type="md",
-                    total_chars=estimated_chars,
-                    subject_count=len(subjects),
+                    total_chars=total_chars,
+                    subject_count=len(subjects) if phase.mode == "batch" else 1,
                 )
             else:
                 phase_timeout = estimate_step_timeout(step_type="py")

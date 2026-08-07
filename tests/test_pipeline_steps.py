@@ -14,10 +14,12 @@ import stat
 
 from paper_review.pipeline_models import StepFile, StepResult
 from paper_review.pipeline_steps import (
+    _DEFAULT_PI_ARGS,
     AgentRunner,
     PromptBuilder,
     _classify_stderr_error,
     _extract_error_message,
+    _output_json_is_valid,
 )
 
 # ============================================================================
@@ -152,6 +154,7 @@ def _make_fake_pi(tmp_path, name: str, stderr_text: str = "", sleep_secs: int = 
     lines.append(f"echo $$ > {pidfile}")
     lines.append(f"exec sleep {sleep_secs}")
     script.write_text("\n".join(lines) + "\n")
+    # pi-lens-ignore: permissive-chmod
     os.chmod(str(script), 0o755)
     return script, pidfile
 
@@ -505,3 +508,276 @@ class TestPromptBuilder:
         assert "01-search" in prompt
         # 用户内容在最后
         assert prompt.strip().endswith("# scoring step")
+
+
+# ============================================================================
+# _output_json_is_valid — 超时后 output.json 有效性检查
+# ============================================================================
+
+
+class TestOutputJsonIsValid:
+    """_output_json_is_valid() 纯函数：边界值全覆盖。"""
+
+    def test_file_not_exists(self, tmp_path):
+        """文件不存在 → False。"""
+        assert not _output_json_is_valid(tmp_path / "nonexistent.json")
+
+    def test_empty_file(self, tmp_path):
+        """空文件 → False。"""
+        f = tmp_path / "empty.json"
+        f.write_text("")
+        assert not _output_json_is_valid(f)
+
+    def test_corrupted_json(self, tmp_path):
+        """损坏 JSON → False。"""
+        f = tmp_path / "corrupt.json"
+        f.write_text('{"status": "ok", "data": {')
+        assert not _output_json_is_valid(f)
+
+    def test_valid_ok_with_data(self, tmp_path):
+        """status=ok + data 有实际内容 → True。"""
+        f = tmp_path / "valid.json"
+        f.write_text('{"status": "ok", "data": {"score": 95}}')
+        assert _output_json_is_valid(f)
+
+    def test_status_error_returns_false(self, tmp_path):
+        """status=error → False（即使 data 有内容）。"""
+        f = tmp_path / "error.json"
+        f.write_text('{"status": "error", "data": {"score": 95}}')
+        assert not _output_json_is_valid(f)
+
+    def test_status_skipped_returns_false(self, tmp_path):
+        """status=skipped → False。"""
+        f = tmp_path / "skipped.json"
+        f.write_text('{"status": "skipped", "data": {"reason": "n/a"}}')
+        assert not _output_json_is_valid(f)
+
+    def test_data_empty_dict_returns_false(self, tmp_path):
+        """data 为空 dict → False（无实际输出）。"""
+        f = tmp_path / "empty_data.json"
+        f.write_text('{"status": "ok", "data": {}}')
+        assert not _output_json_is_valid(f)
+
+    def test_data_all_none_values_returns_false(self, tmp_path):
+        """data 中所有值均为 None/空 → False。"""
+        f = tmp_path / "none_values.json"
+        f.write_text('{"status": "ok", "data": {"a": null, "b": ""}}')
+        assert not _output_json_is_valid(f)
+
+    def test_data_zero_value_is_valid(self, tmp_path):
+        """data 中值为 0 是有效输出（0 ≠ 无数据）。"""
+        f = tmp_path / "zero.json"
+        f.write_text('{"status": "ok", "data": {"score": 0}}')
+        assert _output_json_is_valid(f)
+
+    def test_data_false_value_is_valid(self, tmp_path):
+        """data 中值为 false 是有效输出（false ≠ 无数据）。"""
+        f = tmp_path / "false_val.json"
+        f.write_text('{"status": "ok", "data": {"passed": false}}')
+        assert _output_json_is_valid(f)
+
+    def test_data_non_dict_returns_false(self, tmp_path):
+        """data 不是 dict → False。"""
+        f = tmp_path / "non_dict.json"
+        f.write_text('{"status": "ok", "data": [1, 2, 3]}')
+        assert not _output_json_is_valid(f)
+
+    def test_missing_data_field(self, tmp_path):
+        """缺少 data 字段 → False。"""
+        f = tmp_path / "no_data.json"
+        f.write_text('{"status": "ok"}')
+        assert not _output_json_is_valid(f)
+
+    def test_missing_status_field(self, tmp_path):
+        """缺少 status 字段 → False。"""
+        f = tmp_path / "no_status.json"
+        f.write_text('{"data": {"score": 95}}')
+        assert not _output_json_is_valid(f)
+
+
+# ============================================================================
+# AgentRunner 超时恢复 — pi 超时但 output.json 已写入
+# ============================================================================
+
+
+class TestAgentRunnerTimeoutRecovery:
+    """pi 超时但 output.json 已由 prompt 模板写入 → 视为成功。"""
+
+    def _make_fake_pi_write_then_sleep(self, tmp_path, name, output_json, sleep_secs=30):
+        """创建假 pi：先写 output.json 到 PIPELINE_STEP_DIR，再 exec sleep。"""
+        script = tmp_path / name
+        pidfile = tmp_path / f"{name}.pid"
+        lines = [
+            "#!/bin/sh",
+            f"echo $$ > {pidfile}",
+            # 从 stdin 读取 prompt，提取 PIPELINE_STEP_DIR 标记（不可靠，换环境变量）
+            'STEP_DIR="${PIPELINE_STEP_DIR:-/tmp}"',
+            f"echo '{json.dumps(output_json)}' > \"$STEP_DIR/output.json\"",
+            f"exec sleep {sleep_secs}",
+        ]
+        script.write_text("\n".join(lines) + "\n")
+        os.chmod(str(script), stat.S_IRWXU)  # noqa: S103
+        return script, pidfile
+
+    def _pid_alive(self, pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def _ensure_dead(self, pidfile):
+        if not pidfile.exists():
+            return
+        try:
+            pid = int(pidfile.read_text().strip())
+            if self._pid_alive(pid):
+                os.kill(pid, 9)
+        except (OSError, ValueError):
+            pass
+
+    def test_timeout_with_valid_output_json_recovers(self, tmp_path):
+        """pi 先写 output.json 再挂起 → 超时后返回 ok + data。"""
+        output_json = {"step": "03-scoring", "status": "ok", "data": {"score": 88}}
+        script, pidfile = self._make_fake_pi_write_then_sleep(
+            tmp_path, "fake_pi_recover", output_json, sleep_secs=30
+        )
+
+        runner = AgentRunner()
+        step_dir = tmp_path / "step"
+        try:
+            result = runner.run(
+                prompt="test prompt",
+                step_stem="03-scoring",
+                step_dir=step_dir,
+                env={"PIPELINE_PI_BINARY": str(script)},
+                timeout=3,
+            )
+
+            assert result.status == "ok"
+            assert result.data == {"score": 88}
+            assert result.error is None
+            assert not self._pid_alive(int(pidfile.read_text().strip()))
+        finally:
+            self._ensure_dead(pidfile)
+
+    def test_timeout_with_output_json_but_status_error(self, tmp_path):
+        """output.json status=error → 不走恢复路径，返回 error。"""
+        output_json = {"step": "03-scoring", "status": "error", "data": {}}
+        script, pidfile = self._make_fake_pi_write_then_sleep(
+            tmp_path, "fake_pi_error_recover", output_json, sleep_secs=30
+        )
+
+        runner = AgentRunner()
+        step_dir = tmp_path / "step"
+        try:
+            result = runner.run(
+                prompt="test prompt",
+                step_stem="03-scoring",
+                step_dir=step_dir,
+                env={"PIPELINE_PI_BINARY": str(script)},
+                timeout=3,
+            )
+
+            assert result.status == "error"
+            assert "timed out" in (result.error or "")
+            assert not self._pid_alive(int(pidfile.read_text().strip()))
+        finally:
+            self._ensure_dead(pidfile)
+
+
+# ============================================================================
+# PIPELINE_PI_ARGS — 默认参数与覆盖行为
+# ============================================================================
+
+
+class TestPiArgs:
+    """PIPELINE_PI_ARGS 环境变量控制 pi 额外参数。"""
+
+    def _make_arg_recording_fake_pi(self, tmp_path, name):
+        """创建假 pi：把接收到的全部参数写入 args.txt。"""
+        script = tmp_path / name
+        lines = [
+            "#!/bin/sh",
+            'echo "$@" > "$PIPELINE_STEP_DIR/args.txt"',
+            'echo \'{"step":"test","status":"ok","data":{"ok":true}}\'',
+            "exit 0",
+        ]
+        script.write_text("\n".join(lines) + "\n")
+        os.chmod(str(script), stat.S_IRWXU)  # noqa: S103
+        return script
+
+    def test_default_args_used_when_env_not_set(self, tmp_path):
+        """未设置 PIPELINE_PI_ARGS → 使用 _DEFAULT_PI_ARGS。"""
+        script = self._make_arg_recording_fake_pi(tmp_path, "fake_pi_default")
+        step_dir = tmp_path / "step"
+
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test",
+            step_stem="01-test",
+            step_dir=step_dir,
+            env={"PIPELINE_PI_BINARY": str(script)},
+            timeout=5,
+        )
+
+        assert result.status == "ok"
+        args_txt = step_dir / "args.txt"
+        assert args_txt.exists()
+        args = args_txt.read_text().strip().split()
+        # 默认参数应在 --no-session -p 之前
+        for expected in _DEFAULT_PI_ARGS:
+            assert expected in args, f"Expected '{expected}' in args: {args}"
+        assert "--no-session" in args
+        assert "-p" in args
+
+    def test_env_overrides_default_args(self, tmp_path):
+        """PIPELINE_PI_ARGS 设置后覆盖默认值。"""
+        script = self._make_arg_recording_fake_pi(tmp_path, "fake_pi_override")
+        step_dir = tmp_path / "step"
+
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test",
+            step_stem="01-test",
+            step_dir=step_dir,
+            env={
+                "PIPELINE_PI_BINARY": str(script),
+                "PIPELINE_PI_ARGS": "--custom-flag --debug",
+            },
+            timeout=5,
+        )
+
+        assert result.status == "ok"
+        args_txt = step_dir / "args.txt"
+        assert args_txt.exists()
+        args = args_txt.read_text().strip().split()
+        assert "--custom-flag" in args
+        assert "--debug" in args
+        # 默认参数不应出现在 args 中
+        for d in _DEFAULT_PI_ARGS:
+            assert d not in args, f"Default '{d}' should NOT be in args: {args}"
+
+    def test_env_empty_string_uses_defaults(self, tmp_path):
+        """PIPELINE_PI_ARGS 为空字符串 → 回退到默认值。"""
+        script = self._make_arg_recording_fake_pi(tmp_path, "fake_pi_empty")
+        step_dir = tmp_path / "step"
+
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test",
+            step_stem="01-test",
+            step_dir=step_dir,
+            env={
+                "PIPELINE_PI_BINARY": str(script),
+                "PIPELINE_PI_ARGS": "",
+            },
+            timeout=5,
+        )
+
+        assert result.status == "ok"
+        args_txt = step_dir / "args.txt"
+        assert args_txt.exists()
+        args = args_txt.read_text().strip().split()
+        for expected in _DEFAULT_PI_ARGS:
+            assert expected in args, f"Expected '{expected}' in args: {args}"

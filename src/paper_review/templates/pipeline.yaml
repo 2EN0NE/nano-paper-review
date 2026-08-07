@@ -52,7 +52,7 @@ phases:
       path: "{{ output_dir }}/subject-manifest.json"
     duplicate_policy: skip
     retry:
-      max_attempts: 1 # 一般重试 1 次（Agent 评审费时）
+      max_attempts: 2 # 重试 1 次（Agent 评审可能因 API 波动超时）
       on_failure: skip
 
     # ── Subject 排序 ──

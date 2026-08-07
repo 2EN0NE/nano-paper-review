@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from paper_review.orchestrator import (
     PipelineConfig,
+    _estimate_subject_chars,
     _execute_batch,
     _retry_step,
     discover_steps,
@@ -1064,3 +1065,112 @@ class TestCliTree:
             Path("/tmp/t"),
         )
         assert "summary.xlsx" in tree
+
+
+# ============================================================================
+# _estimate_subject_chars — PDF 文件大小到字符数估算
+# ============================================================================
+
+
+class TestEstimateSubjectChars:
+    """_estimate_subject_chars() 从 manifest 读 PDF 大小估算文本量。"""
+
+    def test_no_manifest_uses_fallback(self, tmp_path):
+        """manifest 不存在 → 全部用兜底值。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        chars_list = _estimate_subject_chars(["paper-a", "paper-b"], output_dir)
+        assert chars_list == [5000, 5000]
+
+    def test_empty_manifest_uses_fallback(self, tmp_path):
+        """manifest 存在但 subjects 为空 → 兜底值。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        manifest = output_dir / "subject-manifest.json"
+        manifest.write_text('{"subjects": []}')
+        chars_list = _estimate_subject_chars(["paper-x"], output_dir)
+        assert chars_list == [5000]
+
+    def test_pdf_exists_estimates_from_size(self, tmp_path):
+        """PDF 存在 → 按文件大小 × 比例计算。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        # 创建 10000 字节的 PDF
+        pdf = tmp_path / "real.pdf"
+        pdf.write_bytes(b"x" * 10000)
+
+        manifest = output_dir / "subject-manifest.json"
+        manifest.write_text(
+            '{"subjects": [{"name": "real", "pdf_path": "' + str(pdf.absolute()) + '"}]}'
+        )
+
+        chars_list = _estimate_subject_chars(["real"], output_dir)
+        expected = max(int(10000 * 0.35), 2500)  # _PDF_BYTE_TO_CHAR_RATIO=0.35, floor=2500
+        assert chars_list == [expected]
+
+    def test_pdf_not_found_uses_fallback(self, tmp_path):
+        """manifest 指向不存在的 PDF → 兜底值。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        manifest = output_dir / "subject-manifest.json"
+        manifest.write_text(
+            '{"subjects": [{"name": "ghost", "pdf_path": "/nonexistent/ghost.pdf"}]}'
+        )
+
+        chars_list = _estimate_subject_chars(["ghost"], output_dir)
+        assert chars_list == [5000]
+
+    def test_mixed_existing_and_missing(self, tmp_path):
+        """多个 subject：部分有 PDF、部分没有 → 混合兜底。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        pdf = tmp_path / "exists.pdf"
+        pdf.write_bytes(b"x" * 20000)
+
+        manifest = output_dir / "subject-manifest.json"
+        manifest.write_text(
+            '{"subjects": ['
+            '{"name": "exists", "pdf_path": "' + str(pdf.absolute()) + '"},'
+            '{"name": "missing", "pdf_path": "/nope.pdf"}'
+            "]}"
+        )
+
+        chars_list = _estimate_subject_chars(["exists", "missing"], output_dir)
+        assert len(chars_list) == 2
+        assert chars_list[0] == max(int(20000 * 0.35), 2500)
+        assert chars_list[1] == 5000
+
+    def test_corrupted_manifest_graceful(self, tmp_path):
+        """损坏的 JSON manifest → 不崩溃，返回兜底值。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "subject-manifest.json").write_text("not json {{{{")
+
+        chars_list = _estimate_subject_chars(["paper-a"], output_dir)
+        assert chars_list == [5000]
+
+    def test_small_pdf_clamped_to_floor(self, tmp_path):
+        """极小 PDF → 结果不低于 FALLBACK_CHARS // 2 (2500)。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        pdf = tmp_path / "tiny.pdf"
+        pdf.write_bytes(b"x" * 100)  # 100 * 0.35 = 35 < 2500
+
+        manifest = output_dir / "subject-manifest.json"
+        manifest.write_text(
+            '{"subjects": [{"name": "tiny", "pdf_path": "' + str(pdf.absolute()) + '"}]}'
+        )
+
+        chars_list = _estimate_subject_chars(["tiny"], output_dir)
+        assert chars_list == [2500]
+
+    def test_empty_subjects_returns_empty_list(self, tmp_path):
+        """空的 subjects 列表 → 返回空列表（调用方负责处理）。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        chars_list = _estimate_subject_chars([], output_dir)
+        assert chars_list == []

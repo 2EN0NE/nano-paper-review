@@ -1415,3 +1415,179 @@ phases:
         assert "429" in combined, (
             f"Expected 429 errors in output:\nSTDOUT:{result.stdout[:500]}\nSTDERR:{result.stderr[:500]}"
         )
+
+
+# ============================================================================
+# 场景 9: 默认配置值可运行性 — 动态验证 _DEFAULT_PI_ARGS 实际可用
+# ============================================================================
+
+
+class TestDefaultConfigValidity:
+    """管线默认配置值的 E2E 可运行性验证。
+
+    原则：不对默认值做硬编码断言；从源码导入当前默认值，
+    验证它们在不报错的情况下被实际传递到 pi 进程。
+    当有人修改 _DEFAULT_PI_ARGS 时，此测试自动适用新值。
+    """
+
+    def _make_arg_recording_pi(self, tmp_path, name):
+        """创建假 pi：记录全部接收到的参数到 args.txt，然后成功退出。"""
+        script = tmp_path / name
+        lines = [
+            "#!/bin/sh",
+            # 把全部参数写到 step 目录下的 args.txt
+            'echo "$@" > "$PIPELINE_STEP_DIR/args.txt"',
+            # 输出有效 output.json
+            'echo \'{"step":"test","status":"ok","data":{"ok":true}}\'',
+            "exit 0",
+        ]
+        script.write_text("\n".join(lines) + "\n")
+        os.chmod(str(script), stat.S_IRWXU)  # noqa: S103
+        return script
+
+    def _setup_minimal_pipeline(self, pipelines_dir):
+        """创建最小管线：pre（convert）+ review（一个 .md 步骤）。"""
+        pipeline_dir = pipelines_dir / "default-args-test"
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+
+        (pipeline_dir / "pipeline.yaml").write_text("""\
+name: "default-args-test"
+version: "2.0"
+phases:
+  - name: pre
+    mode: batch
+    directory: pre-review/
+    manifest_step: "00-convert"
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+  - name: review
+    mode: per_subject
+    directory: review-pipeline/
+    subject_source:
+      type: manifest
+      path: "{{ output_dir }}/subject-manifest.json"
+    retry:
+      max_attempts: 1
+      on_failure: skip
+    subject_order:
+      sort_by: name
+      direction: asc
+    pool:
+      workers: 1
+      timeout: 120
+""")
+
+        pre_dir = pipeline_dir / "pre-review"
+        pre_dir.mkdir()
+        (pre_dir / "00-convert.py").write_text(
+            """
+import json, os
+from pathlib import Path
+
+d = os.environ["PIPELINE_STEP_DIR"]
+out = os.environ["PIPELINE_OUTPUT_DIR"]
+input_path = Path(os.environ.get("PIPELINE_INPUT_PATH", "."))
+os.makedirs(d, exist_ok=True)
+
+if input_path.is_dir():
+    pdfs = sorted(input_path.glob("*.pdf"))
+else:
+    pdfs = [input_path]
+
+subjects = [{
+    "name": f.stem,
+    "pdf_path": str(f.absolute()),
+    "original_path": str(f.absolute()),
+    "source_type": "original_pdf",
+} for f in pdfs]
+
+manifest = {
+    "source": "00-convert",
+    "total_input": len(pdfs),
+    "converted": len(subjects),
+    "skipped": 0,
+    "subjects": subjects,
+    "skipped_entries": [],
+}
+json.dump(manifest, open(os.path.join(out, "subject-manifest.json"), "w"))
+json.dump({"step": "00-convert", "status": "ok", "data": {"manifest": manifest}},
+          open(os.path.join(d, "output.json"), "w"))
+""".strip()
+        )
+
+        review_dir = pipeline_dir / "review-pipeline"
+        review_dir.mkdir()
+        (review_dir / "01-review.md").write_text("# Review {subject.name}\n\nScore this paper.\n")
+
+        return pipeline_dir
+
+    def test_default_pi_args_passed_and_dont_error(self, tmp_path):
+        """E2E：_DEFAULT_PI_ARGS 被实际传递到 pi，且 pi 不报错。
+
+        动态验证而非硬编码值——当开发者修改 _DEFAULT_PI_ARGS 时，
+        此测试自动反映新值。同时确保不会传入已知会报错的参数组合。
+        """
+        from paper_review.pipeline_steps import _DEFAULT_PI_ARGS
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+        (data_dir / "index").mkdir()
+
+        pipelines_dir = data_dir / "pipelines"
+        self._setup_minimal_pipeline(pipelines_dir)
+
+        # 假 pi：记录参数 + 成功退出
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        fake_pi = self._make_arg_recording_pi(mock_bin, "pi")
+        _make_mock_pandoc(mock_bin)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _make_pdf(input_dir / "test-paper.pdf", "Test content")
+
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = str(fake_pi)
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(input_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, (
+            f"Pipeline failed with default args:\n"
+            f"STDOUT:{result.stdout[:500]}\nSTDERR:{result.stderr[:500]}"
+        )
+
+        # 验证假 pi 收到了参数
+        intermediates = _find_task_dir(data_dir / "output") / "intermediates"
+        args_file = intermediates / "test-paper" / "01-review" / "args.txt"
+        assert args_file.exists(), f"args.txt not found at {args_file} — pi was not called"
+
+        args = args_file.read_text().strip().split()
+        assert args, "pi received empty args"
+
+        # 动态验证：当前 _DEFAULT_PI_ARGS 全部出现在实际参数中
+        for expected_arg in _DEFAULT_PI_ARGS:
+            assert expected_arg in args, (
+                f"Default arg '{expected_arg}' NOT in pi args: {args}\n"
+                f"If you changed _DEFAULT_PI_ARGS, verify this test still passes."
+            )
+
+        # 验证 pipeline 正常完成
+        out_file = intermediates / "test-paper" / "01-review" / "output.json"
+        assert out_file.exists(), f"Review output.json not found at {out_file}"

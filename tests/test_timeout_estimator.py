@@ -6,7 +6,7 @@ timeout_estimator 模块单元测试。
 
 from __future__ import annotations
 
-from paper_review.timeout_estimator import estimate_step_timeout
+from paper_review.timeout_estimator import _CHARS_PER_SEC_FACTOR, estimate_step_timeout
 
 
 class TestEstimateStepTimeout:
@@ -55,7 +55,8 @@ class TestEstimateStepTimeout:
     def test_single_subject_no_buffer(self):
         """单 subject 不乘缓冲因子。"""
         t = estimate_step_timeout(step_type="md", total_chars=5000, subject_count=1)
-        assert t == 210  # 60 + (5000/1000)*30 = 60+150 = 210
+        # 60 + (5000/1000) * factor — 表达式而非魔法数字
+        assert t == 60 + int(5000 / 1000 * _CHARS_PER_SEC_FACTOR)
 
     def test_multi_subject_buffer_applied(self):
         """多 subject 时乘以 1.2 缓冲因子。"""

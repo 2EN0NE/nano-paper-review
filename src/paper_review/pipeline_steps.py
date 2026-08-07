@@ -253,6 +253,42 @@ def _extract_error_message(stderr_clean: str) -> str:
     return ""
 
 
+# 默认 pi 额外参数：禁用扩展以加速启动
+_DEFAULT_PI_ARGS = ["-ne"]
+
+
+def _output_json_is_valid(output_file: Path) -> bool:
+    """检查 output.json 是否已由 pi 写入且有有效数据。
+
+    当 pi 子进程超时时，prompt 模板要求 pi 将结果写入 output.json 文件，
+    pi 可能已完成写入但未及时退出。此函数检查文件是否包含有效的评分数据。
+    """
+    return _read_output_json_if_valid(output_file) is not None
+
+
+def _read_output_json_if_valid(output_file: Path) -> dict | None:
+    """读取并返回有效的 output.json 数据，无效则返回 None。
+
+    返回解析后的完整 dict（避免调用方重复读取文件）。
+    """
+    if not output_file.exists():
+        return None
+    try:
+        data = json.loads(output_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    # 状态为 ok，且 data 中有实际内容（不只是空 dict）
+    if data.get("status") != "ok":
+        return None
+    inner = data.get("data", {})
+    if not inner or not isinstance(inner, dict):
+        return None
+    # 至少有一个非空值（区分 None/"" 与 0/False）
+    if not any(v is not None and v != "" for v in inner.values()):
+        return None
+    return data
+
+
 class AgentRunner:
     """通过 subprocess 调用 pi 执行 Agent 步骤。
 
@@ -273,7 +309,10 @@ class AgentRunner:
             prompt: 已构建的完整 prompt（模板已替换 + Agent 前缀已拼接）。
             step_stem: 步骤名（用于日志和 output.json）。
             step_dir: 步骤 intermediates 目录。
-            env: 环境变量。
+            env: 环境变量，可包含：
+                - PIPELINE_PI_BINARY: pi 可执行文件路径（默认 "pi"）
+                - PIPELINE_PI_ARGS: 空格分隔的 pi 额外参数（覆盖默认值 -ne）
+                - PIPELINE_STEP_TIMEOUT: 步骤超时秒数
             timeout: subprocess 超时秒数。
         """
         os.makedirs(step_dir, exist_ok=True)
@@ -305,11 +344,19 @@ class AgentRunner:
                     step_timeout,
                 )
 
+        # 解析 pi 额外参数
+        pi_args_str = env.get("PIPELINE_PI_ARGS", "")
+        if pi_args_str:
+            pi_extra_args = pi_args_str.split()
+        else:
+            pi_extra_args = list(_DEFAULT_PI_ARGS)
+
         prompt_size_kb = len(prompt) / 1024
         logger.info(
-            "  [%s] ▶ pi %s --no-session -p @%s (%.1fKB, timeout=%ds)",
+            "  [%s] ▶ pi %s %s --no-session -p @%s (%.1fKB, timeout=%ds)",
             step_stem,
             pi_binary,
+            " ".join(pi_extra_args),
             prompt_file,
             prompt_size_kb,
             step_timeout,
@@ -317,7 +364,7 @@ class AgentRunner:
         proc = None
         try:
             proc = subprocess.Popen(  # noqa: S603 — pi_binary is user-configurable
-                [pi_binary, "--no-session", "-p", f"@{prompt_file}"],
+                [pi_binary, *pi_extra_args, "--no-session", "-p", f"@{prompt_file}"],
                 env=step_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -337,6 +384,20 @@ class AgentRunner:
                 stdout_data, stderr_data = proc.communicate()
             else:
                 stdout_data, stderr_data = "", ""
+
+            # pi 可能已将结果写入 output.json（prompt 模板要求），检查文件是否存在有效数据
+            output_file = step_dir / "output.json"
+            timeout_data = _read_output_json_if_valid(output_file)
+            if timeout_data is not None:
+                logger.info(
+                    "  [%s] ⚠ pi timed out but output.json already written — treating as ok",
+                    step_stem,
+                )
+                return StepResult(
+                    step_name=step_stem,
+                    status="ok",
+                    data=timeout_data.get("data", {}),
+                )
 
             # 检查 stderr 中的已知错误模式，提供更精确的失败原因
             stderr_clean = _strip_ansi(stderr_data) if stderr_data else ""
@@ -410,6 +471,7 @@ class AgentRunner:
             parsed = json.loads(output_text) if output_text else {}
             if not isinstance(parsed, dict):
                 parsed = {"raw_output": output_text}
+        # pi-lens-ignore: bare-exception
         except json.JSONDecodeError:
             parsed = {
                 "step": step_stem,
