@@ -26,7 +26,7 @@ test-one:                                      # 单个测试文件: make test-o
 	PYTHONPATH=src python3 -m pytest tests/$(t) -v
 
 test-e2e:                                      # E2E smoke 测试（需要先 make install）
-	python3 -m pytest tests/e2e/ -v -m e2e
+	python3 -m pytest tests/e2e/ -v -m "e2e and not e2e_slow"
 
 smoke: test-e2e                                # 别名
 
@@ -38,17 +38,14 @@ setup-hooks:                                   # 安装 git hooks（只需执行
 
 # ─── 业务命令 ──────────────────────────────────────────
 
-prototype:
-	python3 -m prototype.tui
-
 index:
-	PYTHONPATH=src python3 -m paper_rag.cli index --pdf-dir $(PDF_DIR)
+	PYTHONPATH=src python3 -m paper_review.cli index --pdf-dir $(PDF_DIR)
 
 search:
-	PYTHONPATH=src python3 -m paper_rag.cli search "$(Q)"
+	PYTHONPATH=src python3 -m paper_review.cli search "$(Q)"
 
 status:
-	PYTHONPATH=src python3 -m paper_rag.cli status
+	PYTHONPATH=src python3 -m paper_review.cli status
 
 clean:
 	rm -rf data/index/*.sqlite data/index/*.index

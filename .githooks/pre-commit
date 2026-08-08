@@ -15,6 +15,6 @@ uv run ruff check --fix --exit-zero .
 git add -u
 
 echo "=== [pre-commit] 单元测试（全量） ==="
-uv run pytest tests/ -q -m "not integration"
+uv run pytest tests/ -q -m "not integration and not e2e_slow"
 
 echo "=== [pre-commit] ✅ 全部通过 ==="

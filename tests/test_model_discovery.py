@@ -61,25 +61,25 @@ def test_model_dir_name_no_slash():
 
 def test_validate_complete_embedding(tmp_path):
     _make_minimal_onnx_model(tmp_path, "embedding")
-    assert _validate_model_dir(tmp_path, "embedding") is True
+    assert _validate_model_dir(tmp_path, "embedding")
 
 
 def test_validate_missing_tokenizer(tmp_path):
     _make_minimal_onnx_model(tmp_path, "embedding")
     (tmp_path / "tokenizer.json").unlink()
-    assert _validate_model_dir(tmp_path, "embedding") is False
+    assert not _validate_model_dir(tmp_path, "embedding")
 
 
 def test_validate_empty_onnx(tmp_path):
     _make_minimal_onnx_model(tmp_path, "embedding")
     (tmp_path / "model.onnx").write_bytes(b"")  # zero-length
-    assert _validate_model_dir(tmp_path, "embedding") is False
+    assert not _validate_model_dir(tmp_path, "embedding")
 
 
 def test_validate_missing_config(tmp_path):
     _make_minimal_onnx_model(tmp_path, "embedding")
     (tmp_path / "config.json").unlink()
-    assert _validate_model_dir(tmp_path, "embedding") is False
+    assert not _validate_model_dir(tmp_path, "embedding")
 
 
 # ── _infer_model_type ──
@@ -411,3 +411,67 @@ def test_pick_or_download_prompts_download_when_no_models(monkeypatch):
     assert any("选择" in msg for msg, _ in prompt_calls) or any(
         "下载" in msg for msg, _ in prompt_calls
     )
+
+
+# ── download_model copy_mode ──
+
+
+def test_download_copy_mode_creates_real_files(tmp_path, monkeypatch):
+    """download_model(copy_mode=True) should copy files, not symlink."""
+    # Simulate HF cache with onnx/ subdirectory layout
+    hf_root = tmp_path / "hf_snapshot"
+    onnx_sub = hf_root / "onnx"
+    _make_minimal_onnx_model(onnx_sub, "reranker")
+    (hf_root / "config.json").write_text('{"architectures":["BertForSequenceClassification"]}')
+    (hf_root / "tokenizer.json").write_text('{"version":"1.0","model":{}}')
+
+    def _mock_snapshot(repo):
+        return str(hf_root)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", _mock_snapshot, raising=False)
+
+    target = tmp_path / "cache" / "BAAI--bge-reranker-v2-m3"
+
+    import paper_review.model_discovery as md
+
+    ok = md.download_model("onnx-community/bge-reranker-v2-m3-ONNX", target, copy_mode=True)
+    assert ok
+
+    # All files must be real files, NOT symlinks
+    for fname in ("model.onnx", "config.json", "tokenizer.json"):
+        p = target / fname
+        assert p.exists(), f"{fname} should exist"
+        assert p.is_file(), f"{fname} should be a regular file"
+        assert not p.is_symlink(), f"{fname} should not be a symlink (copy_mode=True)"
+
+    # Content should match source
+    assert (target / "model.onnx").read_bytes() == (onnx_sub / "model.onnx").read_bytes()
+
+
+def test_download_copy_mode_still_skips_if_exists(tmp_path, monkeypatch):
+    """download_model(copy_mode=True) returns True when model.onnx already present.
+
+    Note: download_model always calls snapshot_download first (HF cache is
+    idempotent), then skips copy/symlink if target model.onnx already exists.
+    """
+    target = tmp_path / "existing"
+    _make_minimal_onnx_model(target, "embedding")
+
+    # Simulate a successful HF download; the function should still return True
+    # and not overwrite existing files.
+    hf_snapshot = tmp_path / "hf_snapshot"
+    _make_minimal_onnx_model(hf_snapshot, "embedding")
+
+    def _mock_snapshot(repo):
+        return str(hf_snapshot)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", _mock_snapshot, raising=False)
+
+    import paper_review.model_discovery as md
+
+    # Capture original file content to verify no overwrite
+    original_content = (target / "model.onnx").read_bytes()
+    ok = md.download_model("some/repo", target, copy_mode=True)
+    assert ok
+    # Verify the original file wasn't touched
+    assert (target / "model.onnx").read_bytes() == original_content

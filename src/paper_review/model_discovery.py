@@ -313,17 +313,18 @@ def get_known_download_options(model_type: str) -> list[dict]:
     ]
 
 
-def download_model(onnx_repo: str, target_dir: str | Path) -> bool:
-    """Download an ONNX model via HuggingFace Hub cache, then symlink to target.
+def download_model(onnx_repo: str, target_dir: str | Path, copy_mode: bool = False) -> bool:
+    """Download an ONNX model via HuggingFace Hub cache.
 
     Downloads to ``~/.cache/huggingface/hub/`` (standard HF cache) first,
-    then creates symlinks from *target_dir* to the cached files.  This avoids
-    duplicate downloads across projects — any other project using
-    ``huggingface_hub`` for the same model reuses the same cache.
+    then either creates symlinks or copies files to *target_dir*.
+    Symlinks (default) avoid duplicate disk usage; copy_mode is used for
+    offline packaging where files must be relocatable.
 
     Args:
         onnx_repo: HuggingFace repo name (e.g. ``onnx-community/bge-small-zh-v1.5-ONNX``).
-        target_dir: Local directory where symlinks to cached files are created.
+        target_dir: Local directory for model files.
+        copy_mode: If True, copy files instead of symlinking (for offline packaging).
 
     Returns:
         True if ``model.onnx`` exists at *target_dir* after download.
@@ -360,15 +361,20 @@ def download_model(onnx_repo: str, target_dir: str | Path) -> bool:
 
     target.mkdir(parents=True, exist_ok=True)
 
-    # Symlink from source_dir (may be snapshot_dir or its onnx/ subdirectory)
+    import shutil
+
+    # Copy or symlink files from source_dir to target
     for f in source_dir.iterdir():
         if not f.is_file():
             continue
         dest = target / f.name
         if not dest.exists():
-            dest.symlink_to(f)
+            if copy_mode:
+                shutil.copy2(f, dest)
+            else:
+                dest.symlink_to(f)
 
-    # Also symlink root-level files (config.json, tokenizer.json) that may
+    # Also handle root-level files (config.json, tokenizer.json) that may
     # live at snapshot_dir level while model files are in onnx/ subdirectory.
     # E.g. bge-reranker-v2-m3 ONNX repo has config.json at root but model.onnx in onnx/.
     if source_dir != snapshot_dir:
@@ -377,6 +383,9 @@ def download_model(onnx_repo: str, target_dir: str | Path) -> bool:
                 continue
             dest = target / f.name
             if not dest.exists():
-                dest.symlink_to(f)
+                if copy_mode:
+                    shutil.copy2(f, dest)
+                else:
+                    dest.symlink_to(f)
 
     return (target / "model.onnx").exists()

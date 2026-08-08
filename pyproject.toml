@@ -21,7 +21,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4", "huggingface-hub>=0.20.0", "openpyxl>=3.1.0"]
+dev = [
+  "pytest>=8.0",
+  "pytest-timeout>=2.0",
+  "ruff>=0.4",
+  "huggingface-hub>=0.20.0",
+  "openpyxl>=3.1.0",
+  "tomli>=2.0",
+]
 excel = ["openpyxl>=3.1.0"]
 
 [project.scripts]
@@ -65,4 +72,5 @@ pythonpath = ["tests"]
 markers = [
   "integration: tests that span multiple components (HTTP, filesystem, FAISS persistence)",
   "e2e: end-to-end tests that run against the installed package (CLI entry point, smoke)",
+  "e2e_slow: slow e2e that require network (model download, full offline pack). Not in pre-commit.",
 ]

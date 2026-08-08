@@ -3,18 +3,18 @@
 # offline_pack.sh — Package paper-review for offline deployment
 #
 # Usage:
-#   bash scripts/offline_pack.sh [--cache-dir DIR] [--output-dir DIR]
+#   bash scripts/offline_pack.sh [--output-dir DIR] [--help]
 #
 # This script:
-#   1. Downloads all pip wheel dependencies from pyproject.toml
-#   2. Downloads embedding & reranker models
-#   3. Copies the project source code
-#   4. Packages everything into a portable tarball
+#   1. Downloads full pip wheel dependency tree (manylinux2014_x86_64)
+#   2. Downloads ONNX models (same defaults as install.sh --yes)
+#   3. Copies project source + scripts/
+#   4. Packages everything into a portable tarball with fixed top-level dir
 #
-# On the target machine (offline), the user:
+# On the target machine (offline):
 #   tar xzf paper-review-offline-*.tar.gz
-#   cd paper-review-offline-*
-#   pip install --no-index --find-links=./offline_packages -e .
+#   cd paper-review-offline/
+#   bash scripts/install.sh --offline
 # ============================================================================
 
 set -euo pipefail
@@ -23,17 +23,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ---- defaults ----
-CACHE_DIR="${CACHE_DIR:-$HOME/.cache/paper-review/models}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/dist/offline}"
 VERBOSE="${VERBOSE:-false}"
 
 # ---- arg parsing ----
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-	--cache-dir)
-		CACHE_DIR="$2"
-		shift 2
-		;;
 	--output-dir)
 		OUTPUT_DIR="$2"
 		shift 2
@@ -43,11 +38,12 @@ while [[ $# -gt 0 ]]; do
 		shift
 		;;
 	--help | -h)
-		sed -n '2,15p' "$0"
+		sed -n '2,16p' "$0"
 		exit 0
 		;;
 	*)
 		echo "Unknown option: $1"
+		echo "Usage: bash scripts/offline_pack.sh [--output-dir DIR]"
 		exit 1
 		;;
 	esac
@@ -56,7 +52,7 @@ done
 QUIET_FLAG=""
 $VERBOSE || QUIET_FLAG="-q"
 
-# ---- detect uv - fallback to plain pip ----
+# ---- detect pip ----
 if command -v uv >/dev/null 2>&1; then
 	PIP_CMD="uv pip"
 	echo "  [detect] uv found → using uv pip"
@@ -72,70 +68,88 @@ TARBALL_NAME="paper-review-offline-${TIMESTAMP}.tar.gz"
 echo "=== paper-review Offline Pack ==="
 echo "  Project:    $PROJECT_DIR"
 echo "  Output:     $OUTPUT_DIR"
-echo "  Cache:      $CACHE_DIR"
 echo ""
 
-# ---- Step 1: download wheels ----
-echo "[1/4] Downloading wheels..."
+# ---- Step 1: download full dependency tree ----
+echo "[1/3] Downloading wheels (full dependency tree)..."
+WHEEL_DIR="$OUTPUT_DIR/offline_packages"
+mkdir -p "$WHEEL_DIR"
+
+# Download full dependency tree.  pip download without --no-deps includes
+# transitive dependencies.  Prefer binary manylinux2014_x86_64 but fall
+# back to source tarballs if no binary available (target machine has gcc).
 $PIP_CMD download \
 	--platform manylinux2014_x86_64 \
-	--only-binary=:all: \
-	--dest "$OUTPUT_DIR/offline_packages" \
+	--dest "$WHEEL_DIR" \
 	$QUIET_FLAG \
-	-e "$PROJECT_DIR" \
-	--no-deps 2>/dev/null || true
+	-e "$PROJECT_DIR" 2>/dev/null || true
 
-$PIP_CMD download \
-	--platform manylinux2014_x86_64 \
-	--only-binary=:all: \
-	--dest "$OUTPUT_DIR/offline_packages" \
-	$QUIET_FLAG \
-	-r /dev/stdin <<<"$(python -c "
-import tomllib
-with open('$PROJECT_DIR/pyproject.toml','rb') as f:
-    deps = tomllib.load(f)['project']['dependencies']
-for d in deps: print(d)
-")"
-
-# If some packages fail binary-only, retry with source builds allowed
+# If some deps failed binary-only (e.g. platform-specific), retry without
+# platform constraint to pull source tarballs.
 echo "  -> Checking for missing packages..."
-python "$SCRIPT_DIR/_check_missing.py" "$OUTPUT_DIR/offline_packages" "$PROJECT_DIR/pyproject.toml" || {
+"$SCRIPT_DIR/_check_missing.py" "$WHEEL_DIR" "$PROJECT_DIR/pyproject.toml" || {
 	echo "  -> Retrying missing packages with source..."
 	$PIP_CMD download \
 		--platform manylinux2014_x86_64 \
-		--dest "$OUTPUT_DIR/offline_packages" \
+		--dest "$WHEEL_DIR" \
 		$QUIET_FLAG \
-		-r /dev/stdin <<<"$(python "$SCRIPT_DIR/_check_missing.py" --list-missing "$OUTPUT_DIR/offline_packages" "$PROJECT_DIR/pyproject.toml")"
+		-r /dev/stdin 2>/dev/null <<<"$("$SCRIPT_DIR/_check_missing.py" --list-missing "$WHEEL_DIR" "$PROJECT_DIR/pyproject.toml")" || true
 }
 
-echo "  Done. $(ls "$OUTPUT_DIR/offline_packages/"*.whl 2>/dev/null | wc -l) wheel files"
+echo "  Done. $(find "$WHEEL_DIR" -name '*.whl' -o -name '*.tar.gz' | wc -l) packages"
 echo ""
 
-# ---- Step 2: download models ----
-echo "[2/4] Downloading models..."
-python "$SCRIPT_DIR/download_models.py" --cache-dir "$CACHE_DIR"
+# ---- Step 2: download ONNX models (same as install.sh --yes defaults) ----
+echo "[2/3] Downloading ONNX models..."
+MODELS_DIR="$OUTPUT_DIR/models"
+mkdir -p "$MODELS_DIR"
+
+python3 -c "
+import sys
+sys.path.insert(0, '$PROJECT_DIR/src')
+from paper_review.model_discovery import download_model
+
+# Same defaults as install.sh --yes: balanced embedding + best reranker
+ok1 = download_model(
+    'onnx-community/bge-base-zh-v1.5-ONNX',
+    '$MODELS_DIR/BAAI--bge-base-zh-v1.5',
+    copy_mode=True,
+)
+ok2 = download_model(
+    'onnx-community/Qwen3-Reranker-0.6B-ONNX',
+    '$MODELS_DIR/Qwen--Qwen3-Reranker-0.6B',
+    copy_mode=True,
+)
+if not ok1 or not ok2:
+    print('ERROR: model download failed', file=sys.stderr)
+    sys.exit(1)
+print('Models downloaded successfully')
+"
 echo "  Done."
 echo ""
 
-# ---- Step 3: copy source + config ----
-echo "[3/4] Copying project source..."
-mkdir -p "$OUTPUT_DIR/src"
-cp -r "$PROJECT_DIR/src" "$OUTPUT_DIR/"
-cp "$PROJECT_DIR/pyproject.toml" "$OUTPUT_DIR/"
-cp "$PROJECT_DIR/config.yaml" "$OUTPUT_DIR/" 2>/dev/null || true
-cp "$PROJECT_DIR/README.md" "$OUTPUT_DIR/" 2>/dev/null || true
-# copy model cache
-cp -r "$CACHE_DIR" "$OUTPUT_DIR/models"
-echo "  Done."
-echo ""
+# ---- Step 3: create tarball ----
+echo "[3/3] Creating tarball..."
+PACK_DIR="$OUTPUT_DIR/paper-review-offline"
+rm -rf "$PACK_DIR"
+mkdir -p "$PACK_DIR"
 
-# ---- Step 4: create tarball ----
-echo "[4/4] Creating tarball..."
+# Copy source tree
+cp -r "$PROJECT_DIR/src" "$PACK_DIR/"
+cp "$PROJECT_DIR/pyproject.toml" "$PACK_DIR/"
+cp "$PROJECT_DIR/config.yaml" "$PACK_DIR/" 2>/dev/null || true
+cp "$PROJECT_DIR/README.md" "$PACK_DIR/" 2>/dev/null || true
+
+# Copy scripts/ (install.sh + helpers for --offline support)
+cp -r "$PROJECT_DIR/scripts" "$PACK_DIR/"
+
+# Move wheels and models into the pack dir
+mv "$WHEEL_DIR" "$PACK_DIR/offline_packages"
+mv "$MODELS_DIR" "$PACK_DIR/models"
+
+# Create tarball
 cd "$OUTPUT_DIR"
-tar czf "../$TARBALL_NAME" \
-	--exclude="__pycache__" \
-	--exclude="*.pyc" \
-	.
+tar czf "../$TARBALL_NAME" "paper-review-offline"
 cd "$PROJECT_DIR"
 echo "  Created: dist/$TARBALL_NAME"
 echo ""
@@ -147,9 +161,6 @@ echo "  Tarball:  dist/$TARBALL_NAME  ($SIZE)"
 echo ""
 echo "Deploy on target machine:"
 echo "  tar xzf $TARBALL_NAME"
-echo "  cd ${TARBALL_NAME%.tar.gz}"
-echo "  # uv recommended (faster); falls back to pip if uv not found"
-echo "  uv pip install --no-index --find-links=./offline_packages -e ."
-echo "  # or: pip install --no-index --find-links=./offline_packages -e ."
-echo "  # Then set config.yaml model_cache_dir to ./models"
+echo "  cd paper-review-offline"
+echo "  bash scripts/install.sh --offline"
 echo ""

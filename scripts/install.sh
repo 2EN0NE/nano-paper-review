@@ -45,6 +45,7 @@ RERANKER_DIR_NAME="BAAI--bge-reranker-v2-m3"
 
 YES_MODE=false
 SKIP_MODELS=false
+OFFLINE_MODE=false
 
 # ---- 颜色 ----
 RED='\033[0;31m'
@@ -68,6 +69,7 @@ while [[ $# -gt 0 ]]; do
 选项:
   --yes          全自动模式：安装全部模型（含 reranker），不询问
   --skip-models  跳过模型下载，仅安装 Python 依赖
+  --offline      离线模式：从 offline_packages/ 安装，无需网络
   --help         显示此帮助
 
 HELP
@@ -81,13 +83,91 @@ HELP
 		SKIP_MODELS=true
 		shift
 		;;
+	--offline)
+		OFFLINE_MODE=true
+		shift
+		;;
 	*)
 		echo "未知选项: $1"
-		echo "用法: ./scripts/install.sh [--yes] [--skip-models] [--help]"
+		echo "用法: ./scripts/install.sh [--yes] [--skip-models] [--offline] [--help]"
 		exit 1
 		;;
 	esac
 done
+
+# ============================================================================
+# 离线模式：独立分支，不经过在线流程
+# ============================================================================
+if $OFFLINE_MODE; then
+	echo ""
+	echo "=========================================="
+	echo "  paper-review 离线安装"
+	echo "=========================================="
+	echo ""
+
+	OFFLINE_PKGS="$REPO_ROOT/offline_packages"
+	OFFLINE_MODELS="$REPO_ROOT/models"
+
+	if [ ! -d "$OFFLINE_PKGS" ]; then
+		err "离线包目录不存在: $OFFLINE_PKGS"
+		echo "  请确保从 paper-review-offline 压缩包根目录解压后运行。"
+		exit 1
+	fi
+
+	# --- 虚拟环境处理 ---
+	if [ -n "${VIRTUAL_ENV:-}" ]; then
+		info "已在虚拟环境中: $VIRTUAL_ENV"
+		python -m pip --version 2>/dev/null || python -m ensurepip --upgrade 2>/dev/null || {
+			err "虚拟环境缺少 pip，请运行: python -m ensurepip --upgrade"
+			exit 1
+		}
+	elif [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
+		info "激活已有虚拟环境: $REPO_ROOT/.venv"
+		source "$REPO_ROOT/.venv/bin/activate"
+	else
+		info "创建虚拟环境: $REPO_ROOT/.venv"
+		python3 -m venv --without-pip "$REPO_ROOT/.venv" 2>/dev/null ||
+			python3 -m venv "$REPO_ROOT/.venv"
+		source "$REPO_ROOT/.venv/bin/activate"
+		# 确保 pip 可用（有些 venv 默认不带 pip）
+		python -m pip --version 2>/dev/null || python -m ensurepip --upgrade 2>/dev/null || {
+			err "无法在虚拟环境中安装 pip，请确保系统已安装 pip"
+			exit 1
+		}
+	fi
+
+	# --- pip 离线安装 ---
+	cd "$REPO_ROOT"
+	info "离线安装 Python 包..."
+	python -m pip install --no-index --find-links="$OFFLINE_PKGS" -e "$REPO_ROOT"
+	ok "Python 包安装完成"
+
+	# --- 拷贝模型 ---
+	if [ -d "$OFFLINE_MODELS" ]; then
+		info "拷贝模型到 $MODEL_CACHE_DIR ..."
+		mkdir -p "$MODEL_CACHE_DIR"
+		cp -r "$OFFLINE_MODELS"/* "$MODEL_CACHE_DIR/"
+		ok "模型拷贝完成"
+	else
+		warn "离线包中未包含模型目录 (models/) — 跳过"
+	fi
+
+	echo ""
+	echo "=========================================="
+	echo "  离线安装完成！"
+	echo "=========================================="
+	echo ""
+	echo "  1. 初始化默认配置"
+	echo "  paper-review init"
+	echo ""
+	echo "  2. 放入参考论文 PDF"
+	echo "  ~/.paper-review/origin/pdf/"
+	echo ""
+	echo "  3. 执行评审"
+	echo "  paper-review review ./待审论文.pdf"
+	echo ""
+	exit 0
+fi
 
 # ============================================================================
 # 0. 环境检查

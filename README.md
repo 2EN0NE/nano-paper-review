@@ -102,17 +102,23 @@ paper-review serve --port 8765           # HTTP API
 
 ### 自定义评审规则
 
-在 `pipeline.yaml` 中声明阶段，在对应目录下放置 `.py`（脚本步骤）或 `.md`（Agent 评审提示词）：
+`paper-review init` 生成的管线目录结构（可编辑定制）：
 
 ```
 pipeline/
 ├── pipeline.yaml              # 编排定义
 ├── pre-review/                # Pre Phase 步骤
+│   ├── 00-convert.py          # 格式归一化
+│   └── 01-auto-index.py       # 自动建索引
 ├── review-pipeline/           # Review Phase 步骤
 │   ├── 01-search.py           # 检索相似文章
-│   ├── 02-novelty.md          # 创新性评审（Agent）
-│   └── 03-synthesis.md        # 综合评审（Agent）
+│   ├── 02-extract-keywords.py # 提取关键词
+│   ├── 03-direct-scoring.md   # 直接维度评审（Agent）
+│   ├── 04-indirect-scoring.md # 间接维度评审（Agent）
+│   └── 05-summarize.py        # 综合汇总
 └── post-review/               # Post Phase 步骤
+    ├── 01-archive-reports.py  # 报告归档
+    └── 02-generate-excel.py   # 生成 Excel
 ```
 
 `.md` 文件中可用模板变量引用前置步骤输出：
@@ -136,7 +142,7 @@ pipeline/
 paper-review review ./dir/ --phase review
 
 # 重跑单个步骤（需已有中间产物）
-paper-review review ./dir/ --step 02-novelty
+paper-review review ./dir/ --step 03-direct-scoring
 
 # 无人值守模式（跳过空索引提醒、首次提示等交互式确认）
 paper-review review ./dir/ --skip-warnings
@@ -289,38 +295,43 @@ export PAPER_REVIEW_CHUNK_SIZE=256
 
 ## 离线部署
 
-目标机器：2C/4G 无 GPU、Debian Linux、Python 3.12+。
+目标机器：2C/4G 无 GPU、无网络、Debian Linux、Python 3.10+。
 
 本项目所有模型推理使用 **ONNX Runtime (CPU)**，无需 PyTorch / CUDA。
-ONNX 文件在开发机上通过 ``export_onnx.py`` 导出（需要 torch，只需执行一次），
+ONNX 文件在开发机上通过 HuggingFace Hub 下载后直接使用，
 生产环境仅安装 ``onnxruntime`` + ``tokenizers``（~30MB 依赖）。
 
 ### 有网机器：打包
 
 ```bash
-# 1. 导出模型为 ONNX + 打包离线依赖
-python scripts/download_models.py --cache-dir ./models_cache
-bash scripts/offline_pack.sh --cache-dir ./models_cache --output-dir ./dist/offline
+# 一键打包：下载依赖树 + ONNX 模型 + 源码
+bash scripts/offline_pack.sh
 
 # 产物: dist/paper-review-offline-<timestamp>.tar.gz
 ```
 
+脚本会自动：
+
+- 下载完整 pip 依赖树（manylinux2014_x86_64 平台，含 transitive dependencies）
+- 下载 ONNX 模型（embedding + reranker）并物理拷贝（非 symlink，确保可移植）
+- 封装为固定顶层目录 `paper-review-offline/` 的 tarball
+
 ### 目标机器：部署
 
 ```bash
-tar xzf paper-review-offline-<timestamp>.tar.gz
-cd paper-review-offline-<timestamp>
+tar xzf paper-review-offline-*.tar.gz
+cd paper-review-offline/
 
-# 安装依赖（有 uv 用 uv，没有则降级为 pip）
-uv pip install --no-index --find-links=./offline_packages -e .
-# 或：pip install --no-index --find-links=./offline_packages -e .
+# 一键安装：创建 venv → pip 离线安装 → 拷贝模型
+bash scripts/install.sh --offline
 
-# 编辑 config.yaml 指向本地模型路径
-# model_cache_dir: ./models
-
+# 后续使用
+paper-review init
 paper-review index --pdf-dir ./data/history
 paper-review review ./papers/pending/
 ```
+
+`install.sh --offline` 会自动完成：虚拟环境创建（如果未激活）、依赖离线安装、模型拷贝到 `~/.cache/paper-review/models/`。无需手动编辑配置。
 
 内存预算：embedding ~100MB + reranker ~1.1GB (fp16) + Python + FAISS ≈ 2-2.5GB，在 4GB 限制内。
 
@@ -350,17 +361,29 @@ nano-paper-review/
 ├── src/paper_review/
 │   ├── cli.py                # CLI 入口（Typer）
 │   ├── orchestrator.py       # 管线执行引擎
+│   ├── pipeline_models.py    # 管线配置模型（Pydantic）
+│   ├── pipeline_steps.py     # 管线步骤执行器
 │   ├── template_engine.py    # 模板变量引擎
 │   ├── server.py             # HTTP API（Flask）
 │   ├── config.py             # 配置加载（Pydantic）
-│   ├── store.py              # SQLite + FAISS 持久化
-│   ├── extractor.py          # PDF 提取（PyMuPDF）
-│   ├── chunker.py            # 分块
-│   ├── indexer.py            # 索引构建
-│   ├── retriever.py          # 检索管道
-│   ├── embedder.py           # ONNX Runtime 嵌入引擎（CPU-only）
-│   ├── reranker.py           # ONNX Runtime 精排（CPU-only）
-│   └── models.py             # Embedding 模型管理层
+│   ├── extractor.py          # PDF/文档提取（PyMuPDF）
+│   ├── logging_config.py     # 日志配置
+│   ├── model_discovery.py    # 模型发现与下载
+│   ├── auto_index.py         # 自动建索引入口
+│   ├── dynamic_pool.py       # 动态并发池
+│   ├── subject_discovery.py  # Subject 发现
+│   ├── progress.py           # 进度渲染
+│   ├── timeout_estimator.py  # 超时估算
+│   ├── search/               # 检索引擎子包
+│   │   ├── store.py          #   SQLite + FAISS 持久化
+│   │   ├── retriever.py      #   检索管道（BM25+Vector+RRF）
+│   │   ├── reranker.py       #   ONNX Cross-Encoder 精排
+│   │   ├── embedder.py       #   ONNX 嵌入引擎（CPU-only）
+│   │   ├── indexer.py        #   索引构建
+│   │   ├── chunker.py        #   分块
+│   │   ├── models.py         #   Embedding 模型管理
+│   │   └── search_types.py   #   搜索数据类型
+│   └── templates/            # 脚手架模板（init 命令来源）
 └── tests/
 ```
 

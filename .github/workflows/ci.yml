@@ -30,8 +30,8 @@ jobs:
       - name: ruff format check
         run: uv run ruff format --check .
 
-      - name: ruff lint check
-        run: uv run ruff check src/
+      - name: ruff lint check (src/ + tests/)
+        run: uv run ruff check src/ tests/
 
   unit-tests:
     name: "单元测试 (py${{ matrix.python-version }})"
@@ -119,7 +119,9 @@ jobs:
         run: |
           uv run paper-review --help
           uv run python -m paper_review --help
-          uv run pytest tests/e2e/ -v -m e2e --junitxml=junit-e2e.xml
+          uv run pytest tests/e2e/ -v \
+            -m "e2e and not e2e_slow" \
+            --junitxml=junit-e2e.xml
 
       - name: Upload e2e test report
         if: always()
@@ -127,3 +129,47 @@ jobs:
         with:
           name: junit-e2e
           path: junit-e2e.xml
+
+  e2e-offline:
+    name: "E2E 离线打包 + 安装"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies (incl. huggingface-hub for model download)
+        run: uv pip install --system -e .[dev]
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: >-
+            hf-models-${{ runner.os }}-${{ hashFiles(
+            'scripts/offline_pack.sh',
+            'src/paper_review/model_discovery.py',
+            'scripts/install.sh'
+            ) }}
+          restore-keys: |
+            hf-models-${{ runner.os }}-
+
+      - name: Run e2e offline full chain
+        run: |
+          uv run pytest tests/e2e/test_offline_install.py -v -m "e2e_slow" \
+            --timeout=1800 --junitxml=junit-e2e-offline.xml
+
+      - name: Upload e2e offline test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-e2e-offline
+          path: junit-e2e-offline.xml
