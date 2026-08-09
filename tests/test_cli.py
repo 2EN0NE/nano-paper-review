@@ -289,9 +289,9 @@ class TestServeCommand:
             mock_app = MagicMock()
             mock_create.return_value = mock_app
 
-            runner.invoke(app, ["serve", "--port", "9999", "--host", "0.0.0.0"])
+            runner.invoke(app, ["serve", "--port", "9999", "--host", "0.0.0.0"])  # noqa: S104
 
-            mock_app.run.assert_called_once_with(host="0.0.0.0", port=9999, debug=False)
+            mock_app.run.assert_called_once_with(host="0.0.0.0", port=9999, debug=False)  # noqa: S104
 
 
 class TestIndexCommand:

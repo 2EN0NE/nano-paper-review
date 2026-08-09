@@ -345,12 +345,6 @@ def test_scan_detects_model_with_root_config(tmp_path):
 
 def test_pick_or_download_skips_default_when_models_exist(monkeypatch):
     """_pick_or_download_model should default to 's' (skip) when local models exist."""
-    import sys
-
-    if sys.version_info < (3, 10):
-        import pytest
-
-        pytest.skip("cli.py uses PEP 604 union syntax, not compatible with Python 3.9")
 
     from pathlib import Path as _Path
 
@@ -383,12 +377,6 @@ def test_pick_or_download_skips_default_when_models_exist(monkeypatch):
 
 def test_pick_or_download_prompts_download_when_no_models(monkeypatch):
     """_pick_or_download_model should show download options when no local models."""
-    import sys
-
-    if sys.version_info < (3, 10):
-        import pytest
-
-        pytest.skip("cli.py uses PEP 604 union syntax, not compatible with Python 3.9")
 
     from pathlib import Path as _Path
 

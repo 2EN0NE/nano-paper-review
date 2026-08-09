@@ -154,8 +154,7 @@ def _make_fake_pi(tmp_path, name: str, stderr_text: str = "", sleep_secs: int = 
     lines.append(f"echo $$ > {pidfile}")
     lines.append(f"exec sleep {sleep_secs}")
     script.write_text("\n".join(lines) + "\n")
-    # pi-lens-ignore: permissive-chmod
-    os.chmod(str(script), 0o755)
+    os.chmod(str(script), 0o755)  # noqa: S103
     return script, pidfile
 
 

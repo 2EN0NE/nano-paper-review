@@ -78,7 +78,6 @@ class TestContentDedup:
     def test_dedup_skips_doc_vector_faiss(self):
         """去重后 paper 可被 BM25 搜索到（元数据+chunks 已存）但不进入向量索引"""
         store = Store(":memory:")
-        content = make_fake_content("图神经网络")
 
         paper1 = make_paper("p1", "gnn_v1.pdf", "图神经网络")
         paper2 = make_paper("p2", "gnn_v2.pdf", "图神经网络")
@@ -126,7 +125,6 @@ class TestContentDedup:
     def test_force_reindex_bypasses_dedup(self):
         """force_reindex=True 时跳过去重检测，正常建立完整索引"""
         store = Store(":memory:")
-        content = make_fake_content("信用评估")
 
         paper1 = make_paper("p1", "credit_v1.pdf", "信用评估")
         chunks1 = chunk_paper(paper1)

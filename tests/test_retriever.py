@@ -99,7 +99,6 @@ class TestRrfFuse:
 
     def test_rrf_fuse_large_k_smoother(self):
         """k 值越大，排名之间的分数差异越小"""
-        a = [("p1", 1.0), ("p2", 0.8)]
         diff_small_k = abs(1.0 / (1 + 0 + 1) - 1.0 / (1 + 1 + 1))
         diff_large_k = abs(1.0 / (100 + 0 + 1) - 1.0 / (100 + 1 + 1))
         assert diff_large_k < diff_small_k

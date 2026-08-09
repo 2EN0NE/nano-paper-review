@@ -109,7 +109,7 @@ class TestExtractPdf:
         import fitz
 
         doc = fitz.open()
-        page = doc.new_page()  # blank page
+        _page = doc.new_page()  # blank page
         pdf_bytes = doc.tobytes()
         doc.close()
 

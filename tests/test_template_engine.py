@@ -240,7 +240,6 @@ class TestMdStepExecution:
 
         # 验证 pi 调用
         assert mock_popen.called
-        pi_calls = [c for c in mock_popen.call_args_list if "pi" in c[0][0][0]]
 
         # 输出路径
         md_step_dir = result.task_dir / "intermediates" / "subject-01" / "02-novelty"
