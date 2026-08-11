@@ -261,6 +261,26 @@ PAPER_REVIEW_DATA_DIR=/custom/data paper-review status
 所有 `config.yaml` 中的路径字段（`index_dir`、`pdf_dir`）留空即自动从 data_dir 推导。
 配置文件中显式设置的路径优先于自动推导。
 
+### 日志
+
+运行时日志由 `logging_config.py` 统一管理，双通道输出：
+
+| 通道 | 位置 | 级别 | 格式 |
+|---|---|---|---|
+| 控制台 | **stderr** | DEBUG | 简短（无时间戳） |
+| 文件 | **`{data_dir}/logs/paper-review.log`** | INFO | 完整（时间戳 + logger 名） |
+
+- **查看日志**：`tail -f .paper-review/logs/paper-review.log`（或按实际 data_dir）
+- **轮转**：每日 0 点轮转，保留最近 14 天（`paper-review.log.2025-01-01` 等）
+- **配置方式**（优先级递增）：
+  1. `{data_dir}/logging.yaml` 或 `./logging.yaml`（自定义格式 / 级别 / 轮转策略）
+  2. 环境变量 `PAPER_REVIEW_LOG_LEVEL`（如 `DEBUG`）、`PAPER_REVIEW_LOG_DIR`（如 `/var/log`）
+  3. CLI 全局选项：`paper-review --log-level DEBUG --log-dir /tmp/logs <命令>`（最高）
+
+所有模块 logger 统一归入 `paper_review.*` 命名空间（如 `paper_review.orchestrator`）。
+索引 / 检索的关键操作（去重、FAISS 指纹等）还会写入 Store 的内存日志 `ops_log`，
+供测试断言使用，**不落盘**。
+
 ## 配置
 
 编辑 `config.yaml`：

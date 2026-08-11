@@ -228,14 +228,27 @@ CI 中也使用 `pip install -e .[dev]` 方式安装，不依赖 `requirements.l
 
 - **全局初始化**：`setup_logging()` 在 CLI 的 `_main_callback` 中调用，所有命令共享。
   `--log-level` 和 `--log-dir` 为全局选项（不是 `review` 子命令专属）。
+- **输出位置**（双通道）：
+  - console → **stderr**（DEBUG，brief 格式无时间戳）
+  - file → **`{data_dir}/logs/paper-review.log`**（INFO，standard 格式带时间戳，
+    TimedRotatingFileHandler 每日轮转保留 14 天）
+  - 注意：CLI 总是把 log_dir 覆盖为 `{data_dir}/logs`（除非用户传 `--log-dir`）；
+    logging.yaml 里的 filename 只是绕过 CLI 直接调用 `setup_logging()`（如测试）时的兜底占位
 - **配置来源**（优先级递增）：
   1. `{data_dir}/logging.yaml` 或 `cwd/logging.yaml`
   2. 环境变量 `PAPER_REVIEW_LOG_LEVEL`、`PAPER_REVIEW_LOG_DIR`
-  3. 默认配置：console (DEBUG) + file (INFO, `{data_dir}/logs/paper-review.log`, 14 天轮转)
-- **模块级 logger**：通过 `get_logger(__name__)` 或 `logging.getLogger(__name__)`
-  获取，统一归入 `paper_review.*` 命名空间。
-- **Store.log()**：写入 `ops_log` 内存列表，不经过 logger 系统。
-  关键操作同时使用 `logger.info/warning` 和 `self.log()`。
+  3. 内置默认：console (DEBUG) + file (INFO, 14 天轮转)
+  4. CLI 显式参数 `--log-level` / `--log-dir`（最高）
+- **logger 命名空间**：通过 `get_logger(__name__)` 或 `logging.getLogger(__name__)`
+  获取，统一归入 `paper_review.*`。logging.yaml 中显式配置：
+  `paper_review` (DEBUG)、`paper_review.orchestrator` (DEBUG)、`paper_review.retriever` (INFO)；
+  root logger 仅 console (WARNING)。
+- **Store.log()**：写入 `ops_log` 内存列表，不经过 logger 系统、不落盘，
+  仅测试断言消费（如 DEDUP、FINGERPRINT MISMATCH）。关键操作同时使用
+  `logger.info/warning` 和 `self.log()`。
+- **管线步骤日志边界**：`.py` 步骤经 `runpy.run_path()` 进程内执行，logger 名不是
+  `paper_review.*`，默认只走 root→stderr（WARNING+），**不会**进 paper-review.log；
+  `.md` Agent 步骤经 subprocess 调用 pi，stdout/stderr 被捕获记入步骤中间产物。
 
 ### 测试运行
 
