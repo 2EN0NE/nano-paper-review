@@ -12,6 +12,7 @@ Subject 发现 → subject_discovery.py
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
@@ -336,7 +337,7 @@ def _run_steps_for_subject(
         # 动态池超时乘数：productive timeout 后自动上调后续 step 的时限
         adjusted_timeout = step_timeout
         if dyn_pool is not None and dyn_pool.timeout_multiplier > 1.0:
-            adjusted_timeout = int(step_timeout * dyn_pool.timeout_multiplier)
+            adjusted_timeout = math.floor(step_timeout * dyn_pool.timeout_multiplier)
 
         with slot_cm:
             step_dir = Path(result_base) / "intermediates" / subject / step.stem
