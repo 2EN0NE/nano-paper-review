@@ -50,7 +50,8 @@ class TestResolveDataDir:
         """fallback 路径自动创建目录（包含中间目录）。"""
         home = tmp_path / "deep" / "home"
         with patch("pathlib.Path.home", return_value=home):
-            result = resolve_data_dir()
+            with patch("pathlib.Path.cwd", return_value=tmp_path / "some-project"):
+                result = resolve_data_dir()
         assert result == home / ".paper-review"
         assert result.exists()
 

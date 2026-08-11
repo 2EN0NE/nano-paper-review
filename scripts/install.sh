@@ -224,6 +224,13 @@ EOF
 	echo "  离线安装完成！"
 	echo "=========================================="
 	echo ""
+	if [ -n "${VIRTUAL_ENV:-}" ]; then
+		echo "  0. 你已在虚拟环境中（${VIRTUAL_ENV}），paper-review 命令可直接使用"
+	else
+		echo "  0. 激活虚拟环境（每个新终端都需要执行一次）"
+		echo "  source $REPO_ROOT/.venv/bin/activate"
+	fi
+	echo ""
 	echo "  1. 初始化默认配置"
 	echo "  paper-review init"
 	echo ""

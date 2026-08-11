@@ -159,7 +159,10 @@ trap 'rm -rf "$TMP_VENV"' EXIT
 	echo "  [ERR] 无法创建临时 venv" >&2
 	exit 1
 }
-"$TMP_VENV/bin/pip" install -q huggingface-hub || {
+# httpx 需 socksio 支持 SOCKS 代理：机器上若设了 ALL_PROXY/HTTPS_PROXY=socks5:// 等，
+# 缺 socksio 会在下载时报 "Using SOCKS proxy, but the 'socksio' package is not installed."
+# （httpx 自动 trust_env 读取代理；huggingface_hub v1.0 起默认 httpx 后端，必踩此坑）
+"$TMP_VENV/bin/pip" install -q huggingface-hub "httpx[socks]" || {
 	echo "  [ERR] 无法安装 huggingface-hub（需网络连接）" >&2
 	exit 1
 }
