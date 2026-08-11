@@ -24,7 +24,9 @@
 
 ```
 1. --data-dir <path>  显式指定（优先级最高）
-2. ./.paper-review/   当前目录存在时自动使用
+2. ./.paper-review/   当前目录下**已初始化**（含 pipelines/，即运行过 init）时自动使用；
+   存在但未初始化的空目录（如仅 logs/ 或 install.sh --offline 只写入的 config.yaml）
+   视为残留，回退用户级
 3. ~/.paper-review/   兜底（自动创建）
 ```
 
@@ -182,6 +184,23 @@ E2E 测试是集成测试的唯一权威标准：
 4. **覆盖关键路径**：必须覆盖 Pre→Review→Post 完整链路、边界情况（空输入、去重、格式不支持）和特性开关（单篇 vs 多篇 Excel）。
 5. **隔离性**：测试间互不依赖，每个测试独立创建 `tmp_path` 隔离。
 6. **默认配置值可运行性**：任何影响外部工具调用（如 pi 子进程参数）的模块级默认常量必须有 E2E 测试。测试必须从源码动态导入常量值（`from module import _CONSTANT`），而非硬编码预期值——当常量被修改时，测试自动适用新值，同时验证新值不会导致运行时错误。见 `tests/e2e/test_pipeline_integration.py::TestDefaultConfigValidity` 示例。
+
+### 进度卡 TUI 渲染测试（ANSI 残影回归）
+
+进度卡（`progress.py`）在 stderr 上做 ANSI 原地重绘，**无法从原始字节流判断残影**——字节流里全是重复的盒子帧，看不出最终屏幕状态。必须重放为屏幕状态再断言：
+
+1. **真实 TTY**：`pty.openpty()` 让 CLI 的 stdout+stderr 接同一 slave fd（模拟真实终端布局，stdout/stderr 同屏互相干扰的场景才暴露）。
+2. **终端模拟器重放**：极简 VT100 模拟器（`tests/e2e/test_progress_tui.py` 内联 `Term` 类）把字节流重放为行缓冲，断言目标永远是**最终屏幕**，不是字节流。
+3. **屏幕级断言**：完整盒子（`^┌─+┐$` / `^└─+┘$`）恰好 1 个、盒高固定 6、盒内无步骤输出混入、stdout 在 `finish()` 后恢复。
+4. **已知坑**：
+   - 勿用 `startswith("┌")` 找盒子——CLI 树形输出（`_build_cli_tree`）的 `└── POST` 会误匹配 `└`；必须用含结尾字符的完整边框特征。
+   - PTY slave 默认 ONLCR（`\n`→`\r\n`），模拟器对 `\r`/`\n` 分别处理。
+5. **回归价值验证**：本组测试抓过真实残影——临时禁用 `progress._mute_stdout()` 后立即失败（屏幕出现 4 处旧盒子顶框残留）。
+
+进度卡显示期间的终端保护规则（`progress.py`）：
+
+- **stderr 日志**：`_mute_console_logging()` 把 root 与 `paper_review` 的 stderr handler 提到 ERROR（logging.yaml 中共享同一 handler 实例，子 logger 一并静音）。
+- **stdout 输出**：`_mute_stdout()` 把 `sys.stdout` 重定向到 devnull——`.py` 步骤经 `runpy` 在主进程内执行，其 `print()` 写 stdout，TTY 模式下会推动终端滚动、把进度盒往下推，固定行数的 ANSI 上移量错位 → 盒子上部残留旧帧。非 TTY 模式不静音。
 
 ### 测试数据
 

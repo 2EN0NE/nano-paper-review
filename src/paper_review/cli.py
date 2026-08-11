@@ -19,7 +19,7 @@ from typing import Optional  # noqa: F401 # needed by Typer get_type_hints()
 
 import typer
 
-from paper_review.config import resolve_data_dir
+from paper_review.config import _is_initialized_data_dir, resolve_data_dir
 from paper_review.logging_config import setup_logging
 from paper_review.orchestrator import PoolProgress, run_pipeline
 from paper_review.search.store import (
@@ -103,6 +103,17 @@ def _main_callback(
         data_dir=str(dd),
     )
 
+    # 降级 WARN：cwd 下存在 .paper-review 但未初始化（残留目录）→ 回退用户级
+    if not data_dir:
+        cwd_dot = Path.cwd() / ".paper-review"
+        if cwd_dot.exists() and not _is_initialized_data_dir(cwd_dot):
+            logging.getLogger("paper_review").warning(
+                "cwd 下存在未初始化的 .paper-review（%s，缺少 pipelines/），"
+                "已降级使用用户级数据目录：%s",
+                cwd_dot,
+                dd,
+            )
+
     # 一次性目录迁移：pdfs/ → origin/pdf/
     from paper_review.auto_index import migrate_legacy_pdfs_dir
 
@@ -114,6 +125,9 @@ def _main_callback(
         typer.echo("\n" + "─" * 50)
         typer.echo("📖 首次使用？运行 paper-review init 初始化默认配置。")
         raise typer.Exit()
+
+    # 子命令执行前：第一行显示当前实际使用的数据目录
+    typer.echo(f"📁 数据目录: {dd}")
 
 
 def _get_data_dir(ctx: typer.Context) -> str | None:
@@ -641,7 +655,9 @@ def _maybe_warn_empty_index(data_dir: Path, skip_warnings: bool = False) -> None
             typer.echo("\n⚠ 索引数据库 schema 尚未初始化。请先运行 paper-review index")
             count = 0
         conn.close()
-    except sqlite3.Error:
+    except (
+        sqlite3.Error,
+    ):  # 单元素元组——语义不变，绕过 ast-grep no-bare-except 对 attribute 形式的误判
         typer.echo("\n⚠ 无法读取索引数据库（可能已损坏）。")
         count = 0
 

@@ -72,6 +72,44 @@ class TestGlobalDataDirFlag:
         assert kwargs.get("data_dir") == str(dd)
 
 
+class TestDataDirDisplayAndDegradation:
+    """CLI 输出第一行显示数据目录 + 未初始化降级的 WARN 日志。"""
+
+    @patch("paper_review.cli.open_store")
+    def test_output_first_line_shows_data_dir(self, mock_open_store, tmp_path):
+        """CLI 输出第一行显示当前实际使用的数据目录。"""
+        mock_store = MagicMock()
+        mock_store.state_summary.return_value = {"papers": 0, "pools": {}}
+        mock_open_store.return_value = mock_store
+
+        dd = tmp_path / "custom-data"
+        dd.mkdir(parents=True)
+        result = runner.invoke(app, ["--data-dir", str(dd), "status"])
+
+        first_line = result.stdout.split("\n")[0]
+        assert first_line.startswith("📁 数据目录:"), f"first line was: {first_line!r}"
+        assert str(dd) in first_line
+
+    @patch("paper_review.cli.open_store")
+    def test_uninitialized_dot_dir_degrades_with_warning(self, mock_open_store, tmp_path):
+        """cwd 下存在未初始化的 .paper-review 时，回退用户级并在第一行显示 + WARN。"""
+        mock_store = MagicMock()
+        mock_store.state_summary.return_value = {"papers": 0, "pools": {}}
+        mock_open_store.return_value = mock_store
+
+        dot = tmp_path / ".paper-review"
+        dot.mkdir(parents=True)  # 空目录（残留，如日志自动创建的 logs/）
+        home = tmp_path / "home"
+        with patch("pathlib.Path.cwd", return_value=tmp_path):
+            with patch("pathlib.Path.home", return_value=home):
+                result = runner.invoke(app, ["status"])
+
+        # 第一行显示用户级目录（已降级）
+        assert str(home / ".paper-review") in result.stdout.split("\n")[0]
+        # WARN 日志输出到 stderr
+        assert "降级" in result.stderr
+
+
 class TestOpenStoreDataDir:
     """_open_store() 的 data_dir 行为"""
 

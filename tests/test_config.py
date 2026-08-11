@@ -28,13 +28,35 @@ class TestResolveDataDir:
         result = resolve_data_dir(str(d))
         assert result == d.resolve()
 
-    def test_dot_paper_review_exists_uses_it(self, tmp_path):
-        """./.paper-review/ 存在时使用它。"""
+    def test_dot_paper_review_initialized_uses_it(self, tmp_path):
+        """./.paper-review/ 存在且已初始化（含 pipelines/）时使用它。"""
         dot = tmp_path / ".paper-review"
-        dot.mkdir(parents=True)
+        (dot / "pipelines" / "standard").mkdir(parents=True)
         with patch("pathlib.Path.cwd", return_value=tmp_path):
             result = resolve_data_dir()
         assert result == dot.resolve()
+
+    def test_dot_paper_review_uninitialized_falls_back(self, tmp_path):
+        """./.paper-review/ 存在但为空目录（如日志自动创建的 logs/）时回退用户级。"""
+        dot = tmp_path / ".paper-review"
+        dot.mkdir(parents=True)
+        home = tmp_path / "home"
+        with patch("pathlib.Path.home", return_value=home):
+            with patch("pathlib.Path.cwd", return_value=tmp_path):
+                result = resolve_data_dir()
+        assert result == (home / ".paper-review").resolve()
+
+    def test_dot_paper_review_config_only_falls_back(self, tmp_path):
+        """./.paper-review/ 仅有 config.yaml（如 install.sh --offline 写入的模型配置）
+        而无 pipelines/ 时不算已初始化，回退用户级，避免遮蔽用户级管线。"""
+        dot = tmp_path / ".paper-review"
+        dot.mkdir(parents=True)
+        (dot / "config.yaml").write_text("embedding_model: x\n", encoding="utf-8")
+        home = tmp_path / "home"
+        with patch("pathlib.Path.home", return_value=home):
+            with patch("pathlib.Path.cwd", return_value=tmp_path):
+                result = resolve_data_dir()
+        assert result == (home / ".paper-review").resolve()
 
     def test_dot_paper_review_not_exists_falls_back(self, tmp_path):
         """./.paper-review/ 不存在时 fallback 到 ~/.paper-review/ 并自动创建。"""
@@ -106,9 +128,9 @@ class TestConfigResolve:
         assert resolved.model_cache_dir == "/custom/cache/models"
 
     def test_resolve_auto_data_dir(self, tmp_path):
-        """data_dir_override 为 None 时自动解析 data_dir。"""
+        """data_dir_override 为 None 时自动解析 data_dir（项目级已初始化）。"""
         dot = tmp_path / ".paper-review"
-        dot.mkdir(parents=True)
+        (dot / "pipelines" / "standard").mkdir(parents=True)
         cfg = Config(index_dir="", pdf_dir="")
         with patch("pathlib.Path.cwd", return_value=tmp_path):
             resolved = cfg.resolve()
@@ -131,11 +153,11 @@ class TestLoadConfigDataDir:
         assert cfg.model_cache_dir == str(Path.home() / ".cache" / "paper-review" / "models")
 
     def test_load_config_no_data_dir_auto(self, tmp_path):
-        """load_config() 无 data_dir 时自动解析。"""
+        """load_config() 无 data_dir 时自动解析（项目级已初始化）。"""
         from paper_review.config import load_config
 
         dot = tmp_path / ".paper-review"
-        dot.mkdir(parents=True)
+        (dot / "pipelines" / "standard").mkdir(parents=True)
         with patch("pathlib.Path.cwd", return_value=tmp_path):
             cfg = load_config(path=_EXPLICIT_NONE_PATH)
         assert cfg.index_dir == str(dot / "index")

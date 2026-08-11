@@ -109,13 +109,31 @@ class Config(BaseModel):
 # ============================================================================
 
 
+def _is_initialized_data_dir(d: Path) -> bool:
+    """数据目录是否已初始化（运行过 paper-review init）。
+
+    判定依据：存在 ``pipelines/`` 管线定义目录——这是 init 生成、review 可用的
+    最小标志。仅含 config.yaml（如 install.sh --offline 写入的模型配置）或
+    仅含 logs/（日志系统自动创建）的目录视为残留/半初始化，不拦截项目级解析，
+    避免用户级配置被 cwd 下恰巧存在的空目录遮蔽（找不到 pipeline 的根因）。
+    """
+    if not d.is_dir():
+        return False
+    return (d / "pipelines").is_dir()
+
+
 def resolve_data_dir(explicit_path: str | None = None) -> Path:
     """解析数据目录路径。
 
     优先级（高→低）：
     1. explicit_path（来自 CLI --data-dir）
-    2. ``./.paper-review/``（存在于当前目录时）
+    2. ``./.paper-review/``（当前目录下**已初始化**的数据目录，见
+       ``_is_initialized_data_dir()``）
     3. ``~/.paper-review/``（自动创建）
+
+    项目级目录必须是 init 产物（含 pipelines/）才拦截；cwd 下存在但未初始化的
+    空目录（如日志自动创建的 logs/、离线安装仅写入的 config.yaml）不视为有效，
+    回退到用户级。
 
     Returns:
         解析后的绝对 Path。
@@ -124,7 +142,7 @@ def resolve_data_dir(explicit_path: str | None = None) -> Path:
         return Path(explicit_path).resolve()
 
     cwd_dot = Path.cwd() / ".paper-review"
-    if cwd_dot.exists():
+    if _is_initialized_data_dir(cwd_dot):
         return cwd_dot
 
     fallback = Path.home() / ".paper-review"
