@@ -8,6 +8,7 @@ Seam 2 (慢, pre-push/CI): 完整 offline_pack.sh → install.sh --offline 链�
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -341,6 +342,15 @@ class TestOfflineFullChain:
 
     def test_full_offline_pack_and_install(self, tmp_path: Path):
         """运行 offline_pack.sh，解压，install --offline，验证 CLI。"""
+        # wheels 按 manylinux x86_64 打包（offline_pack.sh 硬编码平台标签）：
+        # 非 Linux x86_64 上 pip 找不到匹配轮子，必然失败 —— 直接跳过
+        if not sys.platform.startswith("linux") or platform.machine() != "x86_64":
+            pytest.skip("离线打包只支持 Linux x86_64（manylinux wheels）")
+        # wheels 按 cp312 打包；venv 必须用 python3.12 创建，否则 pip 装不上
+        py312 = shutil.which("python3.12")
+        if py312 is None:
+            pytest.skip("需要 python3.12（离线包 wheels 按 cp312 打包）")
+
         project_root = _project_root()
 
         # Step 1: 打包
@@ -351,14 +361,14 @@ class TestOfflineFullChain:
             capture_output=True,
             text=True,
             cwd=project_root,
-            timeout=1200,  # 20 分钟：下载 whell + 模型
+            timeout=1200,  # 20 分钟：下载 wheel + 模型
         )
         assert result.returncode == 0, (
             f"offline_pack.sh 失败:\nSTDERR:\n{result.stderr}\nSTDOUT:\n{result.stdout}"
         )
 
-        # 找到输出 tarball
-        tarballs = list((tmp_path / "dist").glob("paper-review-offline-*.tar.gz"))
+        # 找到输出 tarball（脚本放在 OUTPUT_DIR 的上级，与默认 dist/ 对齐）
+        tarballs = list(output_dir.parent.glob("paper-review-offline-*.tar.gz"))
         assert len(tarballs) == 1, f"期望 1 个 tarball，得到: {tarballs}"
         tarball = tarballs[0]
 
@@ -375,10 +385,12 @@ class TestOfflineFullChain:
         assert (pack_dir / "src").is_dir()
         assert (pack_dir / "pyproject.toml").is_file()
 
-        # Step 3: 离线安装
+        # Step 3: 离线安装（隔离 HOME，避免污染真实 ~/.cache）
+        fake_home = tmp_path / "fake-home"
+        fake_home.mkdir()
         venv_dir = tmp_path / "venv"
         subprocess.run(
-            [sys.executable, "-m", "venv", str(venv_dir)],
+            [py312, "-m", "venv", str(venv_dir)],
             capture_output=True,
             check=True,
         )
@@ -388,7 +400,7 @@ class TestOfflineFullChain:
             capture_output=True,
             text=True,
             cwd=pack_dir,
-            env={**os.environ, "VIRTUAL_ENV": str(venv_dir)},
+            env={**os.environ, "VIRTUAL_ENV": str(venv_dir), "HOME": str(fake_home)},
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -415,16 +427,39 @@ class TestOfflineFullChain:
         assert result.returncode == 0
         assert "index" in result.stdout
 
-        # Step 6: 验证模型已被拷贝到缓存
-        model_cache = Path.home() / ".cache" / "paper-review" / "models"
+        # Step 6: 验证模型已被拷贝到缓存（HOME 隔离后的路径）
+        model_cache = fake_home / ".cache" / "paper-review" / "models"
         assert model_cache.is_dir(), f"模型缓存不存在: {model_cache}"
         model_dirs = [d for d in model_cache.iterdir() if d.is_dir()]
         assert len(model_dirs) >= 2, f"模型缓存应至少包含 2 个模型，实际: {model_dirs}"
 
-        # 验证每个模型目录都有 model.onnx（实体文件，非 symlink）
+        # 验证每个模型目录都有 INT8 权重（model_quantized.onnx 优先，
+        # 名称随仓库而异 → 从源码动态导入候选列表，不硬编码）
+        from paper_review.model_discovery import RUNTIME_MODEL_FILE_NAMES
+
         for d in model_dirs:
-            onnx_file = d / "model.onnx"
-            assert onnx_file.is_file(), f"{d.name} 缺少 model.onnx"
-            assert not onnx_file.is_symlink(), (
-                f"{d.name} model.onnx 是 symlink，copy_mode=True 应产生实体文件以支持跨机器部署"
+            onnx_file = next(
+                (d / name for name in RUNTIME_MODEL_FILE_NAMES if (d / name).is_file()),
+                None,
             )
+            assert onnx_file is not None, f"{d.name} 缺少 ONNX 权重（{RUNTIME_MODEL_FILE_NAMES}）"
+            assert not onnx_file.is_symlink(), (
+                f"{d.name} {onnx_file.name} 是 symlink，copy_mode=True 应产生实体文件以支持跨机器部署"
+            )
+
+        # Step 7: 验证 install.sh 把 models-manifest.json 的模型名写入 config.yaml
+        # （否则运行时按默认模型名查找 → 模型静默失效 —— 本次变更的核心接线）
+        import json
+
+        manifest = json.loads((pack_dir / "models-manifest.json").read_text(encoding="utf-8"))
+        assert "embedding_model" in manifest and "reranker_model" in manifest
+        for cfg_path in (
+            fake_home / ".paper-review" / "config.yaml",
+            pack_dir / ".paper-review" / "config.yaml",
+        ):
+            assert cfg_path.is_file(), f"install.sh 未写入 {cfg_path}"
+            cfg_text = cfg_path.read_text(encoding="utf-8")
+            for key, value in manifest.items():
+                assert f"{key}: {value}" in cfg_text, (
+                    f"{cfg_path} 缺少 {key}: {value}（当前内容:\n{cfg_text}）"
+                )

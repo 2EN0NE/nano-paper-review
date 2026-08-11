@@ -160,12 +160,13 @@ def index(
         raise typer.Exit(1)
     typer.echo(f"索引目录: {source_path} [pool={pool}]")
 
+    # 初始化模型（无 ONNX 时降级确定性哈希）；跟随 --data-dir 的 config.yaml
+    from paper_review.config import load_config
     from paper_review.extractor import count_pages, extract_meta, extract_pdf
     from paper_review.search.indexer import build_index
     from paper_review.search.models import EmbeddingModelManager
 
-    # 初始化模型（无 ONNX 时降级确定性哈希）
-    model = EmbeddingModelManager()
+    model = EmbeddingModelManager(config=load_config(data_dir=_get_data_dir(ctx)))
     model.load()
     if model._embedder is None:
         typer.echo(
@@ -205,7 +206,8 @@ def index(
         )
 
         # 每个 Epoch 打开新的 Store（从 SQLite 加载去重缓存）
-        store = Store(db_path)
+        # 传入 data_dir 感知的 config，确保 init_faiss 维度与模型一致
+        store = Store(db_path, config=load_config(data_dir=_get_data_dir(ctx)))
         store.load_content_hashes_only()
         if not store.load_faiss():
             store.init_faiss()
@@ -265,7 +267,7 @@ def index(
     typer.echo(f"\n索引完成: 本次处理 {success_total} 篇")
     # 最终计数从 SQLite 直接获取
     final_count = None
-    store_final = Store(db_path)
+    store_final = Store(db_path, config=load_config(data_dir=_get_data_dir(ctx)))
     try:
         final_count = store_final.db.execute("SELECT COUNT(*) FROM papers").fetchone()[0]
     finally:
@@ -306,12 +308,16 @@ def search(
 
     # 加载 embedding 模型（与 index 时一致的向量编码，保证 FAISS 向量检索语义对齐）
     # 若 ONNX 模型不可用则退化为哈希降级 + 非阻断警告
+    from paper_review.config import load_config
     from paper_review.search.models import EmbeddingModelManager
+    from paper_review.search.reranker import CrossEncoderReranker
 
     logger = logging.getLogger("paper_review")
+    # 跟随 --data-dir 的 config.yaml（与 store 打开同一数据目录的模型配置）
+    cfg = load_config(data_dir=_get_data_dir(ctx))
     embed_model: EmbeddingModelManager | None = None
     try:
-        mgr = EmbeddingModelManager()
+        mgr = EmbeddingModelManager(config=cfg)
         mgr.load()
         if mgr._embedder is not None:
             embed_model = mgr
@@ -322,11 +328,19 @@ def search(
             e,
         )
 
+    # 加载 reranker（默认取 config.reranker_model；模型缺失时 store.search 自动跳过精排）
+    reranker = CrossEncoderReranker(config=cfg)
+    try:
+        reranker.load()
+    except Exception as e:
+        logger.warning("Failed to load reranker (%s) — reranking disabled.", e)
+
     results = store.search(
         query,
         pool_filter=pool_filter,
         with_rerank=not no_rerank,
         embed_model=embed_model,
+        reranker=reranker,
     )
 
     if not results:
@@ -384,7 +398,7 @@ def serve(
     """启动 HTTP API 服务（Flask）"""
     typer.echo(f"启动 HTTP 服务: http://{host}:{port}")
     store = open_store(data_dir=_get_data_dir(ctx))
-    app = create_app(store)
+    app = create_app(store, data_dir=_get_data_dir(ctx))
     typer.echo(f"索引状态: {store.state_summary()}")
     app.run(host=host, port=port, debug=False)
 
@@ -914,6 +928,7 @@ def _pick_or_download_model(
             ok = download_model(opt["onnx_repo"], target)
             if ok:
                 typer.echo(f"  ✓ 下载完成 → {target}")
+                _wire_model_config(model_type, opt["display_name"], opt.get("dim"))
             else:
                 typer.echo("  ✗ 下载失败")
             return
@@ -948,10 +963,28 @@ def _download_flow(model_type: str, model_cache: Path):
             ok = download_model(opt["onnx_repo"], target)
             if ok:
                 typer.echo(f"  ✓ 下载完成 → {target}")
+                _wire_model_config(model_type, opt["display_name"], opt.get("dim"))
             else:
                 typer.echo("  ✗ 下载失败")
     except ValueError:
         typer.echo("  无效选择")
+
+
+def _wire_model_config(model_type: str, display_name: str, dim: int | None = None):
+    """把选中的模型写入 config.yaml，让运行时真正使用它。"""
+    from paper_review.model_discovery import update_config_models
+
+    try:
+        if model_type == "embedding":
+            update_config_models(embedding_model=display_name, vector_dim=dim)
+        else:
+            update_config_models(reranker_model=display_name)
+        typer.echo(f"  ✓ 已写入 config.yaml: {model_type} = {display_name}")
+    except Exception as e:
+        typer.echo(
+            f"  ⚠ 写入 config.yaml 失败（{e}）——"
+            f"可稍后手动运行 paper-review config 或编辑 config.yaml"
+        )
 
 
 def _link_model(model, model_cache: Path):
@@ -964,17 +997,20 @@ def _link_model(model, model_cache: Path):
 
     if model.path.parent == model_cache or str(model.path).startswith(str(model_cache)):
         typer.echo(f"  ✓ 使用 {model.display_name}")
+        _wire_model_config(model.model_type, model.display_name, model.dim)
         return
 
     expected_path = model_cache / _model_dir_name(model.display_name)
     if expected_path.exists():
         typer.echo(f"  ✓ 使用 {model.display_name}")
+        _wire_model_config(model.model_type, model.display_name, model.dim)
         return
 
     expected_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         expected_path.symlink_to(model.path, target_is_directory=True)
         typer.echo(f"  ✓ 链接 {model.display_name} → {expected_path}")
+        _wire_model_config(model.model_type, model.display_name, model.dim)
     except OSError as e:
         typer.echo(f"  ⚠ 无法创建链接: {e}")
         typer.echo(f"    模型位于: {model.path}")

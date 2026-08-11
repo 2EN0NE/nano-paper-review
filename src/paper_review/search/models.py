@@ -5,8 +5,8 @@ Provides :class:`EmbeddingModelManager` for loading and using the
 bge-small-zh-v1.5 embedding model through ONNX Runtime.  No PyTorch
 or CUDA packages are required at runtime.
 
-The embedding model must be exported to ONNX format first via
-``scripts/export_onnx.py``.  When no ONNX model is available, the manager
+The embedding model must be exported to ONNX or downloaded from a HuggingFace
+ONNX repo (``paper-review config``).  When no ONNX model is available, the manager
 falls back to ``deterministic_hash_vector`` — a seeded hash-based
 pseudo-embedding suitable for development and testing only.
 
@@ -28,12 +28,12 @@ from pathlib import Path
 import numpy as np
 
 from paper_review.config import Config, load_config
+from paper_review.search.search_types import VECTOR_DIM
 
 logger = logging.getLogger(__name__)
 
 # bge-small-zh-v1.5 produces 512-dim vectors
 MODEL_NAME = "BAAI/bge-small-zh-v1.5"
-VECTOR_DIM = 512
 
 
 class EmbeddingModelManager:
@@ -52,12 +52,15 @@ class EmbeddingModelManager:
 
     def __init__(
         self,
-        model_name: str = MODEL_NAME,
+        model_name: str | None = None,
         config: Config | None = None,
     ):
-        self._model_name = model_name
         self._config = config or load_config()
-        self._dim = VECTOR_DIM
+        # 默认模型名优先取 config.embedding_model（config 命令选中的模型才能生效）
+        self._model_name = model_name or self._config.embedding_model or MODEL_NAME
+        # 初始维度取 config.vector_dim（与 init_faiss 默认维度一致）；
+        # ONNX 加载成功后会被真实模型维度覆盖，无模型时哈希降级也保持同维度。
+        self._dim = self._config.vector_dim or VECTOR_DIM
         self._embedder: _OnnxEmbedderWrapper | None = None
 
     # ---- properties ----
@@ -91,7 +94,9 @@ class EmbeddingModelManager:
         model_cache_dir = Path(self._config.model_cache_dir)
         onnx_dir = model_cache_dir / self._model_name.replace("/", "--")
 
-        if (onnx_dir / "model.onnx").exists():
+        from paper_review.model_discovery import find_model_file
+
+        if find_model_file(onnx_dir) is not None:
             from paper_review.search.embedder import OnnxEmbedder
 
             self._embedder = _OnnxEmbedderWrapper(
@@ -108,10 +113,9 @@ class EmbeddingModelManager:
 
         logger.warning(
             "ONNX model not found at %s. "
-            "Run `python scripts/export_onnx.py --model %s` first. "
+            "Run `paper-review config` to download a model first. "
             "Falling back to deterministic hash (dev/test only).",
             onnx_dir,
-            self._model_name,
         )
         return True
 

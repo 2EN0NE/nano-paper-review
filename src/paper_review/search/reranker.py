@@ -31,26 +31,36 @@ RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 RERANK_MAX_SEQ_LEN = 512  # truncation for query + doc pair
 
 
+def _resolve_model_name(config: Config | None, explicit: str | None) -> str:
+    """默认模型名优先取 config.reranker_model，否则用内置常量。"""
+    if explicit:
+        return explicit
+    if config is not None:
+        return config.reranker_model or RERANKER_MODEL_NAME
+    return RERANKER_MODEL_NAME
+
+
 class CrossEncoderReranker:
     """Cross-Encoder 精排封装
 
-    Uses ONNX Runtime (CPU) for inference.  The model must be exported
-    to ONNX format first via ``scripts/export_onnx.py``.
+        Uses ONNX Runtime (CPU) for inference.  The model is either downloaded from a
+    HuggingFace ONNX repo (``paper-review config``) or exported via
+    ``scripts/export_onnx.py`` (dev-only, needs torch).
 
-    When the ONNX model is not available, ``load()`` logs a warning and
-    subsequent ``rerank()`` calls return the candidates in their original
-    order (passthrough — no actual reranking).
+        When the ONNX model is not available, ``load()`` logs a warning and
+        subsequent ``rerank()`` calls return the candidates in their original
+        order (passthrough — no actual reranking).
 
-    Memory (bge-reranker-v2-m3 via ONNX Runtime): ~1.1 GB fp16 equivalent.
+        Memory (bge-reranker-v2-m3 via ONNX Runtime): ~1.1 GB fp16 equivalent.
     """
 
     def __init__(
         self,
-        model_name: str = RERANKER_MODEL_NAME,
+        model_name: str | None = None,
         config: Config | None = None,
     ):
-        self._model_name = model_name
         self._config = config or load_config()
+        self._model_name = _resolve_model_name(self._config, model_name)
         self._reranker: _OnnxRerankerWrapper | None = None
 
     # ---- properties ----
@@ -76,10 +86,12 @@ class CrossEncoderReranker:
 
         from pathlib import Path
 
+        from paper_review.model_discovery import find_model_file
+
         model_cache_dir = Path(self._config.model_cache_dir)
         onnx_dir = model_cache_dir / self._model_name.replace("/", "--")
 
-        if (onnx_dir / "model.onnx").exists():
+        if find_model_file(onnx_dir) is not None:
             self._reranker = _OnnxRerankerWrapper(
                 OnnxReranker(model_dir=str(onnx_dir), max_length=RERANK_MAX_SEQ_LEN),
             )
@@ -88,10 +100,9 @@ class CrossEncoderReranker:
         else:
             logger.warning(
                 "ONNX reranker not found at %s. "
-                "Run `python scripts/export_onnx.py --model %s` first. "
+                "Run `paper-review config` to download a model first. "
                 "Reranking will passthrough (no-op).",
                 onnx_dir,
-                self._model_name,
             )
 
     # ---- reranking ----
@@ -170,14 +181,16 @@ class OnnxReranker:
         import onnxruntime
         from tokenizers import Tokenizer
 
-        onnx_path = self._model_dir / "model.onnx"
-        if not onnx_path.exists():
+        from paper_review.model_discovery import find_model_file
+
+        onnx_path = find_model_file(self._model_dir)
+        if onnx_path is None:
             raise FileNotFoundError(
-                f"ONNX model not found at {onnx_path}. "
-                f"Run `python scripts/export_onnx.py --model {self.model_name}` first."
+                f"ONNX model not found in {self._model_dir}. "
+                f"Run `paper-review config` to download a model first."
             )
 
-        logger.info("Loading ONNX reranker: %s", self._model_dir)
+        logger.info("Loading ONNX reranker: %s", onnx_path)
         self._session = onnxruntime.InferenceSession(
             str(onnx_path),
             providers=["CPUExecutionProvider"],

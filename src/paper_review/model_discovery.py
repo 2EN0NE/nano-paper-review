@@ -1,6 +1,4 @@
 """
-from __future__ import annotations
-
 Model discovery — scan local caches for ready-to-use ONNX models.
 
 Supports discovery inside:
@@ -22,48 +20,51 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # ── Known-good ONNX models (3 tiers) ──
+# 注意：size_hint 一律标注「INT8 单文件」体积 —— 下载只拉取单个量化版本
+# （onnx-community 仓库同时含 fp32/fp16/q4 等 5-8 个变体，整仓下载会是提示的 3-5 倍）。
 _KNOWN_EMBEDDING_MODELS = {
     "BAAI/bge-small-zh-v1.5": {
         "onnx_repo": "onnx-community/bge-small-zh-v1.5-ONNX",
         "dim": 512,
-        "size_hint": "~96 MB",
+        "size_hint": "~25 MB（INT8 单文件）",
         "tier": "small",
-        "description": "轻量中文嵌入（512维），快速省资源",
+        "description": "轻量中文嵌入（512维），快速省资源，Apache 2.0",
     },
     "BAAI/bge-base-zh-v1.5": {
         "onnx_repo": "onnx-community/bge-base-zh-v1.5-ONNX",
         "dim": 768,
-        "size_hint": "~390 MB",
+        "size_hint": "~100 MB（INT8 单文件）",
         "tier": "balanced",
-        "description": "均衡中文嵌入（768维），精度与速度兼顾",
+        "description": "均衡中文嵌入（768维），精度与速度兼顾，Apache 2.0",
     },
     "BAAI/bge-large-zh-v1.5": {
         "onnx_repo": "onnx-community/bge-large-zh-v1.5-ONNX",
         "dim": 1024,
-        "size_hint": "~1.3 GB",
+        "size_hint": "~330 MB（INT8 单文件）",
         "tier": "best",
-        "description": "最强中文嵌入（1024维），效果最佳",
+        "description": "最强中文嵌入（1024维），效果最佳，Apache 2.0",
     },
 }
 
+# 排序即推荐顺序：JINA 优先（用户偏好；INT8 单文件即可用）
 _KNOWN_RERANKER_MODELS = {
-    "BAAI/bge-reranker-v2-m3": {
-        "onnx_repo": "onnx-community/bge-reranker-v2-m3-ONNX",
-        "size_hint": "INT8 ~200MB / FP16 ~1.1GB",
-        "tier": "small",
-        "description": "轻量中文 Cross-Encoder（567M，INT8 量化），CPU 可跑，Apache 2.0",
-    },
     "jinaai/jina-reranker-v3": {
         "onnx_repo": "s-lorin/jina-reranker-v3-onnx",
-        "size_hint": "~600MB (0.6B)",
-        "tier": "balanced",
-        "description": "均衡多语言（0.6B，BEIR 超 4B 模型），CC-BY-NC-4.0",
+        "size_hint": "~600 MB（INT8 单文件，0.6B）",
+        "tier": "best",
+        "description": "多语言 Reranker（0.6B，BEIR 领先），INT8 单文件开箱即用，CC-BY-NC-4.0（非商业）",
     },
     "Qwen/Qwen3-Reranker-0.6B": {
         "onnx_repo": "onnx-community/Qwen3-Reranker-0.6B-ONNX",
-        "size_hint": "INT8 ~573MB (0.6B)",
-        "tier": "best",
-        "description": "最强中文 Reranker（0.6B，32K 上下文，MMTEB-R 最高），Apache 2.0",
+        "size_hint": "~570 MB（INT8 单文件，0.6B）",
+        "tier": "balanced",
+        "description": "中文 Reranker（0.6B，32K 上下文），Apache 2.0",
+    },
+    "BAAI/bge-reranker-v2-m3": {
+        "onnx_repo": "onnx-community/bge-reranker-v2-m3-ONNX",
+        "size_hint": "~570 MB（INT8 单文件）",
+        "tier": "small",
+        "description": "中文 Cross-Encoder（568M），Apache 2.0",
     },
 }
 
@@ -84,20 +85,58 @@ def _model_dir_name(hf_name: str) -> str:
     return hf_name.replace("/", "--")
 
 
-def _required_files(model_type: str) -> list[str]:
-    """Minimum files needed for a complete ONNX model."""
-    base = ["model.onnx", "tokenizer.json", "config.json"]
-    return base
+# ONNX 权重文件名候选（按优先级）：优先 INT8 量化，其次 fp32 等。
+# onnx-community 仓库用 model_quantized.onnx（INT8）；s-lorin 等仓库直接叫 model.onnx。
+RUNTIME_MODEL_FILE_NAMES = [
+    "model_quantized.onnx",
+    "model_int8.onnx",
+    "model.onnx",
+    "model_fp16.onnx",
+    "model_q4.onnx",
+]
+
+# 下载时在仓库内查找权重文件的相对路径候选（按优先级）
+_DOWNLOAD_WEIGHT_CANDIDATES = [
+    "onnx/model_quantized.onnx",
+    "onnx/model_int8.onnx",
+    "model_quantized.onnx",
+    "model_int8.onnx",
+    "model.onnx",
+    "onnx/model.onnx",
+]
+
+# 下载时一并拉取的配套文件（存在才拉）
+_DOWNLOAD_AUX_FILES = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+]
+
+
+def find_model_file(model_dir: str | Path) -> Path | None:
+    """在模型目录中查找可用的 ONNX 权重文件（INT8 优先）。
+
+    onnx-community 仓库的量化文件名为 ``model_quantized.onnx`` 而非
+    ``model.onnx``；运行时统一通过此函数定位，避免加载 fp32 大文件。
+    """
+    d = Path(model_dir)
+    for name in RUNTIME_MODEL_FILE_NAMES:
+        p = d / name
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    return None
 
 
 def _validate_model_dir(path: Path, model_type: str) -> bool:
     """Check that *path* contains all required files for *model_type*."""
-    for fname in _required_files(model_type):
+    for fname in ("tokenizer.json", "config.json"):
         if not (path / fname).exists():
             return False
-    # model.onnx must be non-empty
-    onnx_file = path / "model.onnx"
-    if onnx_file.stat().st_size == 0:
+    if find_model_file(path) is None:
         return False
     return True
 
@@ -123,11 +162,13 @@ def _infer_model_type(config_path: Path) -> str | None:
     return None
 
 
-def _infer_dim(onnx_path: Path) -> int | None:
+def _infer_dim(onnx_path: Path | None) -> int | None:
     """Extract output dimension from ONNX model metadata.
 
     Parses the protobuf header without importing onnxruntime.
     """
+    if onnx_path is None:
+        return None
     try:
         import onnxruntime as ort
     except ImportError:
@@ -199,7 +240,7 @@ def scan_model_cache(cache_dir: str | Path) -> list[DiscoveredModel]:
         # Infer embedding dimension
         dim = None
         if model_type == "embedding":
-            dim = _infer_dim(entry / "model.onnx")
+            dim = _infer_dim(find_model_file(entry))
 
         # Build display name — try to parse from directory name
         dir_name = entry.name
@@ -268,7 +309,7 @@ def scan_huggingface_cache() -> list[DiscoveredModel]:
             display_name = model_dir.name.replace("models--", "").replace("--", "/")
             dim = None
             if model_type == "embedding":
-                dim = _infer_dim(candidate / "model.onnx")
+                dim = _infer_dim(find_model_file(candidate))
 
             results.append(
                 DiscoveredModel(
@@ -314,12 +355,16 @@ def get_known_download_options(model_type: str) -> list[dict]:
 
 
 def download_model(onnx_repo: str, target_dir: str | Path, copy_mode: bool = False) -> bool:
-    """Download an ONNX model via HuggingFace Hub cache.
+    """Download an ONNX model via HuggingFace Hub — 只拉单个量化版本。
 
-    Downloads to ``~/.cache/huggingface/hub/`` (standard HF cache) first,
-    then either creates symlinks or copies files to *target_dir*.
-    Symlinks (default) avoid duplicate disk usage; copy_mode is used for
-    offline packaging where files must be relocatable.
+    之前用 ``snapshot_download`` 会拉下整个仓库（onnx-community 仓库含
+    fp32/fp16/int8/q4/q4f16 等 5-8 个变体，体积是提示的 3-5 倍）。现在改为：
+
+    1. 列仓库文件，按 ``_DOWNLOAD_WEIGHT_CANDIDATES`` 优先级挑选一个权重
+       （优先 INT8 的 ``model_quantized.onnx``）；
+    2. 逐个 ``hf_hub_download`` 下载该权重（含可能的 ``.onnx_data`` 外部数据）
+       与 tokenizer/config 等配套文件，保留原文件名；
+    3. 拷贝或软链到 *target_dir*（copy_mode=True 用于离线打包）。
 
     Args:
         onnx_repo: HuggingFace repo name (e.g. ``onnx-community/bge-small-zh-v1.5-ONNX``).
@@ -327,65 +372,175 @@ def download_model(onnx_repo: str, target_dir: str | Path, copy_mode: bool = Fal
         copy_mode: If True, copy files instead of symlinking (for offline packaging).
 
     Returns:
-        True if ``model.onnx`` exists at *target_dir* after download.
+        True if a usable ONNX weight file exists at *target_dir* after download.
     """
+    import shutil
+
     target = Path(target_dir)
     try:
-        from huggingface_hub import snapshot_download as _snapshot
+        from huggingface_hub import HfApi, hf_hub_download
     except ImportError:
         logger.error("huggingface-hub not installed — cannot download model")
         return False
 
-    # Download to HF cache (no local_dir means files stay in ~/.cache/huggingface/)
+    # 幂等：目标目录已有完整模型（权重 + tokenizer + config）则跳过；
+    # 仅有部分文件（上次下载中断）不短路——_place 会跳过已存在文件，只补缺。
+    _target_onnx = find_model_file(target)
+    if (
+        _target_onnx is not None
+        and (target / "tokenizer.json").exists()
+        and (target / "config.json").exists()
+    ):
+        logger.info("ONNX model already exists at %s — skipping download", target)
+        return True
+
+    # 列出仓库文件（不下载），挑选单个权重 + 配套文件
     try:
-        snapshot_path = _snapshot(onnx_repo)
+        repo_files = set(HfApi().list_repo_files(repo_id=onnx_repo))
+    except Exception as e:
+        logger.error("Failed to list repo files for %s: %s", onnx_repo, e)
+        return False
+
+    weight = next((f for f in _DOWNLOAD_WEIGHT_CANDIDATES if f in repo_files), None)
+    if weight is None:
+        logger.error(
+            "No recognized ONNX weight file in repo %s (files: %s)", onnx_repo, sorted(repo_files)
+        )
+        return False
+
+    target.mkdir(parents=True, exist_ok=True)
+
+    def _place(local_path: str | Path, dest_name: str) -> None:
+        dest = target / dest_name
+        if dest.exists():
+            return
+        src = Path(local_path)
+        if copy_mode:
+            shutil.copy2(src, dest)
+        else:
+            dest.symlink_to(src)
+
+    try:
+        # 权重本体（保留原文件名，外部数据引用不破坏）
+        _place(hf_hub_download(onnx_repo, weight), Path(weight).name)
+        # 外部数据文件（onnx 模型同名的 .onnx_data）
+        data_file = f"{weight}_data"
+        if data_file in repo_files:
+            _place(hf_hub_download(onnx_repo, data_file), Path(data_file).name)
+        # tokenizer / config 等配套文件（存在才拉）
+        for aux in _DOWNLOAD_AUX_FILES:
+            if aux in repo_files:
+                _place(hf_hub_download(onnx_repo, aux), aux)
     except Exception as e:
         logger.error("Download failed for %s: %s", onnx_repo, e)
         return False
 
-    snapshot_dir = Path(snapshot_path)
-    if not snapshot_dir.is_dir():
-        logger.error("Snapshot directory not found after download: %s", snapshot_dir)
-        return False
+    return find_model_file(target) is not None
 
-    # ONNX community repos often place files in onnx/ subdirectory
-    source_dir = snapshot_dir
-    onnx_sub = snapshot_dir / "onnx"
-    if onnx_sub.is_dir() and (onnx_sub / "model.onnx").exists():
-        source_dir = onnx_sub
 
-    # Create symlinks in target_dir → HF cache (idempotent, skips if model.onnx exists)
-    if (target / "model.onnx").exists():
-        logger.info("model.onnx already exists at %s — skipping symlink creation", target)
-        return True
+# ============================================================================
+# 模型选择 → 写入 config.yaml（让选中的模型真正生效）
+# ============================================================================
 
-    target.mkdir(parents=True, exist_ok=True)
 
-    import shutil
+def _config_candidates(data_dir: str | None = None) -> list[Path]:
+    """可能写入的 config.yaml 路径（高→低优先级）。
 
-    # Copy or symlink files from source_dir to target
-    for f in source_dir.iterdir():
-        if not f.is_file():
-            continue
-        dest = target / f.name
-        if not dest.exists():
-            if copy_mode:
-                shutil.copy2(f, dest)
-            else:
-                dest.symlink_to(f)
+    data_dir 显式指定时只考虑该目录（安装/测试场景）；否则按
+    data_dir 解析链 + 项目根目录兜底。
+    """
+    from paper_review.config import resolve_data_dir
 
-    # Also handle root-level files (config.json, tokenizer.json) that may
-    # live at snapshot_dir level while model files are in onnx/ subdirectory.
-    # E.g. bge-reranker-v2-m3 ONNX repo has config.json at root but model.onnx in onnx/.
-    if source_dir != snapshot_dir:
-        for f in snapshot_dir.iterdir():
-            if not f.is_file():
-                continue
-            dest = target / f.name
-            if not dest.exists():
-                if copy_mode:
-                    shutil.copy2(f, dest)
-                else:
-                    dest.symlink_to(f)
+    if data_dir:
+        return [Path(data_dir) / "config.yaml"]
 
-    return (target / "model.onnx").exists()
+    dd = resolve_data_dir()
+    candidates = [dd / "config.yaml"]
+    cwd_dot = Path.cwd() / ".paper-review"
+    if cwd_dot != dd:
+        candidates.append(cwd_dot / "config.yaml")
+    candidates.append(Path.cwd() / "config.yaml")
+    return candidates
+
+
+def update_config_models(
+    embedding_model: str | None = None,
+    reranker_model: str | None = None,
+    vector_dim: int | None = None,
+    data_dir: str | None = None,
+) -> Path | None:
+    """把选中的模型名写入 config.yaml（保留文件其余内容与注释）。
+
+    逐行定位 ``embedding_model:`` / ``reranker_model:`` / ``vector_dim:``
+    （含被注释的行），原位替换为生效值；不存在则追加到文件末尾。
+    这是「下载了模型却没接上运行时」问题的关键一环：之前 config 命令只下载
+    不写配置，运行时仍按默认模型名找目录 → 模型静默失效。
+
+    Returns:
+        写入的 config.yaml 路径；未写入返回 None。
+    """
+    updates = {
+        k: v
+        for k, v in {
+            "embedding_model": embedding_model,
+            "reranker_model": reranker_model,
+            "vector_dim": vector_dim,
+        }.items()
+        if v is not None
+    }
+    if not updates:
+        return None
+
+    target: Path | None = None
+    for cand in _config_candidates(data_dir):
+        if cand.exists():
+            target = cand
+            break
+    if target is None:
+        # 都不存在：写入默认数据目录；data_dir 未显式指定时同时写项目级
+        # （init 默认选项目级，无论用户选哪一级，模型配置都不会被模板默认值顶掉）
+        from paper_review.config import resolve_data_dir
+
+        targets = [resolve_data_dir(data_dir) / "config.yaml"]
+        if data_dir is None:
+            cwd_dot = Path.cwd() / ".paper-review" / "config.yaml"
+            if cwd_dot != targets[0]:
+                targets.append(cwd_dot)
+        for t in targets:
+            _write_model_config_lines(t, updates)
+        logger.info("Updated config models in %s: %s", targets, updates)
+        return targets[0]
+
+    _write_model_config_lines(target, updates)
+    logger.info("Updated config models in %s: %s", target, updates)
+    return target
+
+
+def _write_model_config_lines(target: Path, updates: dict) -> None:
+    """逐行写模型键到 config.yaml（保留注释），找不到的键追加到末尾。"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lines = target.read_text(encoding="utf-8").splitlines(keepends=True) if target.exists() else []
+
+    remaining = dict(updates)
+    # 第一遍：只替换未注释的生效行。若先替换注释行而保留后面的生效行，
+    # 会产生两个同名键，而 YAML 解析（last-wins）会静默保留旧值。
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        for key in list(remaining):
+            if stripped.startswith(f"{key}:"):
+                indent = line[: len(line) - len(stripped)]
+                lines[i] = f"{indent}{key}: {remaining.pop(key)}\n"
+                break
+    # 第二遍：无生效行时，解除注释行并替换（仅当该 key 仍剩余）
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        for key in list(remaining):
+            if stripped.startswith(f"# {key}:"):
+                indent = line[: len(line) - len(stripped)]
+                lines[i] = f"{indent}{key}: {remaining.pop(key)}\n"
+                break
+
+    for key, value in remaining.items():
+        lines.append(f"\n{key}: {value}\n")
+
+    target.write_text("".join(lines), encoding="utf-8")

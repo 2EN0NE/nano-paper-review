@@ -22,6 +22,7 @@ from paper_review.model_discovery import (
     _infer_model_type,
     _model_dir_name,
     _validate_model_dir,
+    find_model_file,
     get_known_download_options,
     scan_huggingface_cache,
     scan_model_cache,
@@ -229,102 +230,316 @@ def test_get_unknown_type():
     assert get_known_download_options("unknown") == []
 
 
+# ── find_model_file ──
+
+
+def test_find_model_file_prefers_int8(tmp_path):
+    """存在 model_quantized.onnx（INT8）时应优先于 model.onnx（fp32）。"""
+    _make_minimal_onnx_model(tmp_path, "embedding")
+    (tmp_path / "model_quantized.onnx").write_bytes(b"\x08\x01INT8" + b"\x00" * 50)
+    f = find_model_file(tmp_path)
+    assert f is not None
+    assert f.name == "model_quantized.onnx"
+
+
+def test_find_model_file_falls_back_to_plain(tmp_path):
+    """只有 model.onnx（如 jina-reranker-v3 仓库）时返回它。"""
+    _make_minimal_onnx_model(tmp_path, "embedding")
+    f = find_model_file(tmp_path)
+    assert f is not None
+    assert f.name == "model.onnx"
+
+
+def test_find_model_file_skips_empty(tmp_path):
+    """空文件不算可用权重。"""
+    _make_minimal_onnx_model(tmp_path, "embedding")
+    (tmp_path / "model_quantized.onnx").write_bytes(b"")
+    f = find_model_file(tmp_path)
+    assert f is not None
+    assert f.name == "model.onnx"
+
+
 # ── download_model ──
 
 
-def test_download_creates_symlinks(tmp_path, monkeypatch):
-    """download_model should create symlinks from target_dir to HF snapshot."""
+def _make_repo_files(repo_dir: Path, files: dict[str, str | bytes]) -> None:
+    """构造模拟的 HF 仓库文件（relpath -> content）。"""
+    for rel, content in files.items():
+        p = repo_dir / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            p.write_bytes(content)
+        else:
+            p.write_text(content)
 
-    # Simulate HF cache
-    hf_snapshot = tmp_path / "hf_snapshot"
-    onnx_sub = hf_snapshot / "onnx"
-    _make_minimal_onnx_model(onnx_sub, "embedding")
 
-    # Mock snapshot_download to return our simulated path
-    def _mock_snapshot(repo, **kwargs):
-        return str(hf_snapshot)
+def _patch_hf(monkeypatch, repo_dir: Path) -> None:
+    """Mock huggingface_hub：list_repo_files + hf_hub_download 指向本地模拟仓库。"""
+    files = {str(p.relative_to(repo_dir)): p for p in repo_dir.rglob("*") if p.is_file()}
 
-    monkeypatch.setattr(
-        "paper_review.model_discovery._snapshot",
-        _mock_snapshot,
-        raising=False,
+    class _FakeHfApi:
+        def list_repo_files(self, repo_id=None, **kwargs):
+            return list(files.keys())
+
+    def _fake_hub_download(repo_id, filename, **kwargs):
+        return str(files[filename])
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _FakeHfApi)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", _fake_hub_download)
+
+
+_COMMON_AUX = {
+    "config.json": json.dumps({"architectures": ["BertModel"]}),
+    "tokenizer.json": '{"version":"1.0","model":{}}',
+}
+
+
+def test_download_only_single_quantization(tmp_path, monkeypatch):
+    """关键行为：整仓含 fp32/fp16/int8 等多个变体时，只下载单个 INT8 版本。"""
+    repo = tmp_path / "repo"
+    _make_repo_files(
+        repo,
+        {
+            **_COMMON_AUX,
+            "onnx/model.onnx": b"\x08\x01fp32" + b"\x00" * 2000,  # 不应被下载
+            "onnx/model_fp16.onnx": b"\x08\x01fp16" + b"\x00" * 1000,  # 不应被下载
+            "onnx/model_quantized.onnx": b"\x08\x01int8" + b"\x00" * 100,  # 应被选中
+            "onnx/model_q4.onnx": b"\x08\x01q4" + b"\x00" * 50,  # 不应被下载
+        },
     )
-    # Also patch the import path used inside download_model
+    _patch_hf(monkeypatch, repo)
+
+    target = tmp_path / "cache" / "BAAI--bge-small-zh-v1.5"
     import paper_review.model_discovery as md
 
-    monkeypatch.setattr(
-        md, "download_model", lambda repo, target_dir: _real_download(repo, target_dir, hf_snapshot)
+    ok = md.download_model("onnx-community/bge-small-zh-v1.5-ONNX", target)
+    assert ok
+
+    # 只有 INT8 变体 + tokenizer/config 落地，其余量化版本一律不下载
+    placed = {p.name for p in target.iterdir()}
+    assert "model_quantized.onnx" in placed
+    assert "model.onnx" not in placed
+    assert "model_fp16.onnx" not in placed
+    assert "model_q4.onnx" not in placed
+    assert "tokenizer.json" in placed
+    assert "config.json" in placed
+    assert (target / "model_quantized.onnx").read_bytes().startswith(b"\x08\x01int8")
+
+
+def test_download_onnx_subdir_layout_symlinks(tmp_path, monkeypatch):
+    """onnx-community 布局：权重在 onnx/ 子目录、config/tokenizer 在根——
+    目标目录应同时拿到（默认 symlink 模式）。"""
+    repo = tmp_path / "repo"
+    _make_repo_files(
+        repo,
+        {
+            **_COMMON_AUX,
+            "onnx/model_quantized.onnx": b"\x08\x01int8" + b"\x00" * 100,
+            "onnx/model_quantized.onnx_data": b"data-bytes",
+        },
     )
-    # Actually, let's just test the symlink logic directly
-
-    target = tmp_path / "my_cache" / "BAAI--bge-small-zh-v1.5"
-    target.mkdir(parents=True, exist_ok=True)
-
-    # Simulate what download_model does internally
-    source_dir = hf_snapshot / "onnx"
-    for f in source_dir.iterdir():
-        if f.is_file():
-            dest = target / f.name
-            if not dest.exists():
-                dest.symlink_to(f)
-
-    # Verify symlinks
-    assert (target / "model.onnx").is_symlink()
-    assert (target / "model.onnx").exists()
-    assert (target / "model.onnx").resolve() == (onnx_sub / "model.onnx")
-    assert (target / "tokenizer.json").is_symlink()
-    assert (target / "config.json").is_symlink()
-
-
-def _real_download(repo, target_dir, hf_snapshot):
-    """Helper for the download test."""
-    target = Path(target_dir)
-    target.mkdir(parents=True, exist_ok=True)
-    source_dir = hf_snapshot / "onnx" if (hf_snapshot / "onnx").is_dir() else hf_snapshot
-    for f in source_dir.iterdir():
-        if f.is_file():
-            dest = target / f.name
-            if not dest.exists():
-                dest.symlink_to(f)
-    return True
-
-
-def test_download_skips_if_exists(tmp_path):
-    """download_model should not re-download if model.onnx already present."""
-    target = tmp_path / "existing"
-    _make_minimal_onnx_model(target, "embedding")
-    # Call should succeed without actually downloading
-    # We verify by checking no exception is raised and model.onnx exists
-    assert (target / "model.onnx").exists()
-
-
-def test_download_symlinks_root_files_too(tmp_path, monkeypatch):
-    """When model.onnx is in onnx/ subdir but config.json is at root,
-    both should be symlinked — this is the bge-reranker-v2-m3 scenario."""
-    # Simulate HF cache layout: config.json at root, model files in onnx/
-    hf_root = tmp_path / "hf_snapshot"
-    onnx_sub = hf_root / "onnx"
-    _make_minimal_onnx_model(onnx_sub, "reranker")
-    (hf_root / "config.json").write_text('{"architectures":["BertForSequenceClassification"]}')
-    (hf_root / "tokenizer.json").write_text('{"version":"1.0","model":{}}')
-
-    # Patch huggingface_hub.snapshot_download — the local alias inside download_model
-    def _mock_snapshot(repo):
-        return str(hf_root)
-
-    monkeypatch.setattr("huggingface_hub.snapshot_download", _mock_snapshot, raising=False)
+    _patch_hf(monkeypatch, repo)
 
     target = tmp_path / "cache" / "BAAI--bge-reranker-v2-m3"
-
     import paper_review.model_discovery as md
 
     ok = md.download_model("onnx-community/bge-reranker-v2-m3-ONNX", target)
     assert ok
 
-    # Both onnx/ files and root-level files should be symlinked
-    assert (target / "model.onnx").is_symlink()
+    assert (target / "model_quantized.onnx").is_symlink()
+    assert (target / "model_quantized.onnx").exists()
+    # 外部数据文件保留原名（改名会破坏 onnx 内部的 location 引用）
+    assert (target / "model_quantized.onnx_data").exists()
     assert (target / "config.json").is_symlink()
     assert (target / "tokenizer.json").is_symlink()
+
+
+def test_download_root_model_fallback(tmp_path, monkeypatch):
+    """仓库只有根级 model.onnx（s-lorin/jina-reranker-v3 布局）时也能下载。"""
+    repo = tmp_path / "repo"
+    _make_repo_files(
+        repo,
+        {**_COMMON_AUX, "model.onnx": b"\x08\x01onnx" + b"\x00" * 100},
+    )
+    _patch_hf(monkeypatch, repo)
+
+    target = tmp_path / "cache" / "jinaai--jina-reranker-v3"
+    import paper_review.model_discovery as md
+
+    ok = md.download_model("s-lorin/jina-reranker-v3-onnx", target)
+    assert ok
+    assert (target / "model.onnx").exists()
+    assert (target / "tokenizer.json").exists()
+
+
+def test_download_skips_if_exists(tmp_path, monkeypatch):
+    """目标目录已有可用权重时不再发起下载（不调用 HfApi）。"""
+    target = tmp_path / "existing"
+    _make_minimal_onnx_model(target, "embedding")
+    (target / "model_quantized.onnx").write_bytes(b"\x08\x01int8" + b"\x00" * 50)
+
+    called = []
+
+    class _FakeHfApi:
+        def list_repo_files(self, repo_id=None, **kwargs):
+            called.append(True)
+            return []
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _FakeHfApi)
+
+    import paper_review.model_discovery as md
+
+    ok = md.download_model("some/repo", target)
+    assert ok
+    assert not called, "已有模型时不应访问网络"
+
+
+def test_download_copy_mode_creates_real_files(tmp_path, monkeypatch):
+    """download_model(copy_mode=True) 应拷贝真实文件（离线打包用），而非 symlink。"""
+    repo = tmp_path / "repo"
+    _make_repo_files(
+        repo,
+        {
+            **_COMMON_AUX,
+            "onnx/model_quantized.onnx": b"\x08\x01int8" + b"\x00" * 100,
+        },
+    )
+    _patch_hf(monkeypatch, repo)
+
+    target = tmp_path / "cache" / "BAAI--bge-small-zh-v1.5"
+    import paper_review.model_discovery as md
+
+    ok = md.download_model("onnx-community/bge-small-zh-v1.5-ONNX", target, copy_mode=True)
+    assert ok
+
+    for fname in ("model_quantized.onnx", "config.json", "tokenizer.json"):
+        p = target / fname
+        assert p.exists(), f"{fname} should exist"
+        assert p.is_file() and not p.is_symlink(), f"{fname} should be a regular file"
+
+
+def test_download_copy_mode_still_skips_if_exists(tmp_path, monkeypatch):
+    """目标已存在时 copy_mode 也不重复下载、不覆盖。"""
+    target = tmp_path / "existing"
+    _make_minimal_onnx_model(target, "embedding")
+    original_content = (target / "model.onnx").read_bytes()
+
+    class _FakeHfApi:
+        def list_repo_files(self, repo_id=None, **kwargs):
+            raise AssertionError("should not be called")
+
+    monkeypatch.setattr("huggingface_hub.HfApi", _FakeHfApi)
+
+    import paper_review.model_discovery as md
+
+    ok = md.download_model("some/repo", target, copy_mode=True)
+    assert ok
+    assert (target / "model.onnx").read_bytes() == original_content
+
+
+def test_download_no_recognized_weight(tmp_path, monkeypatch):
+    """仓库没有任何候选权重文件时返回 False。"""
+    repo = tmp_path / "repo"
+    _make_repo_files(repo, {"README.md": "nothing here"})
+    _patch_hf(monkeypatch, repo)
+
+    import paper_review.model_discovery as md
+
+    assert not md.download_model("some/repo", tmp_path / "cache" / "x")
+
+
+# ── update_config_models（模型选择 → 写入 config.yaml） ──
+
+
+def test_update_config_models_preserves_comments(tmp_path, monkeypatch):
+    """逐行替换模型键，文件其余内容（注释）保持不变。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "# paper-review 配置\n"
+        "chunk_size: 512\n"
+        "# ── 模型 ──\n"
+        'embedding_model: "BAAI/bge-small-zh-v1.5"\n'
+        'reranker_model: "BAAI/bge-reranker-v2-m3"\n'
+        "vector_dim: 512\n"
+    )
+
+    from paper_review.model_discovery import update_config_models
+
+    written = update_config_models(
+        embedding_model="jinaai/jina-reranker-v3",
+        reranker_model="jinaai/jina-reranker-v3",
+        vector_dim=768,
+        data_dir=str(tmp_path),
+    )
+    assert written == cfg
+
+    text = cfg.read_text()
+    assert "chunk_size: 512" in text
+    assert "# paper-review 配置" in text
+    assert "embedding_model: jinaai/jina-reranker-v3" in text
+    assert "reranker_model: jinaai/jina-reranker-v3" in text
+    assert "vector_dim: 768" in text
+
+
+def test_update_config_models_uncomments_and_appends(tmp_path):
+    """被注释的键应被反注释；不存在的键追加到末尾。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "# paper-review 配置\n# embedding_model: BAAI/bge-small-zh-v1.5\nchunk_size: 256\n"
+    )
+
+    from paper_review.model_discovery import update_config_models
+
+    update_config_models(
+        embedding_model="BAAI/bge-base-zh-v1.5",
+        vector_dim=768,
+        data_dir=str(tmp_path),
+    )
+
+    text = cfg.read_text()
+    assert "embedding_model: BAAI/bge-base-zh-v1.5" in text
+    assert "# embedding_model" not in text
+    assert "vector_dim: 768" in text
+    assert "chunk_size: 256" in text
+
+
+def test_update_config_models_prefers_active_line_over_commented(tmp_path):
+    """注释行在生效行之前时，应替换生效行而非注释行——否则产生重复键，
+    YAML 解析（last-wins）会静默保留旧值，更新失效。"""
+    import yaml
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        '# embedding_model: old-commented\nembedding_model: "active-value"\nchunk_size: 512\n'
+    )
+
+    from paper_review.model_discovery import update_config_models
+
+    update_config_models(
+        embedding_model="new-value",
+        data_dir=str(tmp_path),
+    )
+
+    text = cfg.read_text()
+    # 注释行保持注释（历史参考），生效行被更新
+    assert "# embedding_model: old-commented" in text
+    assert "embedding_model: new-value" in text
+    # 关键：YAML 解析后生效的是新值（无重复键，last-wins 不再吞掉更新）
+    loaded = yaml.safe_load(text)
+    assert loaded["embedding_model"] == "new-value"
+    assert loaded["chunk_size"] == 512
+
+
+def test_update_config_models_creates_when_missing(tmp_path):
+    """没有任何 config.yaml 时在 data_dir 下新建。"""
+    from paper_review.model_discovery import update_config_models
+
+    target = update_config_models(
+        reranker_model="jinaai/jina-reranker-v3", data_dir=str(tmp_path / "dd")
+    )
+    assert target is not None
+    assert target.exists()
+    assert "reranker_model: jinaai/jina-reranker-v3" in target.read_text()
 
 
 def test_scan_detects_model_with_root_config(tmp_path):
@@ -399,67 +614,3 @@ def test_pick_or_download_prompts_download_when_no_models(monkeypatch):
     assert any("选择" in msg for msg, _ in prompt_calls) or any(
         "下载" in msg for msg, _ in prompt_calls
     )
-
-
-# ── download_model copy_mode ──
-
-
-def test_download_copy_mode_creates_real_files(tmp_path, monkeypatch):
-    """download_model(copy_mode=True) should copy files, not symlink."""
-    # Simulate HF cache with onnx/ subdirectory layout
-    hf_root = tmp_path / "hf_snapshot"
-    onnx_sub = hf_root / "onnx"
-    _make_minimal_onnx_model(onnx_sub, "reranker")
-    (hf_root / "config.json").write_text('{"architectures":["BertForSequenceClassification"]}')
-    (hf_root / "tokenizer.json").write_text('{"version":"1.0","model":{}}')
-
-    def _mock_snapshot(repo):
-        return str(hf_root)
-
-    monkeypatch.setattr("huggingface_hub.snapshot_download", _mock_snapshot, raising=False)
-
-    target = tmp_path / "cache" / "BAAI--bge-reranker-v2-m3"
-
-    import paper_review.model_discovery as md
-
-    ok = md.download_model("onnx-community/bge-reranker-v2-m3-ONNX", target, copy_mode=True)
-    assert ok
-
-    # All files must be real files, NOT symlinks
-    for fname in ("model.onnx", "config.json", "tokenizer.json"):
-        p = target / fname
-        assert p.exists(), f"{fname} should exist"
-        assert p.is_file(), f"{fname} should be a regular file"
-        assert not p.is_symlink(), f"{fname} should not be a symlink (copy_mode=True)"
-
-    # Content should match source
-    assert (target / "model.onnx").read_bytes() == (onnx_sub / "model.onnx").read_bytes()
-
-
-def test_download_copy_mode_still_skips_if_exists(tmp_path, monkeypatch):
-    """download_model(copy_mode=True) returns True when model.onnx already present.
-
-    Note: download_model always calls snapshot_download first (HF cache is
-    idempotent), then skips copy/symlink if target model.onnx already exists.
-    """
-    target = tmp_path / "existing"
-    _make_minimal_onnx_model(target, "embedding")
-
-    # Simulate a successful HF download; the function should still return True
-    # and not overwrite existing files.
-    hf_snapshot = tmp_path / "hf_snapshot"
-    _make_minimal_onnx_model(hf_snapshot, "embedding")
-
-    def _mock_snapshot(repo):
-        return str(hf_snapshot)
-
-    monkeypatch.setattr("huggingface_hub.snapshot_download", _mock_snapshot, raising=False)
-
-    import paper_review.model_discovery as md
-
-    # Capture original file content to verify no overwrite
-    original_content = (target / "model.onnx").read_bytes()
-    ok = md.download_model("some/repo", target, copy_mode=True)
-    assert ok
-    # Verify the original file wasn't touched
-    assert (target / "model.onnx").read_bytes() == original_content

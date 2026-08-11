@@ -27,6 +27,12 @@ final_top_n: 5 # 最终返回结果数
 rrf_k: 60 # 倒数排序融合（RRF）常数
 
 # ── 模型 ──
+# 模型文件按目录名存储于 model_cache_dir 下
+# （BAAI/bge-small-zh-v1.5 → 目录名 BAAI--bge-small-zh-v1.5）。
+# 选中的模型由 `paper-review config` / install.sh 自动写入（会覆盖下面两个值）。
+# reranker 可选：jinaai/jina-reranker-v3（INT8 ~600MB，CC-BY-NC 非商业）、
+#   Qwen/Qwen3-Reranker-0.6B（Apache 2.0）、BAAI/bge-reranker-v2-m3（Apache 2.0，默认）
+# 注意：下载只拉取单个 INT8 量化版本（onnx-community 仓库含多个变体，整仓下载会是提示的 3-5 倍）
 embedding_model: "BAAI/bge-small-zh-v1.5"
 reranker_model: "BAAI/bge-reranker-v2-m3"
 vector_dim: 512

@@ -26,6 +26,7 @@ from paper_review.model_discovery import (
     get_known_download_options,
     scan_huggingface_cache,
     scan_model_cache,
+    update_config_models,
 )
 
 MODEL_CACHE = Path.home() / ".cache" / "paper-review" / "models"
@@ -126,7 +127,7 @@ def main():
         else:
             picked = _pick_tiered(options, "embedding")
         if picked:
-            _do_download(picked, MODEL_CACHE)
+            _do_download(picked, MODEL_CACHE, "embedding")
 
     # ── Reranker ──
     if local_rank:
@@ -142,24 +143,45 @@ def main():
         else:
             picked = _pick_tiered(options, "reranker")
         if picked:
-            _do_download(picked, MODEL_CACHE)
+            _do_download(picked, MODEL_CACHE, "reranker")
 
     print()
 
 
-def _do_download(model_info: dict, cache_dir: Path):
+def _do_download(model_info: dict, cache_dir: Path, model_type: str):
     """Download a model and report result."""
     target = cache_dir / _model_dir_name(model_info["display_name"])
-    if (target / "model.onnx").exists():
+    from paper_review.model_discovery import find_model_file
+
+    if find_model_file(target) is not None:
         print(f"  ✓ 已存在: {target}")
+        _wire_config(model_info, model_type)
         return
 
     print(f"  正在下载 {model_info['display_name']} ({model_info['size_hint']})...")
     ok = download_model(model_info["onnx_repo"], target)
     if ok:
         print(f"  ✓ 下载完成 → {target}")
+        _wire_config(model_info, model_type)
     else:
         print("  ✗ 下载失败。可稍后手动运行: paper-review config")
+
+
+def _wire_config(model_info: dict, model_type: str):
+    """把选中的模型写入 config.yaml（否则运行时仍按默认模型名查找，模型会静默失效）。"""
+    try:
+        if model_type == "embedding":
+            update_config_models(
+                embedding_model=model_info["display_name"],
+                vector_dim=model_info["dim"],
+            )
+        else:
+            update_config_models(reranker_model=model_info["display_name"])
+        print(f"  ✓ 已写入 config.yaml: {model_type} = {model_info['display_name']}")
+    except Exception as e:
+        print(
+            f"  ⚠ 写入 config.yaml 失败（{e}），可稍后手动运行 paper-review config 或编辑 config.yaml"
+        )
 
 
 if __name__ == "__main__":

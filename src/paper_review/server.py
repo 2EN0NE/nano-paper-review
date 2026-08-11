@@ -20,13 +20,32 @@ from paper_review.search.store import Store
 logger = logging.getLogger(__name__)
 
 
-def create_app(store: Store) -> Flask:
+def create_app(store: Store, data_dir: str | None = None) -> Flask:
     """创建并配置 Flask 应用
 
     Args:
         store: 共享的 Store 实例（所有请求复用）
+        data_dir: 显式数据目录（CLI --data-dir）；模型加载跟随其 config.yaml
     """
     app = Flask(__name__)
+
+    # 懒加载模型：构造成本极低（只读 config），load() 仅在模型文件存在时
+    # 才真正加载 ONNX；模型缺失时 store.search 自动降级（跳过精排/哈希向量）。
+    from paper_review.config import load_config
+    from paper_review.search.models import EmbeddingModelManager
+    from paper_review.search.reranker import CrossEncoderReranker
+
+    cfg = load_config(data_dir=data_dir)
+    embed_model = EmbeddingModelManager(config=cfg)
+    reranker = CrossEncoderReranker(config=cfg)
+    try:
+        embed_model.load()
+    except Exception as exc:
+        logger.warning("embedding model unavailable (%s) — hash fallback", exc)
+    try:
+        reranker.load()
+    except Exception as exc:
+        logger.warning("reranker unavailable (%s) — rerank disabled", exc)
 
     # ========================================================================
     # 健康检查
@@ -96,6 +115,8 @@ def create_app(store: Store) -> Flask:
                     pool_filter=pool_filter,
                     with_rerank=with_rerank,
                     limit=limit,
+                    embed_model=embed_model,
+                    reranker=reranker,
                 )
         except Exception as exc:
             logger.exception("Internal search error")

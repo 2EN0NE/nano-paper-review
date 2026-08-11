@@ -114,32 +114,69 @@ if $OFFLINE_MODE; then
 		exit 1
 	fi
 
+	# --- 找一个合适的 Python 创建 venv（优先 3.12，与 wheels 的 cp312 标签一致） ---
+	PICKED_PY=""
+	for candidate in "python3.12" "python3.11" "python3.10" "python3"; do
+		if command -v "$candidate" >/dev/null 2>&1; then
+			ver="$("$candidate" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")"
+			major="${ver%%.*}"
+			minor="${ver##*.}"
+			if [[ "$major" -ge 3 && "$minor" -ge 10 ]]; then
+				PICKED_PY="$candidate"
+				break
+			fi
+		fi
+	done
+	if [ -z "$PICKED_PY" ]; then
+		err "未找到 Python >= 3.10（需要 >= 3.10，建议 3.12）"
+		exit 1
+	fi
+	info "使用 $PICKED_PY 创建虚拟环境"
+
 	# --- 虚拟环境处理 ---
+	# 统一用显式的解释器路径（PY_PY），避免 VIRTUAL_ENV 已设置但未激活时
+	# 裸 `python` 指向系统解释器（如 macOS 自带 python3.9 无 pip）导致误判。
+	PY_PY=""
 	if [ -n "${VIRTUAL_ENV:-}" ]; then
 		info "已在虚拟环境中: $VIRTUAL_ENV"
-		python -m pip --version 2>/dev/null || python -m ensurepip --upgrade 2>/dev/null || {
-			err "虚拟环境缺少 pip，请运行: python -m ensurepip --upgrade"
-			exit 1
-		}
+		if [ -x "$VIRTUAL_ENV/bin/python" ]; then
+			PY_PY="$VIRTUAL_ENV/bin/python"
+		else
+			PY_PY="python"
+		fi
 	elif [ -f "$REPO_ROOT/.venv/bin/activate" ]; then
 		info "激活已有虚拟环境: $REPO_ROOT/.venv"
 		source "$REPO_ROOT/.venv/bin/activate"
+		PY_PY="$REPO_ROOT/.venv/bin/python"
 	else
 		info "创建虚拟环境: $REPO_ROOT/.venv"
-		python3 -m venv --without-pip "$REPO_ROOT/.venv" 2>/dev/null ||
-			python3 -m venv "$REPO_ROOT/.venv"
+		"$PICKED_PY" -m venv "$REPO_ROOT/.venv"
 		source "$REPO_ROOT/.venv/bin/activate"
-		# 确保 pip 可用（有些 venv 默认不带 pip）
-		python -m pip --version 2>/dev/null || python -m ensurepip --upgrade 2>/dev/null || {
-			err "无法在虚拟环境中安装 pip，请确保系统已安装 pip"
-			exit 1
-		}
+		PY_PY="$REPO_ROOT/.venv/bin/python"
 	fi
+
+	# 确保 pip 可用（有些 venv 默认不带 pip）
+	"$PY_PY" -m pip --version 2>/dev/null || "$PY_PY" -m ensurepip --upgrade --default-pip 2>/dev/null || {
+		err "虚拟环境缺少 pip（$PY_PY），请运行: $PY_PY -m ensurepip --upgrade"
+		exit 1
+	}
+
+	# --- Python 版本检查（wheels 是按 cp312 打的；版本不一致给出明确提示） ---
+	VENV_PY_VER="$("$PY_PY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+	if [ "$VENV_PY_VER" != "3.12" ]; then
+		warn "当前 Python 版本是 ${VENV_PY_VER}，而离线包 wheels 按 cp312（Python 3.12）打包"
+		warn "若版本不一致，pip 安装可能失败；建议目标机使用 Python 3.12"
+	fi
+
+	# --- 用包内 pip 轮子升级旧 pip（如 macOS 系统 python3.9 自带 pip21 无法离线编辑安装） ---
+	info "升级 pip（从离线包）..."
+	"$PY_PY" -m pip install --no-index --find-links="$OFFLINE_PKGS" --upgrade pip 2>/dev/null ||
+		warn "离线包中没有 pip 轮子，跳过 pip 升级（若安装失败请检查 pip 版本）"
 
 	# --- pip 离线安装 ---
 	cd "$REPO_ROOT"
 	info "离线安装 Python 包..."
-	python -m pip install --no-index --find-links="$OFFLINE_PKGS" -e "$REPO_ROOT"
+	"$PY_PY" -m pip install --no-index --find-links="$OFFLINE_PKGS" -e "$REPO_ROOT"
 	ok "Python 包安装完成"
 
 	# --- 拷贝模型 ---
@@ -148,6 +185,36 @@ if $OFFLINE_MODE; then
 		mkdir -p "$MODEL_CACHE_DIR"
 		cp -r "$OFFLINE_MODELS"/* "$MODEL_CACHE_DIR/"
 		ok "模型拷贝完成"
+
+		# --- 写入 config.yaml：让模型名与包内一致（否则运行时按默认名找不到模型） ---
+		# 复用 model_discovery.update_config_models（AGENTS.md：模型发现逻辑统一在该模块，
+		# 供 config 和 install.sh 共用），避免行级 YAML 编辑逻辑在脚本内重复实现导致漂移。
+		if [ -f "$REPO_ROOT/models-manifest.json" ]; then
+			info "写入 config.yaml（模型名与离线包对齐）..."
+			for dd in "$REPO_ROOT/.paper-review" "$HOME/.paper-review"; do
+				mkdir -p "$dd"
+				if "$PY_PY" - "$REPO_ROOT/models-manifest.json" "$dd" <<'EOF'; then
+import json, sys
+from pathlib import Path
+from paper_review.model_discovery import update_config_models
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+# 无条件对齐包内模型：离线包只含 manifest 里的两个模型，
+# 保留其他模型名会导致运行时找不到模型
+update_config_models(
+    embedding_model=manifest.get("embedding_model"),
+    reranker_model=manifest.get("reranker_model"),
+    vector_dim=manifest.get("vector_dim"),
+    data_dir=sys.argv[2],
+)
+EOF
+					echo "  ✓ $dd/config.yaml"
+				else
+					warn "写入 config.yaml 失败（$dd）— 请手动设置 embedding_model/reranker_model"
+				fi
+			done
+		else
+			warn "未找到 models-manifest.json — 跳过 config.yaml 写入（请手动设置 embedding_model/reranker_model）"
+		fi
 	else
 		warn "离线包中未包含模型目录 (models/) — 跳过"
 	fi

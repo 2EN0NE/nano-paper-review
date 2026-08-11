@@ -23,6 +23,7 @@ from paper_review.search.store import (
     FINAL_TOP_N,
     RECALL_K,
     RRF_K,
+    VECTOR_DIM,
     SearchResult,
     Store,
     deterministic_hash_vector,
@@ -118,9 +119,30 @@ def hybrid_search(
 
     # ---- 2. FAISS 文档级向量检索 ----
     if embed_model is not None:
-        query_vec = embed_model.encode([query])[0].tolist()
+        if (
+            store._faiss_papers is not None
+            and store._faiss_papers.ntotal > 0
+            and getattr(embed_model, "dim", None) not in (None, store._faiss_dim)
+        ):
+            # 模型维度与索引维度不一致（如更换了 embedding 模型后未重建索引）：
+            # 回退哈希向量 + 明确警告（与 store.search 语义对齐）。
+            logger.warning(
+                "embedding model dim=%s 与 FAISS 索引 dim=%s 不一致——"
+                "本次查询退化为哈希向量；建议删除 {data_dir}/index 重建或运行 rebuild_doc_vectors",
+                embed_model.dim,
+                store._faiss_dim,
+            )
+            query_vec = deterministic_hash_vector(query, dim=store._faiss_dim)
+        else:
+            query_vec = embed_model.encode([query])[0].tolist()
     else:
-        query_vec = deterministic_hash_vector(query)
+        # 使用正确的维度（匹配 FAISS / doc_vectors）；无索引时跟随 config.vector_dim
+        dim = (
+            store._faiss_dim
+            if store._faiss_papers is not None
+            else (store.config.vector_dim or VECTOR_DIM)
+        )
+        query_vec = deterministic_hash_vector(query, dim=dim)
 
     vec_results = store._vector_search(query_vec, top_k=recall_k)
 

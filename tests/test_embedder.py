@@ -93,7 +93,7 @@ class TestOnnxEmbedderLoad:
         """缺少 model.onnx 抛 FileNotFoundError."""
         os.unlink(model_dir / "model.onnx")
         embedder = OnnxEmbedder(model_dir=model_dir, max_length=512)
-        with pytest.raises(FileNotFoundError, match="model.onnx"):
+        with pytest.raises(FileNotFoundError, match="ONNX model not found"):
             embedder.load()
 
     def test_load_missing_tokenizer_raises(self, model_dir, mock_onnx_session, mock_tokenizer):

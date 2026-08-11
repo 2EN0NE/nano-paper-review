@@ -11,7 +11,7 @@ Usage::
     embedder.load()
     vecs = embedder.encode(["text1", "text2"])   # (2, 512) float32, L2-normalized
 
-Model files needed (produced by ``scripts/export_onnx.py``)::
+Model files needed (produced by ``scripts/export_onnx.py`` or downloaded from HuggingFace ONNX repos)::
 
     {model_dir}/
         model.onnx         # Exported ONNX model
@@ -77,14 +77,16 @@ class OnnxEmbedder:
 
         import onnxruntime
 
-        onnx_path = self._model_dir / "model.onnx"
-        if not onnx_path.exists():
+        from paper_review.model_discovery import find_model_file
+
+        onnx_path = find_model_file(self._model_dir)
+        if onnx_path is None:
             raise FileNotFoundError(
-                f"ONNX model not found at {onnx_path}. "
-                f"Run `python scripts/export_onnx.py --model {self._model_name}` first."
+                f"ONNX model not found in {self._model_dir}. "
+                f"Run `paper-review config` to download a model first."
             )
 
-        logger.info("Loading ONNX embedder: %s", self._model_dir)
+        logger.info("Loading ONNX embedder: %s", onnx_path)
         self._session = onnxruntime.InferenceSession(
             str(onnx_path),
             providers=["CPUExecutionProvider"],

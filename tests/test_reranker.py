@@ -147,11 +147,20 @@ class TestCrossEncoderReranker:
         assert len(result) == 1
 
     def test_model_name_default(self):
-        """默认模型名与常量一致."""
+        """默认模型名与常量一致（未显式传 config 时读 config.reranker_model）。"""
+        from paper_review.config import Config
         from paper_review.search.reranker import RERANKER_MODEL_NAME
 
-        reranker = CrossEncoderReranker()
+        reranker = CrossEncoderReranker(config=Config())
         assert reranker.model_name == RERANKER_MODEL_NAME
+
+    def test_model_name_from_config(self):
+        """显式配置 reranker_model 时优先使用它（JINA 偏好生效的关键）。"""
+        from paper_review.config import Config
+
+        cfg = Config(reranker_model="jinaai/jina-reranker-v3")
+        reranker = CrossEncoderReranker(config=cfg)
+        assert reranker.model_name == "jinaai/jina-reranker-v3"
 
 
 class TestCrossEncoderRerankerWithMockOnnx:
