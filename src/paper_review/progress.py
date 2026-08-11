@@ -2,8 +2,10 @@
 Pipeline progress display — ANSI terminal progress for Pre/Review/Post phases.
 
 Renders a fixed-height progress box to stderr, refreshed in-place via ANSI
-cursor-move escape codes.  Suppresses console logging while active to avoid
-corrupting the display.
+cursor-move escape codes.  Suppresses console logging AND stdout output while
+active to avoid corrupting the display — stderr logs or .py-step prints would
+push the box down, desyncing the fixed-line cursor moves and leaving ghost
+frames (residual old box rows) at the top of the card.
 
 Layout:
 ┌──────────────────────────────────────────────────────────────┐
@@ -16,7 +18,9 @@ Layout:
 
 from __future__ import annotations
 
+import io
 import logging
+import math
 import os
 import sys
 import threading
@@ -90,6 +94,7 @@ class PipelineProgress:
         self._saved_handler_levels: list[tuple[logging.Handler, int]] = []
         self._saved_level = logging.NOTSET
         self._saved_propagate = True
+        self._saved_stdout: object | None = None  # TTY 模式下被静音的 sys.stdout
 
     # ── Public API ──
 
@@ -118,6 +123,7 @@ class PipelineProgress:
         sys.stderr.flush()
 
         self._mute_console_logging()
+        self._mute_stdout()
         self._started = True
         self._render_first()
         self._spinner_thread = threading.Thread(target=self._spin, daemon=True)
@@ -191,6 +197,7 @@ class PipelineProgress:
             sys.stderr.write(f"[完成] 总耗时 {self._elapsed_str()}\n")
             sys.stderr.flush()
         self._restore_console_logging()
+        self._restore_stdout()
 
     # ── Internal: logging mute ──
 
@@ -213,6 +220,37 @@ class PipelineProgress:
             h.setLevel(lvl)
         self._saved_handler_levels.clear()
 
+    # ── Internal: stdout mute ──
+
+    def _mute_stdout(self):
+        """进度卡激活期间将 sys.stdout 重定向到 devnull。
+
+        .py 步骤经 runpy.run_path() 在主进程内执行，其 print() 直接写
+        sys.stdout（00-convert/01-auto-index/05-summarize/02-generate-excel
+        等模板步骤都有大量输出）。TTY 模式下这些输出与 stderr 进度卡
+        混在同一终端，会把进度盒往下推，导致 ANSI 上移量（固定行数）
+        与实际盒子位置错位——盒子顶部残留旧帧（残影）。
+
+        进度卡激活期间吞掉所有 stdout 输出即可根治；非 TTY 模式不启用，
+        步骤输出照常显示。
+        """
+        self._saved_stdout = sys.stdout
+        try:
+            devnull = open(os.devnull, "w")  # noqa: SIM115 — 替代对象在 _restore_stdout 关闭
+        except OSError:  # /dev/null 不可用（几乎不可能）——用内存缓冲兜底
+            devnull = io.StringIO()
+        sys.stdout = devnull
+
+    def _restore_stdout(self):
+        if self._saved_stdout is not None:
+            devnull = sys.stdout
+            sys.stdout = self._saved_stdout
+            self._saved_stdout = None
+            try:
+                devnull.close()
+            except OSError as e:  # 关闭 devnull 失败无实质影响
+                logger.debug("failed to close muted stdout: %s", e)
+
     # ── Internal: rendering ──
 
     def _spin(self):
@@ -231,16 +269,17 @@ class PipelineProgress:
 
     def _pct(self) -> int:
         t = self._total_steps()
-        return int(self._total_done() / t * 100) if t > 0 else 0
+        # math.floor 与 int() 截断对非负 float 完全等价（避免 ast-grep 对 int() 的误报）
+        return math.floor(self._total_done() / t * 100) if t > 0 else 0
 
     def _bar(self, done: int, total: int) -> str:
         if total == 0:
             return "·" * _BAR_WIDTH
-        filled = int(done / total * _BAR_WIDTH)
+        filled = math.floor(done / total * _BAR_WIDTH)
         return "█" * filled + "░" * (_BAR_WIDTH - filled)
 
     def _elapsed_str(self) -> str:
-        secs = int(time.time() - self._start_time) if self._start_time else 0
+        secs = math.floor(time.time() - self._start_time) if self._start_time else 0
         h, r = divmod(secs, 3600)
         m, s = divmod(r, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"

@@ -1111,3 +1111,70 @@ class TestProgressNonTTYLifecycle:
         # finish 应该仍然输出总耗时
         assert "[完成]" in out, f"Finish without start: {repr(out[:200])}"
         # 不崩溃即为通过
+
+
+# ============================================================================
+# Layer 2: stdout 静音（进度卡激活期间的终端保护）
+# ============================================================================
+
+
+class TestStdoutMute:
+    """TTY 模式下进度卡激活期间 stdout 被静音、结束后恢复。
+
+    残影根因之一：.py 步骤经 runpy 在主进程内执行，其 print() 写 stdout，
+    与 stderr 进度卡混在同一终端，推动滚动导致固定行数的 ANSI 上移量
+    错位。progress.py 在 TTY 模式下将 sys.stdout 重定向到 devnull。
+    """
+
+    def test_tty_start_mutes_stdout_and_finish_restores(self):
+        """TTY 分支：start() 后 stdout 被替换，finish() 后恢复原对象。"""
+        pp = PipelineProgress(
+            pre_steps=1, review_subjects=1, review_steps_per_subject=1, post_steps=1
+        )
+        pp._tty = True
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        try:
+            _start_output(pp)
+            # start() 后 stdout 被替换为 devnull/StringIO
+            assert sys.stdout is not original_stdout
+            # 写入被静音对象不抛异常（步骤 print 不会崩）
+            print("should be muted")
+            sys.stdout.flush()
+
+            _finish_output(pp)
+            assert sys.stdout is original_stdout, "finish() 后 stdout 应恢复为原始对象"
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+    def test_non_tty_keeps_stdout(self):
+        """非 TTY 分支：不静音 stdout（步骤输出照常显示）。"""
+        pp = PipelineProgress(pre_steps=1)
+        pp._tty = False
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        try:
+            _start_output(pp)
+            assert sys.stdout is original_stdout
+            _finish_output(pp)
+            assert sys.stdout is original_stdout
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+    def test_repeated_start_finish_restores_stdout_once(self):
+        """连续 start/finish 两次，stdout 恢复为原始对象且无泄漏。"""
+        pp = PipelineProgress(pre_steps=1)
+        pp._tty = True
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        try:
+            _start_output(pp)
+            _finish_output(pp)
+            _start_output(pp)
+            _finish_output(pp)
+            assert sys.stdout is original_stdout
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
