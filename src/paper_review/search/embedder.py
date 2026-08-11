@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +50,9 @@ class OnnxEmbedder:
         self._session = None
         self._dim: int = 0
         self._model_name: str = self._model_dir.name
+        # server 多线程共享同一实例：tokenizers.Tokenizer 官方声明非线程安全，
+        # encode 整体加锁串行化（与 OnnxReranker 同构；并发 N 请用 workers>1 多实例）。
+        self._lock = threading.Lock()
 
     # ---- properties ----
 
@@ -131,6 +135,13 @@ class OnnxEmbedder:
         Returns:
             Float32 array of shape ``(len(texts), dim)``, L2-normalized.
         """
+        # 整个 encode 加锁（含 load）：tokenizers.Tokenizer 非线程安全，
+        # 多线程共享实例时（server 场景）必须串行调用。
+        with self._lock:
+            return self._encode_locked(texts)
+
+    def _encode_locked(self, texts: list[str]) -> np.ndarray:
+        """持锁执行的编码主体（调用方必须已持有 self._lock）。"""
         self.load()
         session = self._session
         assert session is not None, "load() must succeed before encode()"

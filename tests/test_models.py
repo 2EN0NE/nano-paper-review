@@ -138,3 +138,82 @@ class TestEmbeddingModelManagerWithOnnx:
                 result = mgr.encode(["test"])
                 assert result.shape[0] == 1
                 assert result.shape[1] == 4  # dim from config.json
+
+
+class TestEmbeddingModelManagerWorkers:
+    """embedding_workers > 1：N 个独立实例的池（tokenizer 非线程安全）。"""
+
+    def _make_onnx_dir(self, tmp_path):
+        onnx_dir = tmp_path / "BAAI--bge-small-zh-v1.5"
+        onnx_dir.mkdir(parents=True)
+        (onnx_dir / "model.onnx").write_text("dummy")
+        (onnx_dir / "tokenizer.json").write_text("{}")
+        (onnx_dir / "config.json").write_text('{"hidden_size": 4}')
+        return onnx_dir
+
+    def test_load_creates_workers_instances(self, tmp_path):
+        """workers=2 → _embedder 为池且含 2 个实例。"""
+        self._make_onnx_dir(tmp_path)
+        mgr = EmbeddingModelManager(
+            config=Config(model_cache_dir=str(tmp_path), embedding_workers=2)
+        )
+        with patch("onnxruntime.InferenceSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_output = MagicMock()
+            mock_output.shape = (1, 3, 4)
+            mock_session.get_outputs.return_value = [mock_output]
+            mock_session.run.return_value = [np.zeros((1, 3, 4), dtype=np.float32)]
+            mock_session_cls.return_value = mock_session
+            with patch("tokenizers.Tokenizer.from_file") as mock_tok:
+                mock_tok.return_value.enable_truncation = MagicMock()
+                mock_tok.return_value.encode_batch = lambda texts: [
+                    MagicMock(ids=[101, 102, 103]) for _ in texts
+                ]
+                mgr.load()
+
+        assert mgr._embedder is not None
+        assert mgr._embedder.is_loaded
+        assert len(mgr._embedder._instances) == 2
+        assert mgr.dim == 4
+
+    def test_workers_1_single_instance(self, tmp_path):
+        """workers=1（默认）→ 池大小为 1。"""
+        self._make_onnx_dir(tmp_path)
+        mgr = EmbeddingModelManager(config=Config(model_cache_dir=str(tmp_path)))
+        with patch("onnxruntime.InferenceSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_output = MagicMock()
+            mock_output.shape = (1, 3, 4)
+            mock_session.get_outputs.return_value = [mock_output]
+            mock_session.run.return_value = [np.zeros((1, 3, 4), dtype=np.float32)]
+            mock_session_cls.return_value = mock_session
+            with patch("tokenizers.Tokenizer.from_file") as mock_tok:
+                mock_tok.return_value.enable_truncation = MagicMock()
+                mock_tok.return_value.encode_batch = lambda texts: [
+                    MagicMock(ids=[101, 102, 103]) for _ in texts
+                ]
+                mgr.load()
+
+        assert mgr._embedder is not None
+        assert len(mgr._embedder._instances) == 1
+
+    def test_encode_through_pool(self, tmp_path):
+        """encode 经池转发，输出 shape 正确。"""
+        self._make_onnx_dir(tmp_path)
+        mgr = EmbeddingModelManager(
+            config=Config(model_cache_dir=str(tmp_path), embedding_workers=2)
+        )
+        with patch("onnxruntime.InferenceSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_output = MagicMock()
+            mock_output.shape = (1, 3, 4)
+            mock_session.get_outputs.return_value = [mock_output]
+            mock_session.run.return_value = [np.zeros((1, 3, 4), dtype=np.float32)]
+            mock_session_cls.return_value = mock_session
+            with patch("tokenizers.Tokenizer.from_file") as mock_tok:
+                mock_tok.return_value.enable_truncation = MagicMock()
+                mock_tok.return_value.encode_batch = lambda texts: [
+                    MagicMock(ids=[101, 102, 103]) for _ in texts
+                ]
+                result = mgr.encode(["test", "text"])
+                assert result.shape == (2, 4)

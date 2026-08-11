@@ -194,3 +194,30 @@ class TestLoadConfigDataDir:
         assert cfg.index_dir == "/custom/index"
         # pdf_dir 应来自 data_dir 推导
         assert cfg.pdf_dir == str(dd / "origin" / "pdf")
+
+
+class TestModelWorkers:
+    """embedding_workers / reranker_workers 默认值与 YAML 加载。"""
+
+    def test_defaults_are_one(self):
+        """默认串行：两个 workers 默认都为 1。"""
+        cfg = Config()
+        assert cfg.embedding_workers == 1
+        assert cfg.reranker_workers == 1
+
+    def test_yaml_overrides(self, tmp_path):
+        """YAML 配置可覆盖 workers。"""
+        import yaml
+
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text("embedding_workers: 2\nreranker_workers: 4\n")
+        cfg = Config(**yaml.safe_load(yaml_path.read_text()))
+        assert cfg.embedding_workers == 2
+        assert cfg.reranker_workers == 4
+
+    def test_workers_do_not_affect_fingerprint(self):
+        """workers 不参与 embedding 指纹（指纹只依赖模型与权重参数）。"""
+        cfg = Config()
+        fp1 = cfg.fingerprint()
+        cfg2 = Config(embedding_workers=2)
+        assert cfg2.fingerprint() == fp1

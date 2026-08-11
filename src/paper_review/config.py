@@ -55,6 +55,13 @@ class Config(BaseModel):
     # --- 向量维度 ---
     vector_dim: int = 512
 
+    # --- 模型推理并行度 ---
+    # 每个值 = 独立模型实例数（每实例一个 ONNX session + tokenizer，内存随实例数翻倍）。
+    # tokenizers.Tokenizer 非线程安全 → 并发 N 需要 N 个实例；默认 1（串行）：
+    # 2C/4G 目标机器上并发推理互相拖慢、多实例内存吃紧；更强机器可调高。
+    embedding_workers: int = 1  # embedding 推理实例数（>1 减少并发查询排队）
+    reranker_workers: int = 1  # reranker 推理实例数（50 候选逐条精排单次 10-40s，建议保持 1）
+
     # --- Worker 池默认配置（被 pipeline.yaml 中 review.pool 覆盖） ---
     pool_workers: int = 5  # 默认 Worker 数，0=自动探测
     pool_timeout: int = 0  # 默认单 Subject 超时秒数（0=无超时）

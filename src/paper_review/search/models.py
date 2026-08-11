@@ -28,6 +28,7 @@ from pathlib import Path
 import numpy as np
 
 from paper_review.config import Config, load_config
+from paper_review.search.instance_pool import InstancePool
 from paper_review.search.search_types import VECTOR_DIM
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,9 @@ class EmbeddingModelManager:
         # 初始维度取 config.vector_dim（与 init_faiss 默认维度一致）；
         # ONNX 加载成功后会被真实模型维度覆盖，无模型时哈希降级也保持同维度。
         self._dim = self._config.vector_dim or VECTOR_DIM
-        self._embedder: _OnnxEmbedderWrapper | None = None
+        # 推理实例池：workers=1 时池大小为 1（等价单实例串行）；>1 时为
+        # N 个独立实例轮询（tokenizer 非线程安全 → 每实例自带锁）。
+        self._embedder: InstancePool | None = None
 
     # ---- properties ----
 
@@ -99,15 +102,20 @@ class EmbeddingModelManager:
         if find_model_file(onnx_dir) is not None:
             from paper_review.search.embedder import OnnxEmbedder
 
-            self._embedder = _OnnxEmbedderWrapper(
-                OnnxEmbedder(model_dir=onnx_dir),
-            )
-            self._embedder.load()
-            self._dim = self._embedder.dim
+            # workers 个独立实例（每实例一个 session + tokenizer，内存随实例数翻倍）
+            workers = max(1, self._config.embedding_workers)
+            embedders = [
+                _OnnxEmbedderWrapper(OnnxEmbedder(model_dir=onnx_dir)) for _ in range(workers)
+            ]
+            pool = InstancePool(embedders)
+            pool.load()
+            self._embedder = pool
+            self._dim = pool.dim
             logger.info(
-                "Embedding model loaded via ONNX Runtime: %s (dim=%d)",
+                "Embedding model loaded via ONNX Runtime: %s (dim=%d, workers=%d)",
                 self._model_name,
                 self._dim,
+                workers,
             )
             return True
 

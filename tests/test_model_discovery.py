@@ -98,6 +98,20 @@ def test_infer_reranker():
     assert _infer_model_type(p) == "reranker"
 
 
+def test_infer_reranker_ranking_arch():
+    """JinaForRanking（jina-reranker-v3，架构名无 rerank/cross）识别为 reranker。"""
+    p = Path("/tmp/_test_config.json")
+    p.write_text(json.dumps({"architectures": ["JinaForRanking"]}))
+    assert _infer_model_type(p) == "reranker"
+
+
+def test_infer_reranker_qwen_ranking_arch():
+    """Qwen3ForRanking 同样走 "ranking" 分支。"""
+    p = Path("/tmp/_test_config.json")
+    p.write_text(json.dumps({"architectures": ["Qwen3ForRanking"]}))
+    assert _infer_model_type(p) == "reranker"
+
+
 def test_infer_unknown():
     p = Path("/tmp/_test_config.json")
     p.write_text(json.dumps({"architectures": ["UnknownModel"]}))

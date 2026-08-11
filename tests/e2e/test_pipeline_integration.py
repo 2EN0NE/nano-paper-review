@@ -1591,3 +1591,64 @@ json.dump({"step": "00-convert", "status": "ok", "data": {"manifest": manifest}}
         # 验证 pipeline 正常完成
         out_file = intermediates / "test-paper" / "01-review" / "output.json"
         assert out_file.exists(), f"Review output.json not found at {out_file}"
+
+    def test_py_step_timeout_constant_applies(self, tmp_path):
+        """E2E：_PY_STEP_TIMEOUT（.py 阶段默认超时）动态导入且不导致运行时错误。
+
+        pre 阶段为纯 .py 步骤（无 .md），其 phase 超时走
+        estimate_step_timeout(step_type="py") = _PY_STEP_TIMEOUT。从源码动态导入
+        常量（非硬编码预期值）——修改默认超时时测试自动适用新值，同时验证
+        新值在实际管线执行路径上不会导致运行时错误。
+        """
+        from paper_review.timeout_estimator import _PY_STEP_TIMEOUT
+
+        assert isinstance(_PY_STEP_TIMEOUT, int) and _PY_STEP_TIMEOUT > 0, (
+            f"_PY_STEP_TIMEOUT 应为正整数值，当前: {_PY_STEP_TIMEOUT!r}"
+        )
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+        (data_dir / "index").mkdir()
+
+        pipelines_dir = data_dir / "pipelines"
+        self._setup_minimal_pipeline(pipelines_dir)
+
+        # 假 pi：记录参数 + 成功退出
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        fake_pi = self._make_arg_recording_pi(mock_bin, "pi")
+        _make_mock_pandoc(mock_bin)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _make_pdf(input_dir / "test-paper.pdf", "Test content")
+
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = str(fake_pi)
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(input_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, (
+            f"Pipeline failed with _PY_STEP_TIMEOUT={_PY_STEP_TIMEOUT}:\n"
+            f"STDOUT:{result.stdout[:500]}\nSTDERR:{result.stderr[:500]}"
+        )
+
+        # pre 阶段（纯 .py 步骤）正常完成
+        intermediates = _find_task_dir(data_dir / "output") / "intermediates"
+        pre_outs = list(intermediates.rglob("00-convert/output.json"))
+        assert pre_outs, f"pre 00-convert output.json 未找到: {intermediates}"

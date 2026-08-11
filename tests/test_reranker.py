@@ -204,3 +204,65 @@ class TestCrossEncoderRerankerWithMockOnnx:
         candidates = [_make_candidate(f"p{i}") for i in range(10)]
         result = reranker.rerank("query", candidates, top_n=3)
         assert len(result) == 3
+
+
+class TestCrossEncoderRerankerWorkers:
+    """reranker_workers > 1：N 个独立实例的池，rerank 经池正常转发。
+
+    对应 config.reranker_workers：tokenizer 非线程安全 → 并行度 N 需要 N 个
+    实例；workers=1 时池大小为 1（等价旧单实例路径）。
+    """
+
+    def _make_loaded(self, tmp_path, workers):
+        from paper_review.config import Config
+
+        cache = tmp_path / "cache"
+        model_dir = cache / "BAAI--bge-reranker-v2-m3"
+        model_dir.mkdir(parents=True)
+        (model_dir / "model.onnx").write_text("dummy")
+        (model_dir / "tokenizer.json").write_text(json.dumps({"dummy": True}))
+        (model_dir / "config.json").write_text(
+            json.dumps({"architectures": ["XlmRobertaForSequenceClassification"]})
+        )
+
+        cfg = Config(model_cache_dir=str(cache), reranker_workers=workers)
+        reranker = CrossEncoderReranker(config=cfg)
+        with patch("onnxruntime.InferenceSession") as mock_cls:
+            session = MagicMock()
+            session.get_outputs.return_value = [MagicMock(shape=(1, 1))]
+            session.run.return_value = [np.ones((1, 1), dtype=np.float32)]
+            mock_cls.return_value = session
+            with patch("tokenizers.Tokenizer.from_file") as mock_tok:
+                mock_tok.return_value.enable_truncation = MagicMock()
+                mock_tok.return_value.encode_batch = lambda pairs: [
+                    type("E", (), {"ids": [101, 102, 103]})() for _ in pairs
+                ]
+                reranker.load()
+        return reranker
+
+    def test_load_creates_workers_instances(self, tmp_path):
+        """workers=2 → 池含 2 个实例且全部加载。"""
+        reranker = self._make_loaded(tmp_path, workers=2)
+        assert reranker.is_loaded
+        pool = reranker._reranker
+        assert pool is not None and len(pool._instances) == 2
+
+    def test_workers_1_single_instance(self, tmp_path):
+        """workers=1（默认）→ 池大小为 1，行为等价单实例串行。"""
+        reranker = self._make_loaded(tmp_path, workers=1)
+        assert reranker.is_loaded
+        pool = reranker._reranker
+        assert pool is not None and len(pool._instances) == 1
+
+    def test_rerank_through_pool(self, tmp_path):
+        """rerank 经池转发正常打分排序（全部 0.5 分 → 稳定排序保持原序）。"""
+        reranker = self._make_loaded(tmp_path, workers=2)
+        candidates = [
+            _make_candidate("p1", "a"),
+            _make_candidate("p2", "b"),
+            _make_candidate("p3", "c"),
+        ]
+        result = reranker.rerank("query", candidates, top_n=2)
+        assert len(result) == 2
+        assert result[0].paper_id == "p1"
+        assert result[1].paper_id == "p2"

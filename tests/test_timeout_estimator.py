@@ -6,7 +6,11 @@ timeout_estimator 模块单元测试。
 
 from __future__ import annotations
 
-from paper_review.timeout_estimator import _CHARS_PER_SEC_FACTOR, estimate_step_timeout
+from paper_review.timeout_estimator import (
+    _CHARS_PER_SEC_FACTOR,
+    _PY_STEP_TIMEOUT,
+    estimate_step_timeout,
+)
 
 
 class TestEstimateStepTimeout:
@@ -14,11 +18,14 @@ class TestEstimateStepTimeout:
 
     # ── 类型因子 ──
 
-    def test_py_step_always_60s(self):
-        """.py 步骤固定返回 60s，不受其他参数影响。"""
-        assert estimate_step_timeout(step_type="py") == 60
-        assert estimate_step_timeout(step_type="py", total_chars=100000) == 60
-        assert estimate_step_timeout(step_type="py", subject_count=100) == 60
+    def test_py_step_uses_module_constant(self):
+        """.py 步骤固定返回模块常量 _PY_STEP_TIMEOUT，不受其他参数影响。
+
+        常量值从源码动态导入（非硬编码），调整基准超时时测试自动适用新值。
+        """
+        assert estimate_step_timeout(step_type="py") == _PY_STEP_TIMEOUT
+        assert estimate_step_timeout(step_type="py", total_chars=100000) == _PY_STEP_TIMEOUT
+        assert estimate_step_timeout(step_type="py", subject_count=100) == _PY_STEP_TIMEOUT
 
     def test_md_step_increases_with_chars(self):
         """字符越多，超时越长。"""

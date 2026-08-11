@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -158,6 +160,71 @@ class TestOnnxEmbedderEncode:
             embedder = OnnxEmbedder(model_dir=model_dir, max_length=512)
             embedder.load()
             assert embedder.dim == 4  # from config.json hidden_size
+
+
+class TestOnnxEmbedderConcurrency:
+    """多线程共享同一实例并发 encode：必须串行化（tokenizer 非线程安全）。"""
+
+    def test_concurrent_encode_serialized(self, model_dir):
+        """并发 encode 不抛错、结果正确、session.run 串行。
+
+        对应 server 多线程场景（create_app 应用级单例共享 OnnxEmbedder）：
+        tokenizers.Tokenizer 官方声明非线程安全，encode 必须整体加锁串行化。
+        若未来有人去掉锁，max_depth 断言会立即失败。
+        """
+        with patch("onnxruntime.InferenceSession") as mock_cls:
+            session = MagicMock()
+            mock_output = MagicMock()
+            mock_output.shape = (1, 3, 4)
+            session.get_outputs.return_value = [mock_output]
+            state = {"depth": 0, "max_depth": 0}
+            state_lock = threading.Lock()
+
+            def run_side_effect(*_args, **_kwargs):
+                with state_lock:
+                    state["depth"] += 1
+                    state["max_depth"] = max(state["max_depth"], state["depth"])
+                time.sleep(0.01)
+                with state_lock:
+                    state["depth"] -= 1
+                return [np.zeros((1, 3, 4), dtype=np.float32)]
+
+            session.run.side_effect = run_side_effect
+            mock_cls.return_value = session
+
+            with patch("tokenizers.Tokenizer.from_file") as mock_tok:
+                mock_tok.return_value.enable_truncation = MagicMock()
+                mock_tok.return_value.encode_batch = lambda texts: [
+                    type("E", (), {"ids": [101, 102, 103]})() for _ in texts
+                ]
+                embedder = OnnxEmbedder(model_dir=str(model_dir), max_length=512)
+                texts = ["并发测试文本"]
+                n_threads = 8
+                results: list[np.ndarray] = []
+                errors: list[BaseException] = []
+                results_lock = threading.Lock()
+
+                def worker():
+                    try:
+                        vec = embedder.encode(texts)
+                        with results_lock:
+                            results.append(vec)
+                    except BaseException as exc:  # noqa: BLE001 — 并发测试需捕获全部异常
+                        with results_lock:
+                            errors.append(exc)
+
+                threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+
+        assert not errors, f"并发 encode 抛异常: {[repr(e) for e in errors]}"
+        assert len(results) == n_threads
+        for vec in results:
+            assert vec.shape == (1, 4)
+        # 锁生效：session.run 从未并发执行
+        assert state["max_depth"] == 1, f"session.run 并发深度 {state['max_depth']} > 1——锁失效"
 
 
 class TestOnnxEmbedderProperties:

@@ -154,7 +154,13 @@ def _infer_model_type(config_path: Path) -> str | None:
         return None
     arch = architectures[0].lower()
     # Cross-encoder / reranker models
-    if "cross" in arch or "rerank" in arch or "forsequenceclassification" in arch:
+    # "ranking" 覆盖 JinaForRanking（jina-reranker-v3 基于 Qwen3，架构名无 rerank/cross）
+    if (
+        "cross" in arch
+        or "rerank" in arch
+        or "ranking" in arch
+        or "forsequenceclassification" in arch
+    ):
         return "reranker"
     # Embedding / encoder models — "bert" (BertModel), "roberta", etc.
     if "bert" in arch or "roberta" in arch or "encoder" in arch or "embedding" in arch:

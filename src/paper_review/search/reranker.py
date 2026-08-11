@@ -16,11 +16,13 @@ Usage::
 from __future__ import annotations
 
 import logging
+import threading
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 from paper_review.config import Config, load_config
+from paper_review.search.instance_pool import InstancePool
 
 if TYPE_CHECKING:
     from paper_review.search.store import Paper
@@ -61,7 +63,9 @@ class CrossEncoderReranker:
     ):
         self._config = config or load_config()
         self._model_name = _resolve_model_name(self._config, model_name)
-        self._reranker: _OnnxRerankerWrapper | None = None
+        # 推理实例池：workers=1 时池大小为 1（等价单实例串行）；>1 时为
+        # N 个独立实例轮询（tokenizer 非线程安全 → 每实例自带锁）。
+        self._reranker: InstancePool | None = None
 
     # ---- properties ----
 
@@ -92,11 +96,22 @@ class CrossEncoderReranker:
         onnx_dir = model_cache_dir / self._model_name.replace("/", "--")
 
         if find_model_file(onnx_dir) is not None:
-            self._reranker = _OnnxRerankerWrapper(
-                OnnxReranker(model_dir=str(onnx_dir), max_length=RERANK_MAX_SEQ_LEN),
+            # workers 个独立实例（每实例一个 session + tokenizer，内存随实例数翻倍）
+            workers = max(1, self._config.reranker_workers)
+            wrappers = [
+                _OnnxRerankerWrapper(
+                    OnnxReranker(model_dir=str(onnx_dir), max_length=RERANK_MAX_SEQ_LEN),
+                )
+                for _ in range(workers)
+            ]
+            pool = InstancePool(wrappers)
+            pool.load()
+            self._reranker = pool
+            logger.info(
+                "Reranker loaded via ONNX Runtime: %s (workers=%d)",
+                self._model_name,
+                workers,
             )
-            self._reranker.load()
-            logger.info("Reranker loaded via ONNX Runtime: %s", self._model_name)
         else:
             logger.warning(
                 "ONNX reranker not found at %s. "
@@ -165,6 +180,9 @@ class OnnxReranker:
         self._max_length = max_length
         self._session = None
         self._tokenizer = None
+        # server 多线程共享同一实例：tokenizers.Tokenizer 官方声明非线程安全，
+        # predict 整体加锁串行化（CPU-only 场景并发推理本就互相拖慢）
+        self._lock = threading.Lock()
 
     @property
     def is_loaded(self) -> bool:
@@ -208,46 +226,56 @@ class OnnxReranker:
 
         Returns ``(N,)`` float32 array with relevance scores in ``[0, 1]``.
         """
+        if not pairs:
+            return np.array([], dtype=np.float32)
+
+        # 整个 predict 加锁（含 load）：tokenizers.Tokenizer 官方声明非线程安全，
+        # server 多线程共享同一 OnnxReranker 实例时必须串行调用；同时避免并发
+        # 推理争抢 CPU（2C/4G 机器上并发推理本就互相拖慢，串行反而更稳定）。
+        with self._lock:
+            return self._predict_locked(pairs)
+
+    def _predict_locked(self, pairs: list[tuple[str, str]]) -> np.ndarray:
+        """持锁执行的推理主体（调用方必须已持有 self._lock）。"""
         self.load()
         session = self._session
         tokenizer = self._tokenizer
         assert session is not None and tokenizer is not None
 
-        if not pairs:
-            return np.array([], dtype=np.float32)
-
-        encoded = tokenizer.encode_batch(pairs)
-        max_len = max(len(e.ids) for e in encoded)
-
-        input_ids = np.zeros((len(pairs), max_len), dtype=np.int64)
-        attention_mask = np.zeros((len(pairs), max_len), dtype=np.int64)
-
-        for i, e in enumerate(encoded):
-            seq_len = len(e.ids)
-            input_ids[i, :seq_len] = e.ids
-            attention_mask[i, :seq_len] = 1
-
-        # 构建 ONNX 输入：部分社区导出的模型要求 token_type_ids
-        onnx_inputs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-        }
+        # 逐条推理（batch=1）而非整批 padding：
+        # 部分社区导出的量化模型（如 s-lorin/jina-reranker-v3-onnx）声明输入为
+        # 动态 (batch, seq)，但内部 Reshape 节点把 batch 硬编码为 1，整批喂入会报
+        # "input_shape_size == size was false / requested shape:{1,1,...}" 的 shape 错误。
+        # batch=1 是任意动态 batch 模型的子集，两种导出都兼容；各条 pad 到自身长度，
+        # 总计算量与整批相当，仅多毫秒级的 ORT 调用开销（CPU-only 场景可接受）。
         session_input_names = [inp.name for inp in session.get_inputs()]
-        if "token_type_ids" in session_input_names:
-            onnx_inputs["token_type_ids"] = np.zeros_like(input_ids)
 
-        outputs = session.run(None, onnx_inputs)
-        logits = outputs[0]
+        scores = np.zeros(len(pairs), dtype=np.float32)
+        for i, pair in enumerate(pairs):
+            encoded = tokenizer.encode_batch([pair])[0]
+            input_ids = np.asarray([encoded.ids], dtype=np.int64)
+            attention_mask = np.ones_like(input_ids)
 
-        # Softmax / sigmoid to get positive-class score
-        if logits.shape[-1] == 1:
-            scores = 1.0 / (1.0 + np.exp(-logits[:, 0]))
-        else:
-            exp = np.exp(logits - logits.max(axis=1, keepdims=True))
-            softmax = exp / exp.sum(axis=1, keepdims=True)
-            scores = softmax[:, 1]
+            # 构建 ONNX 输入：部分社区导出的模型要求 token_type_ids
+            onnx_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            }
+            if "token_type_ids" in session_input_names:
+                onnx_inputs["token_type_ids"] = np.zeros_like(input_ids)
 
-        return scores.astype(np.float32)
+            outputs = session.run(None, onnx_inputs)
+            logits = outputs[0]
+
+            # Softmax / sigmoid to get positive-class score
+            if logits.shape[-1] == 1:
+                scores[i] = 1.0 / (1.0 + np.exp(-logits[0, 0]))
+            else:
+                exp = np.exp(logits - logits.max(axis=1, keepdims=True))
+                softmax = exp / exp.sum(axis=1, keepdims=True)
+                scores[i] = softmax[0, 1]
+
+        return scores
 
 
 class _OnnxRerankerWrapper:
