@@ -100,7 +100,11 @@ mkdir -p "$WHEEL_DIR"
 # 从 pyproject.toml 提取依赖名（含 dev extras），并附加构建依赖 setuptools/wheel
 # 与 pip（离线可编辑安装需要构建后端；pip 用于离线升级目标机 venv 的旧 pip）。
 "$PACK_PYTHON" - "$PROJECT_DIR/pyproject.toml" "$WHEEL_DIR/specs.txt" <<'EOF'
-import sys, tomllib, re
+import sys, re
+try:
+    import tomllib  # Python 3.11+
+except ImportError:
+    import tomli as tomllib  # Python < 3.11
 with open(sys.argv[1], "rb") as f:
     d = tomllib.load(f)
 deps = list(d["project"]["dependencies"]) + list(d["project"]["optional-dependencies"]["dev"])
@@ -125,7 +129,10 @@ echo "  -> pip download (cp$PYTHON_TAG, manylinux x86_64, binary-only)..."
 	-r "$WHEEL_DIR/specs.txt"
 
 echo "  -> 校验依赖完整性..."
-"$SCRIPT_DIR/_check_missing.py" "$WHEEL_DIR" "$PROJECT_DIR/pyproject.toml" || {
+# 用 PACK_PYTHON 显式执行（勿依赖 shebang 的 `env python3`：CI 中 PATH 首位是
+# 裸系统 Python，可能既无 tomllib 也无 tomli）。specs.txt 已由上方 heredoc 生成，
+# _check_missing.py 只读纯文本包名，不再需要任何 TOML 解析库。
+"$PACK_PYTHON" "$SCRIPT_DIR/_check_missing.py" "$WHEEL_DIR" "$WHEEL_DIR/specs.txt" || {
 	echo "  [ERR] 依赖不完整，请检查上方 pip download 输出" >&2
 	exit 1
 }

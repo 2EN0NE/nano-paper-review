@@ -9,14 +9,17 @@ pack script can retry with source tarballs.
 from __future__ import annotations
 
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
 
 # Import under test
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-from _check_missing import get_installed_wheel_names, get_tar_gz_names, parse_dep_name
+from _check_missing import (  # type: ignore[reportMissingImports]  # sys.path 运行时注入，Pyright 静态解析不到
+    get_installed_wheel_names,
+    get_tar_gz_names,
+    parse_dep_name,
+)
 
 
 class TestParseDepName:
@@ -86,7 +89,7 @@ class TestGetTarGzNames:
 
 
 class TestMainIntegration:
-    """End-to-end: _check_missing.py main() with a real pyproject.toml."""
+    """End-to-end: _check_missing.py main() with a specs file (as offline_pack.sh calls it)."""
 
     def test_all_present(self, tmp_path: Path, monkeypatch):
         """main() exits 0 when all deps have wheels."""
@@ -95,22 +98,14 @@ class TestMainIntegration:
         (wheel_dir / "pymupdf-1.23.0-cp310-cp310-manylinux.whl").write_text("")
         (wheel_dir / "typer-0.9.0-py3-none-any.whl").write_text("")
 
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            textwrap.dedent("""\
-            [project]
-            name = "test"
-            version = "0.1.0"
-            dependencies = [
-              "pymupdf>=1.23.0",
-              "typer>=0.9.0",
-            ]
-        """)
-        )
+        specs = tmp_path / "specs.txt"
+        specs.write_text("pymupdf\ntyper\n")
 
-        monkeypatch.setattr("sys.argv", ["_check_missing.py", str(wheel_dir), str(pyproject)])
+        monkeypatch.setattr("sys.argv", ["_check_missing.py", str(wheel_dir), str(specs)])
         # Should not raise SystemExit(1)
-        from _check_missing import main
+        from _check_missing import (
+            main,  # type: ignore[reportMissingImports]  # sys.path 运行时注入，Pyright 静态解析不到
+        )
 
         main()
 
@@ -121,21 +116,13 @@ class TestMainIntegration:
         (wheel_dir / "pymupdf-1.23.0-cp310-cp310-manylinux.whl").write_text("")
         # typer wheel is missing
 
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            textwrap.dedent("""\
-            [project]
-            name = "test"
-            version = "0.1.0"
-            dependencies = [
-              "pymupdf>=1.23.0",
-              "typer>=0.9.0",
-            ]
-        """)
-        )
+        specs = tmp_path / "specs.txt"
+        specs.write_text("pymupdf\ntyper\n")
 
-        monkeypatch.setattr("sys.argv", ["_check_missing.py", str(wheel_dir), str(pyproject)])
-        from _check_missing import main
+        monkeypatch.setattr("sys.argv", ["_check_missing.py", str(wheel_dir), str(specs)])
+        from _check_missing import (
+            main,  # type: ignore[reportMissingImports]  # sys.path 运行时注入，Pyright 静态解析不到
+        )
 
         with pytest.raises(SystemExit) as exc:
             main()
@@ -148,25 +135,16 @@ class TestMainIntegration:
         (wheel_dir / "pymupdf-1.23.0-cp310-cp310-manylinux.whl").write_text("")
         # typer and flask are missing
 
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            textwrap.dedent("""\
-            [project]
-            name = "test"
-            version = "0.1.0"
-            dependencies = [
-              "pymupdf>=1.23.0",
-              "typer>=0.9.0",
-              "flask>=2.3.0",
-            ]
-        """)
-        )
+        specs = tmp_path / "specs.txt"
+        specs.write_text("pymupdf\ntyper\nflask\n")
 
         monkeypatch.setattr(
             "sys.argv",
-            ["_check_missing.py", "--list-missing", str(wheel_dir), str(pyproject)],
+            ["_check_missing.py", "--list-missing", str(wheel_dir), str(specs)],
         )
-        from _check_missing import main
+        from _check_missing import (
+            main,  # type: ignore[reportMissingImports]  # sys.path 运行时注入，Pyright 静态解析不到
+        )
 
         main()
         captured = capsys.readouterr()
@@ -180,19 +158,28 @@ class TestMainIntegration:
         wheel_dir.mkdir()
         (wheel_dir / "pymupdf-1.23.0.tar.gz").write_text("")
 
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            textwrap.dedent("""\
-            [project]
-            name = "test"
-            version = "0.1.0"
-            dependencies = [
-              "pymupdf>=1.23.0",
-            ]
-        """)
+        specs = tmp_path / "specs.txt"
+        specs.write_text("pymupdf\n")
+
+        monkeypatch.setattr("sys.argv", ["_check_missing.py", str(wheel_dir), str(specs)])
+        from _check_missing import (
+            main,  # type: ignore[reportMissingImports]  # sys.path 运行时注入，Pyright 静态解析不到
         )
 
-        monkeypatch.setattr("sys.argv", ["_check_missing.py", str(wheel_dir), str(pyproject)])
-        from _check_missing import main
+        main()  # Should not raise
+
+    def test_specs_skip_blank_and_comments(self, tmp_path: Path, monkeypatch):
+        """Blank lines / comments in specs.txt are ignored."""
+        wheel_dir = tmp_path / "wheels"
+        wheel_dir.mkdir()
+        (wheel_dir / "pymupdf-1.23.0-cp310-cp310-manylinux.whl").write_text("")
+
+        specs = tmp_path / "specs.txt"
+        specs.write_text("# generated by offline_pack.sh\n\npymupdf\n\n")
+
+        monkeypatch.setattr("sys.argv", ["_check_missing.py", str(wheel_dir), str(specs)])
+        from _check_missing import (
+            main,  # type: ignore[reportMissingImports]  # sys.path 运行时注入，Pyright 静态解析不到
+        )
 
         main()  # Should not raise
