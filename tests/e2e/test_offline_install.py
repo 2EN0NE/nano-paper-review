@@ -91,24 +91,37 @@ def _build_fixture_wheel(cwd: Path, name: str = "test_pkg") -> None:
     wheel_dir.mkdir(exist_ok=True)
 
     # 寻找带 pip 的 Python（优先 python3.10+）
+    # 坑：CI 中 `uv run pytest` 会把项目根 .venv/bin 前置到 PATH，shutil.which 可能命中
+    # uv venv 里的 python —— 而 uv 默认不装 pip，`-m pip download` 会直接失败。
+    # 因此：1) 跳过 venv 内解释器；2) 必须验证 `-m pip --version` 可用才采用。
     pip_python = None
     for candidate in ("python3.10", "python3.11", "python3.12", "python3.13", "python3"):
         candidate_path = shutil.which(candidate)
-        if candidate_path:
-            ver = subprocess.run(
-                [
-                    candidate_path,
-                    "-c",
-                    "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            if ver.returncode == 0:
-                major, minor = ver.stdout.strip().split(".")
-                if int(major) >= 3 and int(minor) >= 10:
-                    pip_python = candidate_path
-                    break
+        if not candidate_path or "/.venv/" in candidate_path:
+            continue
+        ver = subprocess.run(
+            [
+                candidate_path,
+                "-c",
+                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if ver.returncode != 0:
+            continue
+        major, minor = ver.stdout.strip().split(".")
+        if int(major) < 3 or int(minor) < 10:
+            continue
+        pip_ok = subprocess.run(
+            [candidate_path, "-m", "pip", "--version"],
+            capture_output=True,
+            text=True,
+        )
+        if pip_ok.returncode != 0:
+            continue
+        pip_python = candidate_path
+        break
 
     if pip_python:
         # 下载 setuptools + wheel（用旧版避免传递依赖 packaging>=24.0）
