@@ -29,6 +29,8 @@ TAIL_WEIGHT = 4.0
 HEAD_RATIO = 0.15
 TAIL_RATIO = 0.10
 
+# 默认向量维度 —— Config.vector_dim 的兜底值。运行时始终优先取 config.vector_dim，
+# 仅在 Config 未加载或显式回退时才使用此常量。
 VECTOR_DIM = 512
 
 

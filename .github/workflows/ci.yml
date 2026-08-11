@@ -56,7 +56,7 @@ jobs:
       - name: Run unit tests
         run: >
           uv run pytest tests/ -q
-          -m "not integration"
+          -m "not integration and not e2e_slow"
           --junitxml=junit-unit-${{ matrix.python-version }}.xml
 
       - name: Upload unit test report

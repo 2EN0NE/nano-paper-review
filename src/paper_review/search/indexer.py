@@ -104,6 +104,7 @@ def build_index(
         tail_weight=tail_weight,
         head_ratio=head_ratio,
         tail_ratio=tail_ratio,
+        dim=model.dim,
     )
 
     doc_vec = DocVector(

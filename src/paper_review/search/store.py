@@ -215,11 +215,12 @@ class Store:
         - ``chunks.index``: chunk 级向量（~20N 条）
 
         Args:
-            dim: 向量维度，默认 VECTOR_DIM (512)。
+            dim: 向量维度；未指定时取 config.vector_dim（config 命令选中模型时
+                自动写入），兜底 VECTOR_DIM (512)。
         """
         import faiss
 
-        self._faiss_dim = dim or VECTOR_DIM
+        self._faiss_dim = dim or self.config.vector_dim or VECTOR_DIM
         d = self._faiss_dim
 
         base_papers = faiss.IndexFlatIP(d)
@@ -1001,10 +1002,29 @@ class Store:
 
         # 2. FAISS 文档级向量检索
         if embed_model is not None:
-            query_vec = embed_model.encode([query])[0].tolist()
+            if (
+                self._faiss_papers is not None
+                and self._faiss_papers.ntotal > 0
+                and getattr(embed_model, "dim", None) not in (None, self._faiss_dim)
+            ):
+                # 模型维度与索引维度不一致（如更换了 embedding 模型后未重建索引）：
+                # 直接崩溃会打断检索，回退哈希向量 + 明确警告（语义与模型缺失降级一致）。
+                logger.warning(
+                    "embedding model dim=%s 与 FAISS 索引 dim=%s 不一致——"
+                    "本次查询退化为哈希向量；建议删除 {data_dir}/index 重建或运行 rebuild_doc_vectors",
+                    embed_model.dim,
+                    self._faiss_dim,
+                )
+                query_vec = deterministic_hash_vector(query, dim=self._faiss_dim)
+            else:
+                query_vec = embed_model.encode([query])[0].tolist()
         else:
-            # 使用正确的维度（匹配 FAISS / doc_vectors）
-            dim = self._faiss_dim if self._faiss_papers is not None else VECTOR_DIM
+            # 使用正确的维度（匹配 FAISS / doc_vectors）；无索引时跟随 config.vector_dim
+            dim = (
+                self._faiss_dim
+                if self._faiss_papers is not None
+                else (self.config.vector_dim or VECTOR_DIM)
+            )
             query_vec = deterministic_hash_vector(query, dim=dim)
         vec_results = self._vector_search(query_vec)
 
@@ -1203,6 +1223,7 @@ class Store:
                 tail_weight=cfg.tail_weight,
                 head_ratio=cfg.head_ratio,
                 tail_ratio=cfg.tail_ratio,
+                dim=cfg.vector_dim,
             )
 
             # 更新数据库
@@ -1273,14 +1294,16 @@ def mean_pool_chunks(
     tail_weight: float = TAIL_WEIGHT,
     head_ratio: float = HEAD_RATIO,
     tail_ratio: float = TAIL_RATIO,
+    dim: int = VECTOR_DIM,
 ) -> list[float]:
     """
     按位置权重做加权 Mean Pooling。
 
     配置文件可覆盖 head/body/tail 权重值。
+    dim 用于 cvs/chunks 为空时的降级向量维度（正常路径从 cvs[0].vector 推导）。
     """
     if not cvs or not chunks:
-        return deterministic_hash_vector("", VECTOR_DIM)
+        return deterministic_hash_vector("", dim)
 
     # 按 seq 排序以确保顺序
     sorted_chunks = sorted(chunks, key=lambda c: c.seq)
@@ -1324,15 +1347,19 @@ def open_store(data_dir: str | None = None) -> Store:
 
     命令行和测试的统一入口。自动解析 data_dir → index.sqlite 路径，
     加载全部数据并初始化/恢复 FAISS 索引。
+
+    Store 构造时传入 data_dir 感知的 config，确保 config.vector_dim
+    与 FAISS 索引维度一致（P1 修复：--data-dir 场景下 Store 曾使用错误配置）。
     """
-    from paper_review.config import resolve_data_dir
+    from paper_review.config import load_config, resolve_data_dir
 
     dd = resolve_data_dir(data_dir)
+    cfg = load_config(data_dir=data_dir)
     index_dir = dd / "index"
     index_dir.mkdir(parents=True, exist_ok=True)
     db_path = str(index_dir / "index.sqlite")
 
-    store = Store(db_path)
+    store = Store(db_path, config=cfg)
     store.load_all()
     if not store.load_faiss():
         store.init_faiss()

@@ -12,7 +12,8 @@ dependencies = [
   "typer>=0.9.0",
   "pydantic>=2.0.0",
   "faiss-cpu>=1.7.0",
-  "onnxruntime>=1.15.0",
+  "onnxruntime>=1.15.0,<1.24; python_version < '3.11'", # 1.24+ 无 cp310 wheel（CI）
+  "onnxruntime>=1.15.0; python_version >= '3.11'",
   "tokenizers>=0.15.0",
   "rank-bm25>=0.2.0",
   "flask>=2.3.0",
