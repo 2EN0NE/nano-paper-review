@@ -200,7 +200,46 @@ def test_scan_hf_cache_finds_model(tmp_path, monkeypatch):
 
     results = scan_huggingface_cache()
     assert len(results) == 1
-    assert results[0].display_name == "onnx-community/bge-small-zh-v1.5-ONNX"
+    # HF 缓存目录名是 ONNX 转换仓库名，应反查回 known 表模型名
+    assert results[0].display_name == "BAAI/bge-small-zh-v1.5"
+
+
+def test_scan_hf_cache_maps_onnx_repo_to_model_name(tmp_path, monkeypatch):
+    """onnx-community/bge-reranker-v2-m3-ONNX（ONNX 仓库）反查为 BAAI/bge-reranker-v2-m3。
+
+    与项目缓存（目录名=模型名）条目同名 → cli 合并去重，不再重复列出。
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    hub = tmp_path / ".cache" / "huggingface" / "hub"
+    model_dir = hub / "models--onnx-community--bge-reranker-v2-m3-ONNX"
+    snapshot_dir = model_dir / "snapshots" / "abc123"
+    snapshot_dir.mkdir(parents=True)
+    _make_minimal_onnx_model(snapshot_dir, "reranker")
+
+    refs_dir = model_dir / "refs"
+    refs_dir.mkdir(parents=True)
+    (refs_dir / "main").write_text("abc123")
+
+    results = scan_huggingface_cache()
+    assert len(results) == 1
+    assert results[0].display_name == "BAAI/bge-reranker-v2-m3"
+    assert results[0].model_type == "reranker"
+
+
+def test_canonical_model_name_unknown_repo_unchanged():
+    """known 表外的仓库名保持原样（表外模型仍可用，只是无法反查）。"""
+    from paper_review import model_discovery as md
+
+    assert (
+        md._canonical_model_name("onnx-community/bge-reranker-v2-m3-ONNX")
+        == "BAAI/bge-reranker-v2-m3"
+    )
+    assert (
+        md._canonical_model_name("onnx-community/bge-small-zh-v1.5-ONNX")
+        == "BAAI/bge-small-zh-v1.5"
+    )
+    assert md._canonical_model_name("some/unknown-custom-onnx") == "some/unknown-custom-onnx"
 
 
 def test_scan_hf_cache_skips_without_snapshots(tmp_path, monkeypatch):
@@ -229,14 +268,15 @@ def test_get_embedding_options():
 def test_get_reranker_options():
     opts = get_known_download_options("reranker")
     tiers = {o.get("tier") for o in opts}
-    assert "small" in tiers
     assert "balanced" in tiers
     assert "best" in tiers
-    assert len(opts) == 3
+    assert len(opts) == 2
+    # 默认推荐（best）必须是 bge-reranker-v2-m3（jina 已移除：工件逐对精排不可用）
+    best = next(o for o in opts if o.get("tier") == "best")
+    assert best["display_name"] == "BAAI/bge-reranker-v2-m3"
     # Verify the specific models
     names = {o["display_name"] for o in opts}
     assert "BAAI/bge-reranker-v2-m3" in names
-    assert "jinaai/jina-reranker-v3" in names
     assert "Qwen/Qwen3-Reranker-0.6B" in names
 
 
@@ -245,6 +285,17 @@ def test_get_unknown_type():
 
 
 # ── find_model_file ──
+
+
+def test_find_model_file_onnx_subdir(tmp_path):
+    """权重在 onnx/ 子目录（HF hub 混合布局）时也能找到，且 INT8 优先。"""
+    sub = tmp_path / "onnx"
+    sub.mkdir()
+    (sub / "model.onnx").write_bytes(b"x")
+    (sub / "model_quantized.onnx").write_bytes(b"y")
+    f = find_model_file(tmp_path)
+    assert f is not None
+    assert f.name == "model_quantized.onnx"  # INT8 优先于 model.onnx
 
 
 def test_find_model_file_prefers_int8(tmp_path):
@@ -257,7 +308,7 @@ def test_find_model_file_prefers_int8(tmp_path):
 
 
 def test_find_model_file_falls_back_to_plain(tmp_path):
-    """只有 model.onnx（如 jina-reranker-v3 仓库）时返回它。"""
+    """只有 model.onnx（根级布局仓库）时返回它。"""
     _make_minimal_onnx_model(tmp_path, "embedding")
     f = find_model_file(tmp_path)
     assert f is not None
@@ -369,7 +420,7 @@ def test_download_onnx_subdir_layout_symlinks(tmp_path, monkeypatch):
 
 
 def test_download_root_model_fallback(tmp_path, monkeypatch):
-    """仓库只有根级 model.onnx（s-lorin/jina-reranker-v3 布局）时也能下载。"""
+    """仓库只有根级 model.onnx（无 onnx/ 子目录布局）时也能下载。"""
     repo = tmp_path / "repo"
     _make_repo_files(
         repo,
@@ -377,10 +428,10 @@ def test_download_root_model_fallback(tmp_path, monkeypatch):
     )
     _patch_hf(monkeypatch, repo)
 
-    target = tmp_path / "cache" / "jinaai--jina-reranker-v3"
+    target = tmp_path / "cache" / "some--root-model-onnx"
     import paper_review.model_discovery as md
 
-    ok = md.download_model("s-lorin/jina-reranker-v3-onnx", target)
+    ok = md.download_model("some/root-model-onnx", target)
     assert ok
     assert (target / "model.onnx").exists()
     assert (target / "tokenizer.json").exists()
@@ -480,8 +531,8 @@ def test_update_config_models_preserves_comments(tmp_path, monkeypatch):
     from paper_review.model_discovery import update_config_models
 
     written = update_config_models(
-        embedding_model="jinaai/jina-reranker-v3",
-        reranker_model="jinaai/jina-reranker-v3",
+        embedding_model="BAAI/bge-base-zh-v1.5",
+        reranker_model="Qwen/Qwen3-Reranker-0.6B",
         vector_dim=768,
         data_dir=str(tmp_path),
     )
@@ -490,8 +541,8 @@ def test_update_config_models_preserves_comments(tmp_path, monkeypatch):
     text = cfg.read_text()
     assert "chunk_size: 512" in text
     assert "# paper-review 配置" in text
-    assert "embedding_model: jinaai/jina-reranker-v3" in text
-    assert "reranker_model: jinaai/jina-reranker-v3" in text
+    assert "embedding_model: BAAI/bge-base-zh-v1.5" in text
+    assert "reranker_model: Qwen/Qwen3-Reranker-0.6B" in text
     assert "vector_dim: 768" in text
 
 
@@ -549,11 +600,11 @@ def test_update_config_models_creates_when_missing(tmp_path):
     from paper_review.model_discovery import update_config_models
 
     target = update_config_models(
-        reranker_model="jinaai/jina-reranker-v3", data_dir=str(tmp_path / "dd")
+        reranker_model="Qwen/Qwen3-Reranker-0.6B", data_dir=str(tmp_path / "dd")
     )
     assert target is not None
     assert target.exists()
-    assert "reranker_model: jinaai/jina-reranker-v3" in target.read_text()
+    assert "reranker_model: Qwen/Qwen3-Reranker-0.6B" in target.read_text()
 
 
 def test_scan_detects_model_with_root_config(tmp_path):

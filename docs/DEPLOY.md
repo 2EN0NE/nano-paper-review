@@ -25,7 +25,7 @@ bash scripts/offline_pack.sh
   `--only-binary` 二进制轮子；任一依赖缺轮子会**直接失败**而非静默打包残缺包）
 - 下载 ONNX 模型并物理拷贝（非 symlink），**每个模型只拉单个 INT8 量化版本**：
   - embedding: `BAAI/bge-small-zh-v1.5`（~25MB，与默认 config 一致）
-  - reranker: `jinaai/jina-reranker-v3`（~600MB，用户偏好；CC-BY-NC 非商业许可）
+  - reranker: `BAAI/bge-reranker-v2-m3`（~570MB，Apache 2.0，与默认 config 一致）
 - 在包内写入 `config.yaml` + `models-manifest.json`，保证离线安装后模型名与配置一致
 - 封装为固定顶层目录 `paper-review-offline/` 的 tarball
 
@@ -82,7 +82,7 @@ recall_k: 50
 rrf_k: 60
 final_top_n: 5
 embedding_model: "BAAI/bge-small-zh-v1.5"   # 由 install/config 自动写入
-reranker_model: "jinaai/jina-reranker-v3"   # 由 install/config 自动写入
+reranker_model: "BAAI/bge-reranker-v2-m3"   # 由 install/config 自动写入
 vector_dim: 512
 ```
 
@@ -91,7 +91,7 @@ vector_dim: 512
 ```
 models/
     BAAI--bge-small-zh-v1.5/        # 只有单个 INT8 文件 model_quantized.onnx
-    jinaai--jina-reranker-v3/       # 只有 model.onnx（本身即 INT8 量化）
+    BAAI--bge-reranker-v2-m3/       # 只有单个 INT8 文件 model_quantized.onnx
 ```
 
 > 目录名 = 模型名把 `/` 换成 `--`。运行时优先加载 `model_quantized.onnx`

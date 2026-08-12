@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -30,7 +31,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
-RERANK_MAX_SEQ_LEN = 512  # truncation for query + doc pair
+RERANK_MAX_SEQ_LEN = 512  # token 级截断上限（query+doc 合计，拼接型 cross-encoder）
+# 文档预览字符上限：需覆盖 512 token 预算的中英文最坏情况（512 token × 6 字符/token
+# 的保险值，约 2500-3000 字符）；过长只会让 tokenize 结果被截断丢弃，浪费 CPU。
+_MAX_DOC_PREVIEW_CHARS = 3000
+
+
+# 注意：jina-reranker-v3 不在支持列表（model_discovery 已移除）——s-lorin 导出的
+# (1,2) logits 是整块 prompt 的全局分数而非每文档分数，逐对精排不可用。所有
+# 支持模型均为拼接型契约：(query, doc) 直接经 tokenizer 编码为 pair 后评分。
+def _parse_logits(logits: np.ndarray) -> float:
+    """把 ONNX 输出的 logits 转成相关性分数。
+
+    - 单 logit（bge-reranker-v2-m3 的 INT8 导出实际输出 1 个 logit）→ sigmoid；
+    - 多类 logits（Qwen3-Reranker 等 2 类输出）→ softmax 取相关类（class 1）。
+    """
+    if logits.shape[-1] == 1:
+        return float(1.0 / (1.0 + np.exp(-logits[0, 0])))
+    exp = np.exp(logits - logits.max(axis=1, keepdims=True))
+    softmax = exp / exp.sum(axis=1, keepdims=True)
+    return float(softmax[0, 1])
 
 
 def _resolve_model_name(config: Config | None, explicit: str | None) -> str:
@@ -53,7 +73,7 @@ class CrossEncoderReranker:
         subsequent ``rerank()`` calls return the candidates in their original
         order (passthrough — no actual reranking).
 
-        Memory (bge-reranker-v2-m3 via ONNX Runtime): ~1.1 GB fp16 equivalent.
+        Memory (bge-reranker-v2-m3 via ONNX Runtime): ~570 MB INT8.
     """
 
     def __init__(
@@ -146,7 +166,7 @@ class CrossEncoderReranker:
             return candidates[:top_n]
 
         # Build (query, doc_preview) pairs
-        pairs = [(query, p.raw_text[:RERANK_MAX_SEQ_LEN]) for p in candidates]
+        pairs = [(query, p.raw_text[:_MAX_DOC_PREVIEW_CHARS]) for p in candidates]
 
         # Score via ONNX
         reranker = self._reranker
@@ -170,12 +190,10 @@ class OnnxReranker:
 
     Args:
         model_dir: Directory with ``model.onnx``, ``tokenizer.json``, ``config.json``.
-        max_length: Max token sequence length per pair.
+        max_length: Max token sequence length per pair（query+doc 合计）。
     """
 
     def __init__(self, model_dir: str, max_length: int = 512):
-        from pathlib import Path
-
         self._model_dir = Path(model_dir)
         self._max_length = max_length
         self._session = None
@@ -267,13 +285,8 @@ class OnnxReranker:
             outputs = session.run(None, onnx_inputs)
             logits = outputs[0]
 
-            # Softmax / sigmoid to get positive-class score
-            if logits.shape[-1] == 1:
-                scores[i] = 1.0 / (1.0 + np.exp(-logits[0, 0]))
-            else:
-                exp = np.exp(logits - logits.max(axis=1, keepdims=True))
-                softmax = exp / exp.sum(axis=1, keepdims=True)
-                scores[i] = softmax[0, 1]
+            # 单 logit → sigmoid；多类 → softmax 取 class 1
+            scores[i] = _parse_logits(logits)
 
         return scores
 

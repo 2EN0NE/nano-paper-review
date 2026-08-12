@@ -12,7 +12,7 @@
 #      broken set)
 #   2. Downloads ONNX models — 每个模型只拉取单个 INT8 量化版本
 #      (embedding: BAAI/bge-small-zh-v1.5 匹配默认 config；reranker:
-#      jinaai/jina-reranker-v3 用户偏好) 并写入 pack 内 config.yaml /
+#      jinaai/jina-reranker-v3 逐对精排不可用，已回退 bge) 并写入 pack 内 config.yaml /
 #      models-manifest.json，确保离线安装后模型名与 config 一致
 #   3. Copies project source + scripts/ (剔除 __pycache__)
 #   4. Packages everything into a portable tarball with fixed top-level dir
@@ -149,14 +149,14 @@ mkdir -p "$MODELS_DIR"
 
 # 模型选择（与 pack 内 config.yaml / models-manifest.json 保持一致）：
 #   embedding: BAAI/bge-small-zh-v1.5 — 匹配默认 config（bge-small，INT8 ~25MB）
-#   reranker:  jinaai/jina-reranker-v3 — 用户偏好（INT8 ~600MB）
+#   reranker:  BAAI/bge-reranker-v2-m3 — 默认（INT8 ~570MB）
 EMBEDDING_NAME="BAAI/bge-small-zh-v1.5"
 EMBEDDING_REPO="onnx-community/bge-small-zh-v1.5-ONNX"
 EMBEDDING_DIR="BAAI--bge-small-zh-v1.5"
 EMBEDDING_DIM="512"
-RERANKER_NAME="jinaai/jina-reranker-v3"
-RERANKER_REPO="s-lorin/jina-reranker-v3-onnx"
-RERANKER_DIR="jinaai--jina-reranker-v3"
+RERANKER_NAME="BAAI/bge-reranker-v2-m3"
+RERANKER_REPO="onnx-community/bge-reranker-v2-m3-ONNX"
+RERANKER_DIR="BAAI--bge-reranker-v2-m3"
 
 # 模型下载需要 huggingface-hub（开发机有网）；为避免污染系统 Python
 # （Homebrew Python 受 PEP 668 管控），在临时 venv 中安装后即清理。

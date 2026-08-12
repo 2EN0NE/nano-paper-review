@@ -46,13 +46,16 @@ _KNOWN_EMBEDDING_MODELS = {
     },
 }
 
-# 排序即推荐顺序：JINA 优先（用户偏好；INT8 单文件即可用）
+# 排序即推荐顺序：bge 优先（契约匹配、Apache-2.0；逐对打分经真实模型验证可用）。
+# 注意：jina-reranker-v3 已从表内移除——s-lorin/jina-reranker-v3-onnx 工件
+# 的 (1,2) logits 输出是整块 prompt 的全局分数，非每文档分数，逐对精排不可用
+# （真实模型验证：无关文档系统性高于相关文档）。
 _KNOWN_RERANKER_MODELS = {
-    "jinaai/jina-reranker-v3": {
-        "onnx_repo": "s-lorin/jina-reranker-v3-onnx",
-        "size_hint": "~600 MB（INT8 单文件，0.6B）",
+    "BAAI/bge-reranker-v2-m3": {
+        "onnx_repo": "onnx-community/bge-reranker-v2-m3-ONNX",
+        "size_hint": "~570 MB（INT8 单文件）",
         "tier": "best",
-        "description": "多语言 Reranker（0.6B，BEIR 领先），INT8 单文件开箱即用，CC-BY-NC-4.0（非商业）",
+        "description": "中文 Cross-Encoder（568M），Apache 2.0，逐对精排契约匹配",
     },
     "Qwen/Qwen3-Reranker-0.6B": {
         "onnx_repo": "onnx-community/Qwen3-Reranker-0.6B-ONNX",
@@ -60,13 +63,25 @@ _KNOWN_RERANKER_MODELS = {
         "tier": "balanced",
         "description": "中文 Reranker（0.6B，32K 上下文），Apache 2.0",
     },
-    "BAAI/bge-reranker-v2-m3": {
-        "onnx_repo": "onnx-community/bge-reranker-v2-m3-ONNX",
-        "size_hint": "~570 MB（INT8 单文件）",
-        "tier": "small",
-        "description": "中文 Cross-Encoder（568M），Apache 2.0",
-    },
 }
+
+
+# ── ONNX 仓库名 → 模型名 反查 ──
+# 同一模型可能同时出现在两处缓存：项目缓存（目录名=模型名）与 HF hub 缓存
+# （目录名=ONNX 转换仓库名）。反查让两者 display_name 一致，供 cli 合并去重，
+# 避免 `paper-review config` 里同一模型列出两条（如 onnx-community/
+# bge-reranker-v2-m3-ONNX 与 BAAI/bge-reranker-v2-m3 实际是同一份 ONNX）。
+_ONNX_REPO_TO_MODEL_NAME = {
+    info["onnx_repo"]: name
+    for table in (_KNOWN_EMBEDDING_MODELS, _KNOWN_RERANKER_MODELS)
+    for name, info in table.items()
+    if info.get("onnx_repo")
+}
+
+
+def _canonical_model_name(repo_or_name: str) -> str:
+    """把 ONNX 转换仓库名映射回 known 表模型名；表外仓库保持原样。"""
+    return _ONNX_REPO_TO_MODEL_NAME.get(repo_or_name, repo_or_name)
 
 
 @dataclass
@@ -122,12 +137,20 @@ def find_model_file(model_dir: str | Path) -> Path | None:
 
     onnx-community 仓库的量化文件名为 ``model_quantized.onnx`` 而非
     ``model.onnx``；运行时统一通过此函数定位，避免加载 fp32 大文件。
+    兼容两种布局：权重在模型目录根（下载/链接布局）或 ``onnx/`` 子目录
+    （HF hub 快照的混合布局：config/tokenizer 在根、权重在子目录）。
     """
     d = Path(model_dir)
     for name in RUNTIME_MODEL_FILE_NAMES:
         p = d / name
         if p.is_file() and p.stat().st_size > 0:
             return p
+    sub = d / "onnx"
+    if sub.is_dir():
+        for name in RUNTIME_MODEL_FILE_NAMES:
+            p = sub / name
+            if p.is_file() and p.stat().st_size > 0:
+                return p
     return None
 
 
@@ -312,7 +335,9 @@ def scan_huggingface_cache() -> list[DiscoveredModel]:
             if not _validate_model_dir(candidate, model_type):
                 continue
 
-            display_name = model_dir.name.replace("models--", "").replace("--", "/")
+            display_name = _canonical_model_name(
+                model_dir.name.replace("models--", "").replace("--", "/")
+            )
             dim = None
             if model_type == "embedding":
                 dim = _infer_dim(find_model_file(candidate))

@@ -12,7 +12,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from paper_review.search.reranker import CrossEncoderReranker, OnnxReranker
+from paper_review.search.reranker import (
+    CrossEncoderReranker,
+    OnnxReranker,
+    _parse_logits,
+)
 from paper_review.search.store import Paper, PaperMeta
 
 
@@ -155,12 +159,12 @@ class TestCrossEncoderReranker:
         assert reranker.model_name == RERANKER_MODEL_NAME
 
     def test_model_name_from_config(self):
-        """显式配置 reranker_model 时优先使用它（JINA 偏好生效的关键）。"""
+        """显式配置 reranker_model 时优先使用它。"""
         from paper_review.config import Config
 
-        cfg = Config(reranker_model="jinaai/jina-reranker-v3")
+        cfg = Config(reranker_model="Qwen/Qwen3-Reranker-0.6B")
         reranker = CrossEncoderReranker(config=cfg)
-        assert reranker.model_name == "jinaai/jina-reranker-v3"
+        assert reranker.model_name == "Qwen/Qwen3-Reranker-0.6B"
 
 
 class TestCrossEncoderRerankerWithMockOnnx:
@@ -204,6 +208,32 @@ class TestCrossEncoderRerankerWithMockOnnx:
         candidates = [_make_candidate(f"p{i}") for i in range(10)]
         result = reranker.rerank("query", candidates, top_n=3)
         assert len(result) == 3
+
+
+# ============================================================================
+# 评分解析（_parse_logits）
+# ============================================================================
+
+
+class TestScoreParsing:
+    def test_sigmoid_single_logit(self):
+        """bge-reranker-v2-m3（INT8 导出实际输出单 logit）→ sigmoid。"""
+        logits = np.array([[0.0]], dtype=np.float32)
+        assert _parse_logits(logits) == pytest.approx(0.5)
+
+    def test_softmax_two_classes_class1(self):
+        """Qwen3-Reranker：2 类 logits 取 class 1。"""
+        logits = np.array([[0.2, 1.8]], dtype=np.float32)
+        s = _parse_logits(logits)
+        exp = np.exp(np.array([0.2, 1.8]) - 1.8)
+        assert s == pytest.approx(float(exp[1] / exp.sum()))
+
+    def test_softmax_three_classes_class1(self):
+        """3 类 logits 取 class 1（多类 softmax 路径的一般化）。"""
+        logits = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+        s = _parse_logits(logits)
+        exp = np.exp(np.array([1.0, 2.0, 3.0]) - 3.0)
+        assert s == pytest.approx(float(exp[1] / exp.sum()))
 
 
 class TestCrossEncoderRerankerWorkers:

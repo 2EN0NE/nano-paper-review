@@ -148,8 +148,13 @@ class TestRealReranker:
         top_texts = [r.raw_text for r in results]
         relevant = ["深度学习", "Transformer", "自然语言处理"]
         assert any(kw in top_texts[0] for kw in relevant), f"第一篇应为相关文献: {top_texts[0]}"
-        # 多语言 reranker（如 jina-reranker-v3）对超短中文文本排序存在噪声，
-        # 不做"不相关论文绝不进 top-3"的过严断言；只验证 top-3 中相关文献占多数
+        # 注意：s-lorin/jina-reranker-v3-onnx 的 (1,2) logits 输出是整块 prompt 的全局分数，
+        # 非每文档分数——即使喂官方模板也无法区分相关/无关（实测无关文档系统性高于相关
+        # 文档，见代码评审记录）。拼接型契约（bge-reranker-v2-m3）无此问题。
+        # 残余风险：_find_reranker_model() 会选中用户缓存中任意 reranker（项目缓存优先，
+        # 其次 HF hub 缓存）——若旧 jina 缓存仍在（~/.cache/paper-review/models/jinaai--
+        # jina-reranker-v3 或 ~/.cache/huggingface/hub/models--s-lorin--jina-reranker-v3-onnx），
+        # 本断言仍会失败；清理旧缓存（或缓存中只有 bge）后恢复绿色。
         n_relevant = sum(1 for t in top_texts if any(kw in t for kw in relevant))
         assert n_relevant >= 2, f"top-3 应至少含 2 篇相关文献: {top_texts}"
 
@@ -175,6 +180,7 @@ class TestRealReranker:
         ]
         scores = reranker._reranker.predict(pairs)  # type: ignore[union-attr]
         assert scores.shape == (4,)
+        # 拼接型契约（bge/Qwen3）评分恒在 [0,1]（单 logit sigmoid / 多类 softmax）
         assert all(0.0 <= s <= 1.0 for s in scores)
 
 
@@ -183,7 +189,7 @@ class TestRealReranker:
 
 class TestEmbeddingMock:
     @pytest.fixture
-    def model_dir(self) -> Path:
+    def model_dir(self) -> Iterator[Path]:
         with tempfile.TemporaryDirectory() as tmpdir:
             mp = Path(tmpdir)
             (mp / "model.onnx").write_text("dummy")

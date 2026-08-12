@@ -32,7 +32,7 @@ pip install -e .
 `install.sh` 会交互式询问是否下载 ONNX 模型：
 
 - **Embedding 模型**（bge-small-zh-v1.5, ~96MB）— 建议下载，否则检索使用确定性哈希（仅测试可用）
-- **Reranker 模型**（bge-reranker-v2-m3, ~1.1GB fp16）— 可选项，不下载则检索跳过 Cross-Encoder 精排
+- **Reranker 模型**（bge-reranker-v2-m3, ~570MB INT8，Apache 2.0）— 可选项，不下载则检索跳过 Cross-Encoder 精排
 
 > **CPU-only 设计**：所有模型推理使用 ONNX Runtime，无需 PyTorch / CUDA。
 > 总内存约 2-2.5GB（含 reranker），仅 embedding 时约 500MB。
