@@ -21,7 +21,13 @@ import typer
 
 from paper_review.config import _is_initialized_data_dir, resolve_data_dir
 from paper_review.logging_config import setup_logging
-from paper_review.orchestrator import PoolProgress, run_pipeline
+from paper_review.orchestrator import (
+    PoolProgress,
+    detect_unfinished_tasks,
+    read_task_manifest,
+    run_pipeline,
+    write_task_manifest,
+)
 from paper_review.search.store import (
     Paper,
     PaperMeta,
@@ -417,6 +423,46 @@ def serve(
     app.run(host=host, port=port, debug=False)
 
 
+def _format_task_summary(task_dir: Path) -> str:
+    """格式化未完成任务摘要：Task ID + 发起日期 + 完成进度 + 中断位置。"""
+    manifest = read_task_manifest(task_dir)
+    subjects = manifest.get("subjects", [])
+    subject_dirs: dict[str, Path] = {s: task_dir / "intermediates" / s for s in subjects}
+    # 步骤全集优先取 manifest.steps（运行开始时写入的 per_subject 步骤全集），某
+    # subject 的每个步骤都有 output.json 才计为完成（避免“只完成 1/3 步也算 1 篇
+    # 完成”的高估）。老任务（无 steps 字段）回退磁盘并集——注意并集在“中断于首
+    # 步”时会缩小，把部分完成高估为完成，因此新任务一律写 steps。
+    step_names: set[str] = set(manifest.get("steps") or [])
+    if not step_names:
+        for sdir in subject_dirs.values():
+            if sdir.is_dir():
+                step_names.update(d.name for d in sdir.iterdir() if d.is_dir())
+    done = 0
+    for sdir in subject_dirs.values():
+        if sdir.is_dir() and all(
+            (sdir / st).is_dir() and (sdir / st / "output.json").exists() for st in step_names
+        ):
+            done += 1
+    name = task_dir.name
+    date_part = ""
+    if len(name) >= 15 and name[8] == "-":
+        date_part = f"{name[:8]} {name[9:15]}"
+    progress = f"{done}/{len(subjects)} 篇完成" if subjects else "subjects 未知"
+    summary = f"{name}  ·  {date_part} 发起  ·  {progress}"
+    # 展示管线名：续做门控不比对 pipeline，摘要展示它帮助用户识别跨管线续做风险
+    # （同名步骤的旧产物可能由另一条管线生成，会被静默跳过复用）。
+    pipeline_name = manifest.get("pipeline")
+    if pipeline_name:
+        summary += f"  ·  管线 {pipeline_name}"
+    prev_input = manifest.get("input")
+    if prev_input:
+        summary += f"  ·  输入 {prev_input}"
+    interrupted_at = manifest.get("interrupted_at_step")
+    if interrupted_at:
+        summary += f"  ·  中断于 {interrupted_at}"
+    return summary
+
+
 @app.command()
 def review(
     ctx: typer.Context,
@@ -443,7 +489,9 @@ def review(
         help="仅运行指定步骤（需已有中间产物）",
     ),
     skip_warnings: bool = typer.Option(
-        False, "--skip-warnings", help="无人值守模式：跳过所有交互式确认和警告"
+        False,
+        "--skip-warnings",
+        help="无人值守模式：跳过所有交互式确认和警告（未完成的任务会被标记为 abandoned，不再提示续做）",
     ),
 ):
     """
@@ -511,6 +559,51 @@ def review(
                 typer.echo(f"无效选择: {choice}")
                 raise typer.Exit(1)
 
+    # ── Resume：检测未完成任务 ──
+    # 交互式模式：询问继续最近一批 / 重新一批 / 取消。
+    # 无人值守模式（--skip-warnings）：无交互，直接弃置所有未完成任务后新建一批——
+    # 否则中断遗留的 running 任务永不清理，result/ 下持续累积，且后续交互式运行
+    # 会把陈旧批次当作“最近一批”提示续做（无人值守即“重新开始”语义）。
+    resume_task_dir = None
+    unfinished = detect_unfinished_tasks(default_output)
+    if skip_warnings:
+        if unfinished:
+            for t in unfinished:
+                write_task_manifest(t, status="abandoned")
+            typer.echo(f"⚠ 无人值守模式：已弃置 {len(unfinished)} 个未完成任务，新建一批")
+    elif unfinished:
+        latest = unfinished[0]
+        current_input = str(path.absolute())
+        typer.echo(f"\n⚠ 检测到 {len(unfinished)} 个未完成的任务（中断遗留）：")
+        for i, t in enumerate(unfinished[:3], 1):
+            marker = " [最近]" if i == 1 else " [次近]" if i == 2 else ""
+            m = read_task_manifest(t)
+            mismatch = bool(m.get("input")) and str(Path(m["input"]).absolute()) != current_input
+            hint = "（输入与当前不一致：续做将重跑全部步骤并覆盖已有产物）" if mismatch else ""
+            typer.echo(f"  {marker} {_format_task_summary(t)}{hint}")
+        if len(unfinished) > 3:
+            typer.echo(f"  … 共 {len(unfinished)} 个未完成任务")
+        typer.echo("\n继续哪一批？")
+        typer.echo(f"  [1] 继续最近一批（{latest.name}）")
+        typer.echo("  [2] 重新开始一批（新建任务，放弃未完成任务）")
+        typer.echo("  [3] 取消")
+        choice = typer.prompt("选择", default="1")
+        if choice == "1":
+            resume_task_dir = latest
+            typer.echo(f"  ↻ 续做任务 {latest.name}")
+            lm = read_task_manifest(latest)
+            if bool(lm.get("input")) and str(Path(lm["input"]).absolute()) != current_input:
+                typer.echo(
+                    "  ⚠ 输入与任务原输入不一致：将全量重跑（不跳过已有产物），避免跨批次混批"
+                )
+        elif choice == "2":
+            for t in unfinished:
+                write_task_manifest(t, status="abandoned")
+            typer.echo(f"  ⊘ 已放弃 {len(unfinished)} 个未完成任务，新建一批")
+        else:
+            typer.echo("已取消")
+            raise typer.Exit(0)
+
     # ── 执行 ──
     if pipeline_path.is_dir():
         result = run_pipeline(
@@ -521,6 +614,7 @@ def review(
             target_phase=phase,
             target_step=step,
             pool_progress=progress,
+            resume_task_dir=resume_task_dir,
         )
     else:
         # pipeline_path 是 pipeline.yaml 文件
@@ -532,6 +626,7 @@ def review(
             target_phase=phase,
             target_step=step,
             pool_progress=progress,
+            resume_task_dir=resume_task_dir,
         )
 
     typer.echo(f"\nPipeline 完成: {result.subject}")

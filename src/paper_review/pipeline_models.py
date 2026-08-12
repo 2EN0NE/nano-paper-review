@@ -143,8 +143,17 @@ class PoolConfig:
     profile: str = "fixed"  # 'fixed' | 'dynamic'
     workers_min: int = 1
     workers_max: int = 0  # 0 = 和 workers 相同
+    granularity: str = (
+        "subject"  # 'subject'（worker=一个 Subject 跑完全部 Steps）| 'step'（按 Step 分波次）
+    )
 
     def __post_init__(self):
+        # 粒度合法性校验：非法值回退 subject（保持现有行为）
+        if self.granularity not in ("subject", "step"):
+            logger.warning(
+                "pool.granularity=%r is invalid — falling back to 'subject'", self.granularity
+            )
+            self.granularity = "subject"
         # 自动推导：workers=0 时根据 CPU 核数
         if self.workers == 0:
             cpus = os.cpu_count() or 1
@@ -269,6 +278,7 @@ def _parse_phase(data: dict) -> PhaseConfig:
                 profile=pool_data.get("profile", "fixed"),
                 workers_min=pool_data.get("workers_min", 1),
                 workers_max=pool_data.get("workers_max", 0),
+                granularity=pool_data.get("granularity", "subject"),
             )
             if pool_data
             else None
@@ -417,7 +427,9 @@ class PipelineResult:
     success: bool = True
     step_results: list[StepResult] = field(default_factory=list)
     task_id: str = ""
-    task_dir: Path | None = None
+    task_dir: Path = field(
+        default_factory=lambda: Path("")
+    )  # run_pipeline 恒赋值；空值仅 dataclass 默认占位
     conclusion: str = ""
 
 

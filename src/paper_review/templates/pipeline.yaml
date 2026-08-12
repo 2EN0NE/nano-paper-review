@@ -68,7 +68,9 @@ phases:
       profile: dynamic # 并发策略：fixed（固定）| dynamic（自适应）
       workers_min: 1 # dynamic 模式最小 worker 数
       workers_max: 5 # dynamic 模式最大 worker 数
-      timeout: 600 # 单个 Subject 超时秒数（10分钟/篇，.md Agent 步骤可能较慢）
+      granularity: subject # worker 拆分粒度：subject（一个 Subject 跑完全部 Steps）
+      #            | step（按 Step 分波次，波内多 Subject 并行）
+      timeout: 600 # 单个 Subject 超时秒数（10分钟/篇，.md Agent 步骤可能较慢）；step 粒度下为单步超时上限
       ordered: true # 是否按 Subject 原始顺序返回结果
 
   # ── Post Phase（批量执行）───────────────────────────────────────────────

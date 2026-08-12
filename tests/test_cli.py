@@ -321,3 +321,58 @@ class TestReviewCommand:
         """缺少 path 参数应报错。"""
         result = runner.invoke(app, ["review"])
         assert result.exit_code != 0
+
+    def test_format_task_summary_progress_requires_all_steps(self, tmp_path):
+        """未完成任务摘要：只完成部分步骤的 subject 不计为“篇完成”。
+
+        回归：曾只要有任意一步 output.json 即计完成——3 步只完成 1 步也显示“1/N 篇完成”。
+        """
+        import json
+
+        from paper_review.cli import _format_task_summary
+
+        task_dir = tmp_path / "result" / "20260812-100000-abc"
+        for step in ("01-s", "02-s"):
+            (task_dir / "intermediates" / "a" / step).mkdir(parents=True)
+            (task_dir / "intermediates" / "a" / step / "output.json").write_text("{}")
+        # b 只完成 01-s（02-s 缺失）
+        (task_dir / "intermediates" / "b" / "01-s").mkdir(parents=True)
+        (task_dir / "intermediates" / "b" / "01-s" / "output.json").write_text("{}")
+        (task_dir / "task.json").write_text(
+            json.dumps({"subjects": ["a", "b"], "status": "running", "input": "/tmp/pdfs"})
+        )
+
+        summary = _format_task_summary(task_dir)
+        assert "1/2 篇完成" in summary, summary
+        assert "/tmp/pdfs" in summary, f"摘要应展示旧输入路径: {summary}"
+
+    def test_format_task_summary_uses_manifest_steps(self, tmp_path):
+        """摘要的步骤全集优先取 manifest.steps：中断于首步时不高估完成度。
+
+        回归：曾以磁盘步骤目录并集作为全集——中断于首步时并集缩小（只含已触及的
+        步骤），部分完成的 subject 被计为“篇完成”。
+        """
+        import json
+
+        from paper_review.cli import _format_task_summary
+
+        task_dir = tmp_path / "result" / "20260812-100000-abc"
+        # 3 步管线，所有 subject 均中断于 step 01：磁盘并集只有 {01-s}
+        for s in ("a", "b"):
+            (task_dir / "intermediates" / s / "01-s").mkdir(parents=True)
+            (task_dir / "intermediates" / s / "01-s" / "output.json").write_text("{}")
+        # manifest.steps 记录真实步骤全集（02-s/03-s 尚未被任何 subject 触及）
+        (task_dir / "task.json").write_text(
+            json.dumps(
+                {
+                    "subjects": ["a", "b"],
+                    "steps": ["01-s", "02-s", "03-s"],
+                    "status": "running",
+                    "input": "/tmp/pdfs",
+                }
+            )
+        )
+
+        summary = _format_task_summary(task_dir)
+        # 无 subject 完成全部 3 步 → 0 篇完成（磁盘并集回退会误报 2/2）
+        assert "0/2 篇完成" in summary, summary

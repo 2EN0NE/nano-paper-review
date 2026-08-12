@@ -345,8 +345,14 @@ class TestPoolEnvOverride:
 
 
 class TestPoolTimeout:
-    def test_timeout_marks_subject_as_error(self, tmp_path):
-        """pool.timeout 对超时 Subject 标记 error（短 sleep 替代原 30s）。"""
+    def test_timeout_marks_subject_as_error(self, tmp_path, monkeypatch):
+        """pool.timeout 对超时 Subject 标记 error（未在排空窗口内恢复的超时才报 fail）。
+
+        回归：超时的 fail 事件延迟到排空后按最终结果上报——worker 在窗口内恢复则
+        报 complete（不报 fail，避免双报导致 pending 为负）；未恢复才报 fail。
+        """
+        # 缩短排空窗口：5s 步骤在超时（t≈2s）后不会被排空收割 → 未恢复 → fail
+        monkeypatch.setattr("paper_review.orchestrator._TIMEOUT_DRAIN_FUTURES", 1)
         output_dir = tmp_path / "output"
         steps_dir = tmp_path / "steps"
         steps_dir.mkdir(parents=True)
@@ -367,7 +373,7 @@ class TestPoolTimeout:
 
         progress = PoolProgress()
 
-        run_pipeline(
+        result = run_pipeline(
             pipeline_yaml={
                 "name": "timeout-test",
                 "output_dir": str(output_dir),
@@ -383,7 +389,23 @@ class TestPoolTimeout:
         )
 
         fail_events = [e for e in progress.events if e.event_type == "subject_fail"]
-        assert len(fail_events) >= 1
+        assert len(fail_events) >= 1, [e for e in progress.events]
+        # 未恢复的超时 → 步骤结果为 error（而非被排空收割为 ok）
+        assert any(r.status == "error" for r in result.step_results), result.step_results
+
+        # 等待残留 worker 线程结束：未恢复的步骤仍在进程内运行（PyStepRunner 经
+        # runpy 进程内执行并持全局 _py_step_lock）——run_pipeline 返回时它们还
+        # 在跑，不等待会让本文件后续测试的步骤阻塞在锁上、被其 1s 预算误杀。
+        import time as _time
+
+        deadline = _time.monotonic() + 10
+        while _time.monotonic() < deadline:
+            outs = list((output_dir / "result").rglob("**/01-slow/output.json"))
+            if len(outs) >= 2:
+                break
+            _time.sleep(0.1)
+        else:
+            raise AssertionError("残留 worker 未在预期时间内完成")
 
     def test_timeout_does_not_block_other_subjects(self, tmp_path):
         """一个 Subject 超时不阻塞其他 Worker。"""

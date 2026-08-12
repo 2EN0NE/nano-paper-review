@@ -14,8 +14,11 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import threading
 import time
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -253,15 +256,31 @@ def _execute_per_subject(
     pool_progress: PoolProgress | None = None,
     pp: PipelineProgress | None = None,
     step_timeout: int = 0,
+    skip_completed: bool = False,
 ) -> dict[str, list[StepResult]]:
     """逐 Subject 模式：每个 Subject 顺序执行所有 Step。
 
     当 pool.workers > 1 且 subjects > 1 时启用 ThreadPoolExecutor 并发。
+    skip_completed=True（Resume 续做）时，已有 output.json 的 Subject-Step 跳过。
     """
     pool_cfg = phase.pool
     use_pool = pool_cfg is not None and pool_cfg.workers > 1 and len(subjects) > 1
 
     if use_pool:
+        if pool_cfg.granularity == "step":  # type: ignore[union-attr]
+            return _execute_per_step_pooled(
+                phase=phase,
+                steps=steps,
+                subjects=subjects,
+                output_dir=output_dir,
+                base_env=base_env,
+                executor=executor,
+                pool_cfg=pool_cfg,  # type: ignore[arg-type]  # guard above
+                pool_progress=pool_progress,
+                pp=pp,
+                step_timeout=step_timeout,
+                skip_completed=skip_completed,
+            )
         return _execute_per_subject_pooled(
             phase=phase,
             steps=steps,
@@ -273,6 +292,7 @@ def _execute_per_subject(
             pool_progress=pool_progress,
             pp=pp,
             step_timeout=step_timeout,
+            skip_completed=skip_completed,
         )
 
     # 顺序执行
@@ -298,6 +318,7 @@ def _execute_per_subject(
             executor=executor,
             pp=pp,
             step_timeout=step_timeout,
+            skip_completed=skip_completed,
         )
         all_results[subject] = subject_results
 
@@ -317,12 +338,24 @@ def _run_steps_for_subject(
     pp: PipelineProgress | None = None,
     step_timeout: int = 0,
     dyn_pool: DynamicPool | None = None,
+    started: dict[str, float] | None = None,
+    skip_completed: bool = False,
+    seed_results: list[StepResult] | None = None,
 ) -> list[StepResult]:
     """对单个 Subject 执行全部 Step（顺序）。
 
     dyn_pool 不为 None 时，每个 step 完成后向 DynamicPool 报告观测结果。
+    started 不为 None 时（池化模式），记录该 Subject 实际开始执行的时间——
+    池化超时以此刻为起点（排队等待时间不计入超时）。
+    skip_completed=True（Resume 续做）时，已有 output.json 的步骤跳过（复用产物）。
+    seed_results 不为 None 时（step 粒度分波执行），以它作为前序波次已完成的
+    StepResult 种子——step 粒度每个波次只执行一个 step，`.md` 步骤模板的
+    `{intermediates.*}` 变量依赖 prior_results，必须把前序波次的产物带进来。
     """
-    subject_results: list[StepResult] = []
+    if started is not None:
+        started[subject] = time.monotonic()
+
+    subject_results: list[StepResult] = list(seed_results) if seed_results else []
     result_base = base_env.get("PIPELINE_RESULT_DIR", str(output_dir))
     t0 = time.monotonic()
 
@@ -331,6 +364,36 @@ def _run_steps_for_subject(
     )
 
     for step in steps:
+        step_dir = Path(result_base) / "intermediates" / subject / step.stem
+
+        # Resume 续做：已有 output.json 的步骤跳过（复用产物，不重跑）。
+        # 仅当产物 status 为 ok/skipped 才跳过——status=error 的失败产物不跳过
+        # （重跑重试），否则失败会被续做永久固化。
+        if skip_completed and (step_dir / "output.json").exists():
+            try:
+                out = json.loads((step_dir / "output.json").read_text(encoding="utf-8"))
+                result = None
+                if out.get("status", "ok") in ("ok", "skipped"):
+                    result = StepResult(
+                        step_name=step.stem,
+                        status=out.get("status", "ok"),
+                        error=out.get("error"),
+                        subject=subject,
+                        data=out.get("data", {}),
+                    )
+            except (json.JSONDecodeError, OSError):
+                result = None  # 产物损坏 → 正常重跑
+            if result is not None:
+                subject_results.append(result)
+                logger.info(
+                    "  [%s] ⏭ step '%s' skipped (resume: output.json exists)",
+                    subject,
+                    step.stem,
+                )
+                if pp:
+                    pp.review_step_done(subject)
+                continue
+
         # 动态池：用 with 保护槽位生命周期，异常时自动释放
         slot_cm = dyn_pool.worker_slot() if dyn_pool else nullcontext()
 
@@ -340,7 +403,6 @@ def _run_steps_for_subject(
             adjusted_timeout = math.floor(step_timeout * dyn_pool.timeout_multiplier)
 
         with slot_cm:
-            step_dir = Path(result_base) / "intermediates" / subject / step.stem
             env = {
                 **base_env,
                 "PIPELINE_PHASE": phase.name,
@@ -391,6 +453,9 @@ def _run_steps_for_subject(
 # 池化执行
 # ============================================================================
 
+# 超时 worker 排空等待上限（秒）：防御标准库 wait 对已 cancel future 的漏计数死锁
+_TIMEOUT_DRAIN_FUTURES = 30
+
 
 def _make_error_results(
     steps: list[StepFile],
@@ -404,6 +469,20 @@ def _make_error_results(
     ]
 
 
+def _report_subject_failure(
+    pool_progress: PoolProgress | None,
+    subject_state: dict[str, str],
+    subject: str,
+    status: str,
+    error: str,
+) -> None:
+    """step 粒度下向 PoolProgress 上报 subject 失败（仅首次失败上报，避免重复计数）。"""
+    if pool_progress is None or subject_state.get(subject) == "failed":
+        return
+    pool_progress.on_subject_fail(subject, status, error)
+    subject_state[subject] = "failed"
+
+
 def _execute_per_subject_pooled(
     phase: PhaseConfig,
     steps: list[StepFile],
@@ -415,6 +494,7 @@ def _execute_per_subject_pooled(
     pool_progress: PoolProgress | None = None,
     pp: PipelineProgress | None = None,
     step_timeout: int = 0,
+    skip_completed: bool = False,
 ) -> dict[str, list[StepResult]]:
     """Worker 池并发处理多个 Subject。
 
@@ -432,6 +512,17 @@ def _execute_per_subject_pooled(
         dyn_pool = None
 
     per_subject_timeout = pool_cfg.timeout if pool_cfg.timeout > 0 else None
+
+    # 墙钟兜底上限：worker 卡死（.py 步骤进程内执行无 subprocess 超时）时，
+    # 排队未开始的 Subject 永远记录不到 started → 永不超时 → 主循环无限挂起。
+    # 上限 = 全部 subject 最坏串行化时间（ceil 波次 × 单 subject 预算）；
+    # dynamic 用 workers_min（DynamicPool 可收缩并发）避免误杀。
+    pool_start = time.monotonic()
+    if per_subject_timeout is not None:
+        wall_workers = actual_workers if not is_dynamic else max(1, pool_cfg.workers_min)
+        pool_wall_limit = math.ceil(len(subjects) / wall_workers) * per_subject_timeout
+    else:
+        pool_wall_limit = None
 
     if is_dynamic:
         logger.info(
@@ -453,8 +544,15 @@ def _execute_per_subject_pooled(
 
     all_results: dict[str, list[StepResult]] = {}
     errors: list[str] = []
-    start_times: dict[str, float] = {}
+    # Subject 实际开始执行的时间（worker 线程入口记录）；排队等待不计入超时
+    started: dict[str, float] = {}
     timed_out_futures: set[Future] = set()
+    # 超时判定会立刻 cancel/写 error 占位，但 worker 仍可能实质完成（cancel 对
+    # RUNNING future 无效，排空窗口内完成即“晚到成功”）。PoolProgress 的 fail 与
+    # complete 互斥（pending = total - completed - failed），故超时的 fail 事件
+    # 延迟到排空后按最终结果上报：恢复 → complete；未恢复 → fail（曾双报导致
+    # pending 出现负值）。
+    deferred_timeout_fails: dict[str, str] | None = {} if pool_progress else None
 
     tp_executor = ThreadPoolExecutor(max_workers=actual_workers)
     try:
@@ -471,9 +569,10 @@ def _execute_per_subject_pooled(
                 pp,
                 step_timeout,
                 dyn_pool,
+                started,
+                skip_completed,
             )
             future_map[fut] = s
-            start_times[s] = time.monotonic()
             if pool_progress:
                 pool_progress.on_subject_start(s)
             if pp:
@@ -488,7 +587,7 @@ def _execute_per_subject_pooled(
                 try:
                     results = future.result()
                     all_results[subject] = results
-                    elapsed = time.monotonic() - start_times[subject]
+                    elapsed = time.monotonic() - started.get(subject, time.monotonic())
                     logger.info("  [%s] ✓ completed in %.0fs", subject, elapsed)
                     if pool_progress:
                         pool_progress.on_subject_complete(subject, results)
@@ -503,21 +602,43 @@ def _execute_per_subject_pooled(
             now = time.monotonic()
             for future in list(pending):
                 subject = future_map[future]
+                actual_start = started.get(subject)
                 if (
                     per_subject_timeout is not None
-                    and (now - start_times[subject]) > per_subject_timeout
+                    and actual_start is not None
+                    and (now - actual_start) > per_subject_timeout
                 ):
                     pending.discard(future)
                     timed_out_futures.add(future)
                     future.cancel()
                     errors.append(subject)
                     logger.error("  [%s] ✗ timed out after %ds", subject, per_subject_timeout)
-                    if pool_progress:
-                        pool_progress.on_subject_fail(
-                            subject, "timeout", f"Timed out after {per_subject_timeout}s"
-                        )
+                    if deferred_timeout_fails is not None:
+                        deferred_timeout_fails[subject] = f"Timed out after {per_subject_timeout}s"
                     all_results[subject] = _make_error_results(
                         steps, subject, f"Timed out after {per_subject_timeout}s"
+                    )
+                elif (
+                    pool_wall_limit is not None
+                    and actual_start is None
+                    and (now - pool_start) > pool_wall_limit
+                ):
+                    # 排队超过墙钟上限仍未开始：worker 大概率卡死，止损放弃
+                    pending.discard(future)
+                    timed_out_futures.add(future)
+                    future.cancel()
+                    errors.append(subject)
+                    logger.error(
+                        "  [%s] ✗ queued but never started after %ds — worker may be stuck",
+                        subject,
+                        pool_wall_limit,
+                    )
+                    if deferred_timeout_fails is not None:
+                        deferred_timeout_fails[subject] = (
+                            f"Never started after {pool_wall_limit}s (worker stuck?)"
+                        )
+                    all_results[subject] = _make_error_results(
+                        steps, subject, f"Never started after {pool_wall_limit}s (worker stuck?)"
                     )
 
             if not pp:
@@ -531,28 +652,308 @@ def _execute_per_subject_pooled(
         tp_executor.shutdown(wait=False, cancel_futures=True)
 
     # 等待超时 worker 实质完成
+    # 兜底 timeout：标准库 wait 对"已 cancel（CANCELLED）且通知发生在 waiter 安装前"
+    # 的 future 可能漏计数导致死锁——给上限避免卡死（正常场景 RUNNING worker 秒级完成）。
     if timed_out_futures:
-        done_timed_out, _ = wait(timed_out_futures)
+        done_timed_out, not_done = wait(timed_out_futures, timeout=_TIMEOUT_DRAIN_FUTURES)
         for future in done_timed_out:
             subject = future_map[future]
             try:
                 results = future.result()
                 all_results[subject] = results
-                elapsed = time.monotonic() - start_times[subject]
+                elapsed = time.monotonic() - started.get(subject, time.monotonic())
                 logger.info("  [%s] ✓ completed after timeout in %.0fs", subject, elapsed)
-                # 恢复完成后同步 pool_progress 和 errors 列表
+                # 恢复完成：上报 complete（fail 事件已延迟，此处不双报）并清理 errors
                 if pool_progress:
                     pool_progress.on_subject_complete(subject, results)
                 if subject in errors:
                     errors.remove(subject)
-            except (CancelledError, Exception) as e:
+            except Exception as e:
                 logger.debug("  [%s] timed-out future resolved with %s", subject, type(e).__name__)
+                # 未恢复（CANCELLED / 异常结束）：按延迟记录的原始超时原因上报 fail
+                if pool_progress and deferred_timeout_fails is not None:
+                    pool_progress.on_subject_fail(
+                        subject,
+                        "timeout",
+                        deferred_timeout_fails.pop(subject, "timed out"),
+                    )
+
+        if not_done:
+            logger.warning(
+                "  %d timed-out future(s) unresolved after drain timeout — results dropped",
+                len(not_done),
+            )
+            if pool_progress and deferred_timeout_fails is not None:
+                for future in not_done:
+                    subject = future_map[future]
+                    pool_progress.on_subject_fail(
+                        subject,
+                        "timeout",
+                        deferred_timeout_fails.pop(subject, "timed out"),
+                    )
 
     if pool_cfg.ordered:
         all_results = {s: all_results[s] for s in subjects if s in all_results}
 
     if errors:
         logger.warning("Pool mode finished with %d failed subject(s): %s", len(errors), errors)
+
+    return all_results
+
+
+def _execute_per_step_pooled(
+    phase: PhaseConfig,
+    steps: list[StepFile],
+    subjects: list[str],
+    output_dir: Path,
+    base_env: dict,
+    executor: StepExecutor,
+    pool_cfg: PoolConfig,
+    pool_progress: PoolProgress | None = None,
+    pp: PipelineProgress | None = None,
+    step_timeout: int = 0,
+    skip_completed: bool = False,
+) -> dict[str, list[StepResult]]:
+    """step 级粒度：按 Step 分波次（barrier），波内多 Subject 并行。
+
+    - 外层循环 Steps（顺序）：所有 Subject 完成当前 Step 后才进入下一 Step；
+    - 波内：ThreadPoolExecutor 并行所有 Subject 的当前 Step（每波新建线程池）；
+    - 单步预算 = pool.timeout（>0 时，模板契约“step 粒度下为单步超时上限”）
+      否则 step_timeout；超时从 Subject 实际开始起算（排队等待不计入）；
+      预算同时作为 executor 超时传入（PIPELINE_STEP_TIMEOUT），避免估算值
+      小于配置上限时步骤被提前杀掉；
+    - 波次墙钟上限 = ceil(subjects/workers) × 单步预算，兜底 cancel 无效的僵尸 worker
+      （.py 步骤进程内执行无 subprocess 超时，卡死必须由这里兜底）；
+    - profile='dynamic' 时 DynamicPool 跨波共享，自适应观测跨波累计；
+    - 前序波次产物通过 seed_results 传入（prior_results 种子）：step 粒度每个
+      波次只执行一个 step，`.md` 步骤模板的 {intermediates.*} 变量依赖
+      prior_results，必须带上已完成的 StepResult（barrier 保证前序产物已落盘）。
+    """
+    is_dynamic = pool_cfg.profile == "dynamic"
+    if is_dynamic:
+        actual_workers = pool_cfg.workers_max
+        total_steps = len(subjects) * len(steps)
+        dyn_pool = DynamicPool(pool_cfg, total_steps)
+    else:
+        actual_workers = min(pool_cfg.workers, len(subjects))
+        dyn_pool = None
+
+    # step 粒度下单步预算：pool.timeout > 0 时优先（YAML 注释声明的契约），否则用
+    # phase 估算的 step_timeout。波次墙钟兜底 = 全部 subject 最坏串行化时间（ceil 波次 ×
+    # 单步预算），正常排队场景足够；僵尸 worker 卡死时由其收尾（不会无限等待）。
+    # dynamic 与 subject 粒度一致用 workers_min（DynamicPool 可收缩并发）避免误杀
+    # 排队中的 Subject——若按初始 workers 预算，池收缩后真实串行化时间会超出上限。
+    effective_step_timeout = pool_cfg.timeout if pool_cfg.timeout > 0 else step_timeout
+    if effective_step_timeout > 0:
+        wave_workers = actual_workers if not is_dynamic else max(1, pool_cfg.workers_min)
+        wave_wall_limit = math.ceil(len(subjects) / wave_workers) * effective_step_timeout
+    else:
+        # 与 subject 粒度一致：无超时配置（pool.timeout=0 且估算为 0）不设墙钟上限。
+        # 曾回退 _TIMEOUT_DRAIN_FUTURES（30s）——"无超时"被静默改成 30s 硬上限。
+        wave_wall_limit = None
+
+    logger.info(
+        "Granularity=step — %d step(s) × %d subject(s), %d worker(s)/wave (step_timeout=%ds)",
+        len(steps),
+        len(subjects),
+        actual_workers,
+        effective_step_timeout,
+    )
+
+    all_results: dict[str, list[StepResult]] = {}
+    errors: set[str] = set()
+    # on_failure=abort 的 subject：本波步骤失败后不再提交后续波次（与 subject 粒度
+    # break 语义一致——曾每波无条件提交全部 subject，abort 被静默忽略）。
+    aborted: set[str] = set()
+    # PoolProgress 为 subject 级事件：step 模式每波提交全部 subject，只能
+    # 首次波次上报 start、失败首次上报 fail、最后波次成功上报 complete
+    # （按波次重复上报会虚增 completed/failed 计数）。
+    subject_state: dict[str, str] = {}
+
+    for step_index, step in enumerate(steps):
+        last_wave = step_index == len(steps) - 1
+        wave_results: dict[str, StepResult] = {}
+        started: dict[str, float] = {}
+        canceled: set[Future] = set()
+        wave_start = time.monotonic()
+        tp_executor = ThreadPoolExecutor(max_workers=actual_workers)
+        # 提前初始化：submit 中途抛异常时 finally 内收割僵尸仍需访问（避免 unbound）
+        future_map: dict[Future, str] = {}
+        try:
+            for s in subjects:
+                if s in aborted:
+                    continue  # abort：本 subject 不再参与后续波次
+                fut = tp_executor.submit(
+                    _run_steps_for_subject,
+                    s,
+                    [step],  # 单步波次：每个 Subject 只跑当前 Step
+                    phase,
+                    output_dir,
+                    base_env,
+                    executor,
+                    pp,
+                    effective_step_timeout,  # 单步预算同时作为 executor 超时（pool.timeout 契约）
+                    dyn_pool,
+                    started,
+                    skip_completed,
+                    all_results.get(s, []),  # 前序波次产物作为 prior_results 种子
+                )
+                future_map[fut] = s
+                if s not in subject_state:
+                    subject_state[s] = "started"
+                    if pool_progress:
+                        pool_progress.on_subject_start(s)
+                    if pp:
+                        pp.review_subject_running(s)
+
+            # barrier：轮询等待波内全部完成。每个 Subject 的超时从“实际开始”起算
+            # （worker 入口记录于 started），排队未开始的 Subject 不计入超时——
+            # 与 subject 粒度修复语义一致，避免大批量排队被集体冤杀。
+            pending = set(future_map.keys())
+            while pending:
+                done, pending = wait(pending, timeout=1.0)
+                now = time.monotonic()
+                for fut in done:
+                    s = future_map[fut]
+                    try:
+                        res = fut.result()
+                        # res = 前序波次种子 + 当前步骤结果；取最后一项（当前步骤）。
+                        # 曾取 res[0]——第 2 波起取到的是前序波次产物，当前步骤结果被
+                        # 丢弃，导致结果列表重复首步骤、报告/CLI 统计缺后续步骤。
+                        wave_results[s] = (
+                            res[-1] if res else _make_error_results([step], s, "no result")[0]
+                        )
+                        if pool_progress and last_wave and subject_state.get(s) == "started":
+                            pool_progress.on_subject_complete(s, res)
+                            subject_state[s] = "done"
+                    except Exception as e:
+                        wave_results[s] = StepResult(
+                            step_name=step.stem, status="error", error=str(e), subject=s
+                        )
+                        errors.add(s)
+                        _report_subject_failure(pool_progress, subject_state, s, "error", str(e))
+                        if phase.retry.on_failure == "abort":
+                            aborted.add(s)
+                    else:
+                        # 正常完成但状态为 error（重试耗尽）→ on_failure=abort 时停止该 subject
+                        if (
+                            phase.retry.on_failure == "abort"
+                            and wave_results.get(s) is not None
+                            and wave_results[s].status == "error"
+                        ):
+                            aborted.add(s)
+                            # 上报失败：abort 后该 subject 不再进入最后波次，
+                            # 不报 complete 也不报 fail 会让 PoolProgress 出现 pending 泄漏
+                            # （曾只处理异常/超时分支，error-status 结果被漏报）。
+                            _report_subject_failure(
+                                pool_progress,
+                                subject_state,
+                                s,
+                                "error",
+                                wave_results[s].error or "step failed",
+                            )
+
+                # 已实际开始且超过单步预算的 Subject 判超时（排队未开始的不计）
+                for fut in list(pending):
+                    s = future_map[fut]
+                    st = started.get(s)
+                    if (
+                        effective_step_timeout > 0
+                        and st is not None
+                        and (now - st) > effective_step_timeout
+                    ):
+                        pending.discard(fut)
+                        canceled.add(fut)
+                        fut.cancel()
+                        errors.add(s)
+                        wave_results[s] = _make_error_results(
+                            [step], s, f"step timed out after {effective_step_timeout}s"
+                        )[0]
+                        logger.error(
+                            "  [%s] ✗ step '%s' timed out after %ds",
+                            s,
+                            step.stem,
+                            effective_step_timeout,
+                        )
+                        _report_subject_failure(
+                            pool_progress,
+                            subject_state,
+                            s,
+                            "timeout",
+                            f"step timed out after {effective_step_timeout}s",
+                        )
+                        if phase.retry.on_failure == "abort":
+                            # 与 error-status/异常分支一致：abort 策略对超时同样生效
+                            aborted.add(s)
+
+                # 波次墙钟兜底：僵尸 worker 占住线程/槽位时排队者永远无法开始，
+                # 到上限后整体放弃剩余（僵尸场景无法真正 kill 线程，只能止损）
+                if wave_wall_limit is not None and pending and (now - wave_start) > wave_wall_limit:
+                    for fut in list(pending):
+                        s = future_map[fut]
+                        pending.discard(fut)
+                        canceled.add(fut)
+                        fut.cancel()
+                        errors.add(s)
+                        wave_results[s] = _make_error_results(
+                            [step], s, f"wave timed out after {wave_wall_limit}s"
+                        )[0]
+                        logger.error(
+                            "  [%s] ✗ step '%s' wave timeout after %ds",
+                            s,
+                            step.stem,
+                            wave_wall_limit,
+                        )
+                        _report_subject_failure(
+                            pool_progress,
+                            subject_state,
+                            s,
+                            "timeout",
+                            f"wave timed out after {wave_wall_limit}s",
+                        )
+                        if phase.retry.on_failure == "abort":
+                            aborted.add(s)
+        finally:
+            tp_executor.shutdown(wait=False, cancel_futures=True)
+            # 有界等待被 cancel 但仍在运行的 worker 结束：cancel 对 RUNNING future
+            # 无效，僵尸继续跑会破坏 barrier（同 Subject 下一步与其并发）并占用
+            # DynamicPool 槽位导致后续波次级联超时。等它完成以恢复顺序不变量；
+            # 无限循环的僵尸由兜底超时放弃（daemon 线程随进程结束清理）。
+            zombies = [f for f in canceled if not f.done()]
+            if zombies:
+                done_zombies, _ = wait(zombies, timeout=_TIMEOUT_DRAIN_FUTURES)
+                # 收割实际完成的僵尸结果：波次超时后 worker 仍可能实质完成（cancel
+                # 对 RUNNING future 无效，output.json 已落盘）。用真实结果覆盖 error
+                # 占位，与 subject 粒度排空回收一致——曾静默丢弃，导致“报告 error 但
+                # 磁盘产物 ok、续做又跳过该步骤”的视图分裂。
+                for fut in done_zombies:
+                    s = future_map[fut]
+                    try:
+                        res = fut.result()
+                        if res and res[-1].status in ("ok", "skipped"):
+                            wave_results[s] = res[-1]
+                            errors.discard(s)
+                    except Exception as e:
+                        logger.debug("  [%s] zombie resolved with %s", s, type(e).__name__)
+                        # 僵尸以异常结束：保留超时 error 占位
+
+        # 按 Subject 原始顺序收集本波结果（ordered 语义）
+        for s in subjects:
+            if s in aborted and s not in wave_results:
+                # abort 后的后续波次（未提交，无本波结果）：不追加，与 subject
+                # 粒度 break 一致（剩余步骤无结果，不制造伪造 error）。
+                # abort 发生的当波（失败步骤在 wave_results 中）正常追加。
+                continue
+            all_results.setdefault(s, []).append(
+                wave_results.get(s, _make_error_results([step], s, "wave failed")[0])
+            )
+
+    if errors:
+        logger.warning(
+            "Step-granularity finished with %d failed subject-step(s): %s",
+            len(errors),
+            sorted(errors),
+        )
 
     return all_results
 
@@ -611,6 +1012,12 @@ def _build_cli_tree(
         indent = "    " if is_last_phase else "│   "
 
         # Phase 概览
+        if phase.mode == "batch" and not phase_results:
+            # batch 阶段无任何产物：续做跳过的 Pre（或 0 步骤阶段）——避免显示
+            # 误导性的“✅ 0/0”（b_err==0 恒真，看起来像空批次成功）。
+            lines.append(f"{phase_prefix} {phase.name.upper()} (batch) ⏭ skipped（无产物）")
+            lines.append("")
+            continue
         if phase.mode == "batch":
             batch = phase_results.get("_batch_", [])
             b_ok = sum(1 for r in batch if r.status == "ok")
@@ -898,6 +1305,108 @@ def _generate_report(
 
 
 # ============================================================================
+# Task manifest（任务状态机）
+# ============================================================================
+
+
+def read_task_manifest(task_dir: Path) -> dict:
+    """读取 task.json（容错：缺失/损坏返回空 dict，不抛异常）。"""
+    manifest_path = Path(task_dir) / "task.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_task_manifest(task_dir: Path, **updates) -> None:
+    """写/更新 task.json（Task Status 状态机）。
+
+    读取已有内容合并更新后，临时文件 + rename 原子写回（避免中断时写坏）。
+    status 取值：running / done / interrupted / abandoned。
+    """
+    task_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = task_dir / "task.json"
+    manifest = read_task_manifest(task_dir)
+    manifest.update(updates)
+    tmp_path = manifest_path.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    tmp_path.replace(manifest_path)
+
+
+def _infer_last_interrupted_step(task_dir: Path) -> str | None:
+    """从 intermediates 推断中断位置：最后写入 output.json 的 subject/step。"""
+    intermediates = Path(task_dir) / "intermediates"
+    if not intermediates.is_dir():
+        return None
+    latest: tuple[float, str] | None = None
+    for subject_dir in sorted(intermediates.iterdir()):
+        if not subject_dir.is_dir():
+            continue
+        for step_dir in subject_dir.iterdir():
+            out = step_dir / "output.json"
+            if out.is_file():
+                mtime = out.stat().st_mtime
+                if latest is None or mtime > latest[0]:
+                    latest = (mtime, f"{subject_dir.name}/{step_dir.name}")
+    return latest[1] if latest else None
+
+
+# ============================================================================
+# 未完成任务检测（Resume 前置）
+# ============================================================================
+
+# 任务目录名格式：YYYYMMDD-HHMMSS-<hash>
+_TASK_DIR_NAME_RE = re.compile(r"^\d{8}-\d{6}-")
+
+
+def detect_unfinished_tasks(output_dir: Path) -> list[Path]:
+    """扫描 result/ 下未完成（status ∈ {running, interrupted}）的任务目录，最近优先。
+
+    - 无 task.json 的目录：视为未完成（中断发生在运行开始写 manifest 之前，或
+      旧版本在完成时才写 task.json、中断未写入）——按目录名时间排序；
+    - task.json 存在但无 status 字段：旧版本完成时写入的格式（当时无状态机，
+      旧代码只在运行收尾写 task.json）——视为已完成，排除；
+    - task.json 损坏/为空：无法判定状态，保守视为未完成（宁可多提示）；
+    - status=done / abandoned：排除。
+    """
+    result_root = Path(output_dir) / "result"
+    if not result_root.is_dir():
+        return []
+
+    unfinished: list[Path] = []
+    for task_dir in sorted(result_root.iterdir()):
+        if not task_dir.is_dir():
+            continue
+        # 仅接受任务目录命名（YYYYMMDD-HHMMSS-xxx）：result/ 下的杂物/备份目录
+        # 无 task.json 会被误判为未完成并触发续做提示。老版本任务目录沿用同一
+        # task_id 格式，不受影响。
+        if not _TASK_DIR_NAME_RE.match(task_dir.name):
+            continue
+        manifest_path = task_dir / "task.json"
+        if not manifest_path.exists():
+            unfinished.append(task_dir)
+            continue
+        manifest = read_task_manifest(task_dir)
+        if not manifest:
+            # task.json 存在但损坏/为空：无法判定状态，保守视为未完成
+            unfinished.append(task_dir)
+            continue
+        status = manifest.get("status")
+        if status in ("running", "interrupted"):
+            unfinished.append(task_dir)
+        # status=None 且可解析 = 旧版本收尾写入的格式（无状态机）→ 已完成，排除
+
+    # 最近优先：Task ID 前缀是 YYYYMMDD-HHMMSS，可按目录名倒序（缺失名时兜底 mtime）
+    unfinished.sort(key=lambda d: (d.name, d.stat().st_mtime), reverse=True)
+    return unfinished
+
+
+# ============================================================================
 # 主入口 — 薄编排层
 # ============================================================================
 
@@ -911,6 +1420,7 @@ def run_pipeline(
     target_phase: str | None = None,
     target_step: str | None = None,
     pool_progress: PoolProgress | None = None,
+    resume_task_dir: Path | None = None,
 ) -> PipelineResult:
     """执行一条完整的 pipeline。
 
@@ -923,6 +1433,8 @@ def run_pipeline(
         target_phase: 仅运行指定阶段（匹配 phases[].name）。
         target_step: 仅运行指定步骤名。
         pool_progress: 可选的 PoolProgress 实例。
+        resume_task_dir: 续做（Resume）时复用前序 task 目录——原地续做：
+            已完成 Steps（有 output.json）跳过，产物合并进原 task。
 
     Returns:
         PipelineResult
@@ -975,11 +1487,18 @@ def run_pipeline(
     import hashlib
 
     now = datetime.datetime.now()
-    task_seed = f"{input_path.absolute()}:{now.isoformat()}"
-    hash_suffix = hashlib.sha256(task_seed.encode()).hexdigest()[:8]
-    task_id = now.strftime("%Y%m%d-%H%M%S") + "-" + hash_suffix
-    task_dir = config.output_dir / "result" / task_id
-    logger.info("Task ID: %s → %s", task_id, task_dir)
+    resume_mode = resume_task_dir is not None
+    if resume_mode:
+        # 续做：复用前序 task 目录与 ID（原地续做，产物合并进原 task）
+        task_dir = Path(resume_task_dir)
+        task_id = task_dir.name
+        logger.info("Resuming task: %s → %s", task_id, task_dir)
+    else:
+        task_seed = f"{input_path.absolute()}:{now.isoformat()}"
+        hash_suffix = hashlib.sha256(task_seed.encode()).hexdigest()[:8]
+        task_id = now.strftime("%Y%m%d-%H%M%S") + "-" + hash_suffix
+        task_dir = config.output_dir / "result" / task_id
+        logger.info("Task ID: %s → %s", task_id, task_dir)
 
     resolved_data_dir = data_dir or os.environ.get("PAPER_REVIEW_DATA_DIR")
     if resolved_data_dir is None:
@@ -1049,6 +1568,21 @@ def run_pipeline(
         conclusion = _build_cli_tree(
             task_id, config.name, config, all_phase_results, pipeline_dir, task_dir
         )
+        # 早退路径同样写 manifest（done）：否则 result/{task_id}/ 下只有 report.md
+        # 无 task.json，detect_unfinished_tasks 会把它当未完成任务在下次 review 时提示续做。
+        write_task_manifest(
+            task_dir,
+            task_id=task_id,
+            status="done",
+            created_at=now.isoformat(),
+            pipeline=config.name,
+            input=str(input_path.absolute()),
+            subjects=[],
+            steps=[],
+            success=True,
+            step_count=0,
+            error_count=0,
+        )
         return PipelineResult(
             subject="",
             success=overall_success,
@@ -1061,6 +1595,128 @@ def run_pipeline(
     # ── Subject 发现 ──
     subjects = discover_subjects(config, input_path, config.output_dir)
     primary_subject = subjects[0] if subjects else ""
+
+    # ── Resume：Pre Phase 跳过判定 ──
+    # 必须先读旧 manifest 再写 running——否则写入会覆盖旧 subjects，判定恒真。
+    # 跳过条件（三者全满足）：
+    #   1) 前序 Pre 产物确证：Pre 阶段最后一个 step 的 output.json 存在——只比对
+    #      subjects 会在“中断发生在 Pre 阶段”时误跳过未完成的 Pre（manifest.subjects
+    #      是 Pre 运行前写入的，resume 时 discover 对相同输入目录返回同一列表，
+    #      等式恒真，无法区分 Pre 是否真正完成）；
+    #   2) 前序 manifest subjects 与当前发现一致；
+    #   3) 前序 input 与当前输入路径一致（同名不同目录时禁止复用 Pre 产物）。
+    prev_manifest: dict = {}
+    skip_pre_phase = False
+    # Resume 续做时 review 步骤是否跳过已完成产物（有 output.json 且 ok/skipped）。
+    # 与 Pre 跳过同一门控（input + subjects 一致才允许复用产物）：
+    # 换输入目录后续做时禁止跳过——同名 subject（如不同目录下的 paper.pdf）
+    # 的旧产物会被静默复用，跨批次混批。pipeline 名不参与（续做使用当前配置）。
+    resume_skip_completed = False
+    if resume_mode:
+        prev_manifest = read_task_manifest(task_dir)
+        # Pre 阶段 = 首个 per_subject 阶段之前的 batch 阶段。曾取 active_phases 中
+        # 第一个 batch 阶段——对无 pre 的 [review, post] 管线会误判为 post，
+        # 续做时跳过 Post（回归）；--phase post 时同样把用户显式要求的阶段跳过。
+        per_subject_idx = next(
+            (i for i, p in enumerate(active_phases) if p.mode == "per_subject"), None
+        )
+        pre_phase = (
+            next((p for p in active_phases[:per_subject_idx] if p.mode == "batch"), None)
+            if per_subject_idx is not None
+            else None
+        )
+        pre_complete = False
+        if pre_phase is not None:
+            pre_steps = discover_steps(pipeline_dir / pre_phase.directory)
+            if pre_steps:
+                last_pre_out = (
+                    task_dir / "intermediates" / pre_phase.name / pre_steps[-1].stem / "output.json"
+                )
+                # 与 review 步骤跳过同一原则：产物存在且 status 为 ok/skipped 才算 Pre 完成。
+                # 曾只判存在——status=error 的失败产物（如 index 构建失败）被静默跳过，
+                # 续做时失败状态被永久固化（与 ADR 0005“失败产物续做时重跑”原则矛盾）。
+                if last_pre_out.exists():
+                    try:
+                        out = json.loads(last_pre_out.read_text(encoding="utf-8"))
+                        pre_complete = out.get("status", "ok") in ("ok", "skipped")
+                    except (json.JSONDecodeError, OSError):
+                        pre_complete = False  # 产物损坏 → 视作未完成，重跑 Pre
+        prev_input = prev_manifest.get("input")
+        input_matches = not prev_input or str(Path(prev_input).absolute()) == str(
+            input_path.absolute()
+        )
+        if prev_input and not input_matches:
+            logger.warning(
+                "Resume: previous task input was %r, current input is %r — "
+                "Pre will be re-run to avoid mixing batches",
+                prev_input,
+                str(input_path),
+            )
+        subjects_match = sorted(prev_manifest.get("subjects", [])) == sorted(subjects)
+        resume_skip_completed = resume_mode and input_matches and subjects_match
+        skip_pre_phase = pre_complete and input_matches and subjects_match
+        if resume_mode and not resume_skip_completed:
+            logger.warning(
+                "Resume: review-step skip disabled (input or subjects mismatch) — "
+                "existing products will be re-run to avoid mixing batches"
+            )
+        if skip_pre_phase:
+            logger.info(
+                "Resume: Pre phase will be skipped (products verified + subjects/input match)"
+            )
+
+    # ── Task manifest：标记运行开始（未完成任务的检测基础） ──
+    # steps 记录 per_subject 步骤全集（不被 target_step 过滤）：Resume 摘要的完成
+    # 进度以它为基准——磁盘并集在“中断于首步”时会缩小，导致部分完成被高估为完成。
+    _review_steps_all: list[str] = []
+    for _p in active_phases:
+        if _p.mode == "per_subject":
+            _review_steps_all = [sf.stem for sf in discover_steps(pipeline_dir / _p.directory)]
+            break
+    write_task_manifest(
+        task_dir,
+        task_id=task_id,
+        status="running",
+        # resume 保留原发起时间（created_at 属于任务发起时刻，不是续做时刻）
+        created_at=prev_manifest.get("created_at") or now.isoformat(),
+        pipeline=config.name,
+        input=str(input_path.absolute()),
+        subjects=subjects,
+        steps=_review_steps_all,
+    )
+
+    # ── SIGINT 优雅中断：尽力写 interrupted 状态（Resume 检测依赖） ──
+    # 仅主线程有效；kill -9/断电 等硬中断不经过此 handler——状态推断（running 无 done）兜底。
+    _restore_sigint: Callable[[], None] | None = None
+    if threading.current_thread() is threading.main_thread():
+        import signal as _signal
+
+        _prev_int = _signal.getsignal(_signal.SIGINT)
+
+        def _sigint_mark_interrupted(signum, frame):
+            # 信号处理器内做文件 I/O 属尽力而为：任何异常不得替换 KeyboardInterrupt。
+            # 注意：此处禁止 logging——若 SIGINT 恰在主线程执行 logging 调用（持有
+            # logging 模块内部锁）期间到达，handler 内再次 logging 会死锁而非抛异常。
+            try:
+                write_task_manifest(
+                    task_dir,
+                    status="interrupted",
+                    interrupted_at_step=_infer_last_interrupted_step(task_dir),
+                )
+            except Exception as e:
+                # 尽力而为：写失败依赖“running 无 done”状态推断兜底。
+                # 禁止在此 logging——信号处理器内 logging 可能死锁（logging 锁
+                # 非 async-signal-safe），故仅消费异常不记录。
+                _ = e
+            _signal.signal(_signal.SIGINT, _prev_int)
+            raise KeyboardInterrupt
+
+        _signal.signal(_signal.SIGINT, _sigint_mark_interrupted)
+
+        def _restore_sigint_impl() -> None:
+            _signal.signal(_signal.SIGINT, _prev_int)
+
+        _restore_sigint = _restore_sigint_impl
 
     # ── Pool 环境变量覆盖 ──
     per_subject_phases = [p for p in active_phases if p.mode == "per_subject"]
@@ -1145,6 +1801,15 @@ def run_pipeline(
                 phase_timeout = estimate_step_timeout(step_type="py")
 
         if phase.mode == "batch":
+            if skip_pre_phase:
+                # 续做：Pre 产物已在前序 task（格式转换/索引已完成），跳过首个 batch 阶段
+                logger.info(
+                    "Resume: skipping batch phase '%s' (Pre products already exist)", phase.name
+                )
+                phase_results = {}
+                skip_pre_phase = False  # 只跳第一个 batch（Pre）
+                all_phase_results[phase.name] = phase_results
+                continue
             logger.info(
                 "Phase [%s] batch — %d step(s) (timeout=%ds/step)",
                 phase.name,
@@ -1184,6 +1849,10 @@ def run_pipeline(
                         primary_subject = subjects[0] if subjects else ""
                         # 同步更新进度条：subject 列表变化后总量需要重新计算
                         pp.set_subject_count(len(subjects))
+                        # 同步重写 manifest.subjects：运行开始时写入的是 Pre 前的 CLI
+                        # 扫描列表（docx/doc 未转换时缺项），续做的 subjects 比对依赖
+                        # 真实列表，否则 manifest 来源管线续做被误判为不一致而全量重跑。
+                        write_task_manifest(task_dir, subjects=subjects)
                 else:
                     logger.warning(
                         "manifest_step '%s' not found in phase '%s'. Available: %s",
@@ -1210,6 +1879,7 @@ def run_pipeline(
                 pool_progress=pool_progress,
                 pp=pp,
                 step_timeout=phase_timeout,
+                skip_completed=resume_skip_completed,
             )
         else:
             logger.warning("Unknown mode '%s' for phase '%s' — skipping", phase.mode, phase.name)
@@ -1237,20 +1907,19 @@ def run_pipeline(
         task_id, config.name, config, all_phase_results, pipeline_dir, task_dir
     )
 
-    task_meta = {
-        "task_id": task_id,
-        "pipeline": config.name,
-        "input": str(input_path.absolute()),
-        "subjects": subjects,
-        "success": overall_success,
-        "step_count": len(all_step_results),
-        "error_count": sum(1 for r in all_step_results if r.status == "error"),
-    }
-    task_dir.mkdir(parents=True, exist_ok=True)
-    (task_dir / "task.json").write_text(
-        json.dumps(task_meta, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
+    # ── Task manifest：标记完成 ──
+    # 部分运行（--phase/--step）只执行了部分阶段/步骤：任务仍属“未完成”，保持
+    # running 供下次 review 检测续做——写 done 会把未完成的阶段永久掩盖。
+    partial_run = target_phase is not None or target_step is not None
+    write_task_manifest(
+        task_dir,
+        status="running" if partial_run else "done",
+        success=overall_success,
+        step_count=len(all_step_results),
+        error_count=sum(1 for r in all_step_results if r.status == "error"),
     )
+    if _restore_sigint is not None:
+        _restore_sigint()
 
     return PipelineResult(
         subject=primary_subject,

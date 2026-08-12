@@ -19,11 +19,13 @@ from paper_review.orchestrator import (
     _estimate_subject_chars,
     _execute_batch,
     _retry_step,
+    detect_unfinished_tasks,
     discover_steps,
     run_pipeline,
 )
 from paper_review.pipeline_models import (
     PhaseConfig,
+    PoolConfig,
     RetryConfig,
     StepFile,
     StepResult,
@@ -136,6 +138,60 @@ class TestPipelineConfigParsing:
             }
         )
         assert cfg.phases[0].step_timeout == 0
+
+    def test_pool_granularity_defaults_to_subject(self):
+        """pool.granularity 未指定时默认 subject（保持现有行为）。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "granularity-default",
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": "r/",
+                        "pool": {"workers": 3},
+                    }
+                ],
+            }
+        )
+        assert cfg.phases[0].pool is not None
+        assert cfg.phases[0].pool.granularity == "subject"
+
+    def test_pool_granularity_step(self):
+        """pool.granularity 支持 step 级。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "granularity-step",
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": "r/",
+                        "pool": {"workers": 3, "granularity": "step"},
+                    }
+                ],
+            }
+        )
+        assert cfg.phases[0].pool is not None
+        assert cfg.phases[0].pool.granularity == "step"
+
+    def test_pool_granularity_invalid_falls_back_to_subject(self):
+        """非法 granularity 值回退 subject 并告警（不崩溃）。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "granularity-bad",
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": "r/",
+                        "pool": {"workers": 3, "granularity": "bogus"},
+                    }
+                ],
+            }
+        )
+        assert cfg.phases[0].pool is not None
+        assert cfg.phases[0].pool.granularity == "subject"
 
 
 # ============================================================================
@@ -342,6 +398,44 @@ with open(os.path.join(step_dir, 'output.json'), 'w') as f:
         assert data["step"] == "01-test"
         assert data["status"] == "ok"
 
+    def test_run_writes_task_manifest_done(self, tmp_path):
+        """正常完成后 task.json 存在且 status=done（任务状态机的基础）。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        (steps_dir / "01-test.py").write_text(
+            "import json, os; "
+            "d=os.environ['PIPELINE_STEP_DIR']; "
+            "os.makedirs(d, exist_ok=True); "
+            "json.dump({'step':'01-test','status':'ok','error':None,'data':{}}, "
+            "open(os.path.join(d,'output.json'),'w'))"
+        )
+
+        result = run_pipeline(
+            pipeline_yaml={
+                "name": "t1",
+                "output_dir": str(output_dir),
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    }
+                ],
+            },
+            input_path=tmp_path / "subject-01.pdf",
+        )
+
+        assert result.task_dir is not None
+        manifest_path = result.task_dir / "task.json"
+        assert manifest_path.exists()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["status"] == "done"
+        assert manifest["task_id"] == result.task_id
+        assert "subjects" in manifest
+        assert "created_at" in manifest
+        assert manifest["success"] is True
+
     def test_run_returns_pipeline_result(self, tmp_path):
         """run_pipeline 返回 PipelineResult 对象。"""
         output_dir = tmp_path / "output"
@@ -374,6 +468,808 @@ with open(os.path.join(step_dir, 'output.json'), 'w') as f:
         assert len(result.step_results) == 1
         assert result.step_results[0].step_name == "01-test"
         assert result.step_results[0].status == "ok"
+
+
+# ============================================================================
+# Resume — 未完成任务检测
+# ============================================================================
+
+
+class TestResumeDetection:
+    def test_detect_unfinished_tasks_recent_first(self, tmp_path):
+        """只返回未完成任务，最近优先；done/abandoned 排除。"""
+        result_root = tmp_path / "result"
+
+        def _mk(name: str, status: str) -> None:
+            d = result_root / name
+            d.mkdir(parents=True)
+            (d / "task.json").write_text(json.dumps({"task_id": name, "status": status}))
+
+        _mk("20260811-100000-aaa", "done")
+        _mk("20260812-080000-bbb", "running")  # 中断遗留
+        _mk("20260812-090000-ccc", "interrupted")
+        _mk("20260812-100000-ddd", "abandoned")
+
+        tasks = detect_unfinished_tasks(tmp_path)
+        assert [t.name for t in tasks] == ["20260812-090000-ccc", "20260812-080000-bbb"]
+
+    def test_detect_unfinished_tasks_no_manifest_counts_as_unfinished(self, tmp_path):
+        """无 task.json 的目录视为未完成（老版本产物或中断早期）。"""
+        (tmp_path / "result" / "20260812-050000-old").mkdir(parents=True)
+        tasks = detect_unfinished_tasks(tmp_path)
+        assert [t.name for t in tasks] == ["20260812-050000-old"]
+
+    def test_detect_unfinished_tasks_legacy_manifest_without_status_is_done(self, tmp_path):
+        """旧版本 task.json（无 status 字段，收尾时写入）视为已完成，不提示续做。
+
+        回归：曾把 status=None 一律当未完成——旧版本完成的 task（task.json 无
+        status）每次 review 都被误判为"中断遗留"并提示续做（默认选 [1] 还会重跑
+        Post/覆盖旧报告）。
+        """
+        result_root = tmp_path / "result"
+        legacy_done = result_root / "20260810-120000-aaaa"
+        legacy_done.mkdir(parents=True)
+        # 旧版本格式：无 status 字段（只在收尾写一次 task.json）
+        (legacy_done / "task.json").write_text(
+            json.dumps(
+                {
+                    "task_id": legacy_done.name,
+                    "pipeline": "default",
+                    "input": "/tmp/pdfs",
+                    "subjects": ["a", "b"],
+                    "success": True,
+                    "step_count": 4,
+                    "error_count": 0,
+                }
+            )
+        )
+        # 对照：真正中断的新格式任务仍被检测
+        interrupted = result_root / "20260812-100000-bbbb"
+        interrupted.mkdir(parents=True)
+        (interrupted / "task.json").write_text(
+            json.dumps({"task_id": interrupted.name, "status": "interrupted"})
+        )
+
+        tasks = detect_unfinished_tasks(tmp_path)
+        assert [t.name for t in tasks] == ["20260812-100000-bbbb"]
+
+    def test_detect_unfinished_tasks_ignores_non_task_dirs(self, tmp_path):
+        """result/ 下非任务命名（YYYYMMDD-HHMMSS-*）的目录不参与未完成检测。
+
+        回归：杂物/备份目录无 task.json 会被误判为未完成，触发续做提示。
+        """
+        result_root = tmp_path / "result"
+        # 非任务命名目录（无 task.json）
+        (result_root / "backup-copy").mkdir(parents=True)
+        (result_root / "tmp-dir").mkdir(parents=True)
+        # 真实任务（running）
+        real = result_root / "20260812-090000-ccc"
+        real.mkdir(parents=True)
+        (real / "task.json").write_text(json.dumps({"task_id": real.name, "status": "running"}))
+
+        tasks = detect_unfinished_tasks(tmp_path)
+        assert [t.name for t in tasks] == ["20260812-090000-ccc"]
+
+    def test_detect_unfinished_tasks_empty_result_dir(self, tmp_path):
+        """无 result/ 目录或全完成 → 空列表。"""
+        assert detect_unfinished_tasks(tmp_path / "nonexistent") == []
+        result_root = tmp_path / "result"
+        (result_root / "20260811-100000-done").mkdir(parents=True)
+        (result_root / "20260811-100000-done" / "task.json").write_text(
+            json.dumps({"status": "done"})
+        )
+        assert detect_unfinished_tasks(tmp_path) == []
+
+    def test_resume_skip_completed_steps(self, tmp_path):
+        """续做：已有 output.json 的步骤跳过（复用产物），未完成的执行。"""
+        from paper_review.orchestrator import _run_steps_for_subject
+
+        calls: list[str] = []
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                calls.append(step.stem)
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        # 前序产物：01-a 已完成（output.json 存在），02-b 未完成
+        result_base = tmp_path / "out"
+        done_dir = result_base / "intermediates" / "s1" / "01-a"
+        done_dir.mkdir(parents=True)
+        (done_dir / "output.json").write_text(
+            json.dumps({"step": "01-a", "status": "ok", "data": {"x": 1}})
+        )
+
+        steps = [
+            StepFile(path=Path("01-a.py"), stem="01-a", step_type="py"),
+            StepFile(path=Path("02-b.py"), stem="02-b", step_type="py"),
+        ]
+        phase_config = PhaseConfig(
+            name="review",
+            mode="per_subject",
+            directory="dummy",
+            retry=RetryConfig(max_attempts=1, on_failure="skip"),
+        )
+
+        results = _run_steps_for_subject(
+            subject="s1",
+            steps=steps,
+            phase=phase_config,
+            output_dir=tmp_path / "out",
+            base_env={},
+            executor=RecordingExecutor(),
+            skip_completed=True,
+        )
+
+        # 01-a 跳过（复用产物），02-b 执行
+        assert calls == ["02-b"]
+        assert len(results) == 2
+        assert results[0].step_name == "01-a"
+        assert results[0].status == "ok"
+        assert results[0].data == {"x": 1}  # 产物原样复用
+        assert results[1].step_name == "02-b"
+
+    def test_resume_skip_completed_false_runs_all(self, tmp_path):
+        """非续做（skip_completed=False）时即使有 output.json 也照常执行。"""
+        from paper_review.orchestrator import _run_steps_for_subject
+
+        calls: list[str] = []
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                calls.append(step.stem)
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        result_base = tmp_path / "out"
+        done_dir = result_base / "intermediates" / "s1" / "01-a"
+        done_dir.mkdir(parents=True)
+        (done_dir / "output.json").write_text(json.dumps({"step": "01-a", "status": "ok"}))
+
+        steps = [StepFile(path=Path("01-a.py"), stem="01-a", step_type="py")]
+        _run_steps_for_subject(
+            subject="s1",
+            steps=steps,
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            output_dir=tmp_path / "out",
+            base_env={},
+            executor=RecordingExecutor(),
+        )
+
+        assert calls == ["01-a"]  # 正常模式：仍执行
+
+    def test_resume_pre_skip_depends_on_manifest_match(self, tmp_path):
+        """Pre 跳过判定基于前序 manifest subjects（与当前输入一致才跳过）。
+
+        回归：曾因先写 running manifest 再比较导致判定恒真（输入变化也跳过 Pre）。
+        """
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+
+        # pre 步骤：写 run_count（每执行一次 +1）
+        (steps_dir / "00-pre.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR'])\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            "cnt_path = d / 'run_count.txt'\n"
+            "cnt = 0\n"
+            "if cnt_path.exists(): cnt = int(cnt_path.read_text())\n"
+            "cnt += 1\n"
+            "cnt_path.write_text(str(cnt))\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '00-pre', 'status': 'ok', 'data': {'run': cnt}}))\n"
+        )
+        # review 步骤
+        (steps_dir / "01-test.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR'])\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '01-test', 'status': 'ok', 'data': {}}))\n"
+        )
+
+        def _pipeline_yaml():
+            return {
+                "name": "resume-pre",
+                "output_dir": str(output_dir),
+                "phases": [
+                    {
+                        "name": "pre",
+                        "mode": "batch",
+                        "directory": str(steps_dir.absolute()),
+                    },
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    },
+                ],
+            }
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy")
+
+        def _run_count() -> int | None:
+            cnt_file = (
+                output_dir
+                / "result"
+                / sorted((output_dir / "result").iterdir())[-1].name
+                / "intermediates"
+                / "pre"
+                / "00-pre"
+                / "run_count.txt"
+            )
+            if cnt_file.exists():
+                return int(cnt_file.read_text())
+            return None
+
+        # 1) 首次运行（输入 a.pdf）→ pre 执行 1 次
+        r1 = run_pipeline(_pipeline_yaml(), pdf_dir)
+        assert _run_count() == 1
+
+        # 2) 续做相同输入 → Pre 跳过（run_count 不变）
+        r2 = run_pipeline(_pipeline_yaml(), pdf_dir, resume_task_dir=r1.task_dir)
+        assert _run_count() == 1, f"输入一致应跳过 Pre: {_run_count()}"
+        assert r2.task_id == r1.task_id
+
+        # 3) 输入变化（新增 b.pdf）后续做 → Pre 不跳过（run_count +1）
+        (pdf_dir / "b.pdf").write_text("dummy")
+        r3 = run_pipeline(_pipeline_yaml(), pdf_dir, resume_task_dir=r1.task_dir)
+        assert _run_count() == 2, f"输入变化应重跑 Pre: {_run_count()}"
+        assert r3.task_id == r1.task_id
+        # 新 subject 的 review 步骤执行（b 无产物）
+        assert (r3.task_dir / "intermediates" / "b" / "01-test" / "output.json").exists()
+
+    def test_resume_pre_incomplete_is_rerun(self, tmp_path):
+        """续做：前序 Pre 未完成（最后一步产物缺失）时不得跳过 Pre。
+
+        回归：曾只比对 manifest subjects——manifest.subjects 是 Pre 运行前写入的，
+        续做时 discover 对相同输入目录返回同一列表，等式恒真，导致"中断发生在
+        Pre 阶段"时未完成的 Pre 被静默跳过，review 基于缺失产物运行。
+        """
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+
+        (steps_dir / "00-pre.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR'])\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            "cnt_path = d / 'run_count.txt'\n"
+            "cnt = 0\n"
+            "if cnt_path.exists(): cnt = int(cnt_path.read_text())\n"
+            "cnt += 1\n"
+            "cnt_path.write_text(str(cnt))\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '00-pre', 'status': 'ok', 'data': {'run': cnt}}))\n"
+        )
+        (steps_dir / "01-test.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR'])\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '01-test', 'status': 'ok', 'data': {}}))\n"
+        )
+
+        def _pipeline_yaml():
+            return {
+                "name": "resume-pre",
+                "output_dir": str(output_dir),
+                "phases": [
+                    {
+                        "name": "pre",
+                        "mode": "batch",
+                        "directory": str(steps_dir.absolute()),
+                        "manifest_step": "00-pre",
+                    },
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    },
+                ],
+            }
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy")
+
+        def _run_count() -> int | None:
+            cnt_file = (
+                output_dir
+                / "result"
+                / sorted((output_dir / "result").iterdir())[-1].name
+                / "intermediates"
+                / "pre"
+                / "00-pre"
+                / "run_count.txt"
+            )
+            if cnt_file.exists():
+                return int(cnt_file.read_text())
+            return None
+
+        # 1) 完整跑一次 → pre 执行 1 次
+        r1 = run_pipeline(_pipeline_yaml(), pdf_dir)
+        assert _run_count() == 1
+
+        # 2) 模拟"中断发生在 Pre 阶段"：删除 Pre 阶段最后一步产物（Pre 未完成）
+        # 注：pre/review 复用 steps_dir，Pre 阶段的步骤为 [00-pre, 01-test]，
+        # 最后一步是 01-test。
+        pre_last_out = r1.task_dir / "intermediates" / "pre" / "01-test" / "output.json"
+        assert pre_last_out.exists()
+        pre_last_out.unlink()
+
+        # 3) 续做相同输入 → Pre 必须重跑（run_count 2），而非被跳过
+        r2 = run_pipeline(_pipeline_yaml(), pdf_dir, resume_task_dir=r1.task_dir)
+        assert _run_count() == 2, f"Pre 未完成时应重跑 Pre: {_run_count()}"
+        assert r2.success
+        # review 步骤产物齐全（a 的 output.json 重新生成）
+        assert (r2.task_dir / "intermediates" / "a" / "01-test" / "output.json").exists()
+
+    def test_resume_pre_error_status_reruns_pre(self, tmp_path):
+        """续做：Pre 最后一步产物 status=error 时不得跳过 Pre（失败产物重跑）。
+
+        回归：曾只检查 output.json 是否存在——Pre 最后一步失败（status=error）
+        时续做静默跳过 Pre，失败状态被永久固化（与 review 步骤“仅跳过 ok/skipped
+        产物”的原则不一致）。
+        """
+        output_dir = tmp_path / "output"
+        pre_steps = tmp_path / "pre-steps"
+        review_steps = tmp_path / "review-steps"
+        pre_steps.mkdir(parents=True)
+        review_steps.mkdir(parents=True)
+
+        # pre 阶段唯一一步：写出 status=error 的产物（失败但 output.json 存在）
+        (pre_steps / "00-index.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR']); d.mkdir(parents=True, exist_ok=True)\n"
+            "cnt = d / 'run_count.txt'\n"
+            "n = int(cnt.read_text()) if cnt.exists() else 0\n"
+            "cnt.write_text(str(n + 1))\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '00-index', 'status': 'error', 'error': 'index boom', 'data': {}}))\n"
+        )
+        # review 步骤
+        (review_steps / "01-test.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR']); d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '01-test', 'status': 'ok', 'data': {}}))\n"
+        )
+
+        def _pipeline_yaml():
+            return {
+                "name": "resume-pre-err",
+                "output_dir": str(output_dir),
+                "phases": [
+                    {
+                        "name": "pre",
+                        "mode": "batch",
+                        "directory": str(pre_steps.absolute()),
+                    },
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(review_steps.absolute()),
+                    },
+                ],
+            }
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy")
+
+        def _run_count() -> int | None:
+            cnt_file = (
+                output_dir
+                / "result"
+                / sorted((output_dir / "result").iterdir())[-1].name
+                / "intermediates"
+                / "pre"
+                / "00-index"
+                / "run_count.txt"
+            )
+            return int(cnt_file.read_text()) if cnt_file.exists() else None
+
+        # 1) 完整跑一次：Pre 最后一步失败（产物存在但 status=error）
+        r1 = run_pipeline(_pipeline_yaml(), pdf_dir)
+        assert _run_count() == 1
+        pre_last_out = r1.task_dir / "intermediates" / "pre" / "00-index" / "output.json"
+        assert json.loads(pre_last_out.read_text(encoding="utf-8"))["status"] == "error"
+
+        # 2) 模拟中断后续做：Pre 必须重跑（run_count 2），而非被静默跳过
+        from paper_review.orchestrator import write_task_manifest
+
+        write_task_manifest(r1.task_dir, status="interrupted")
+        r2 = run_pipeline(_pipeline_yaml(), pdf_dir, resume_task_dir=r1.task_dir)
+        assert _run_count() == 2, f"Pre 最后一步失败时续做应重跑 Pre: {_run_count()}"
+        assert r2.task_id == r1.task_id
+
+    def test_resume_input_mismatch_reruns_pre(self, tmp_path, caplog):
+        """续做：前序输入路径与当前不一致时不得跳过 Pre。
+
+        回归：曾只比对 subjects 列表——不同目录但文件名相同时（subjects 相等）
+        Pre 被误跳过，旧批次产物混入新输入。
+        """
+        import logging
+
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+
+        (steps_dir / "00-pre.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR'])\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            "cnt_path = d / 'run_count.txt'\n"
+            "cnt = 0\n"
+            "if cnt_path.exists(): cnt = int(cnt_path.read_text())\n"
+            "cnt += 1\n"
+            "cnt_path.write_text(str(cnt))\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '00-pre', 'status': 'ok', 'data': {'run': cnt}}))\n"
+        )
+        (steps_dir / "01-test.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR'])\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '01-test', 'status': 'ok', 'data': {}}))\n"
+        )
+
+        def _pipeline_yaml():
+            return {
+                "name": "resume-pre",
+                "output_dir": str(output_dir),
+                "phases": [
+                    {
+                        "name": "pre",
+                        "mode": "batch",
+                        "directory": str(steps_dir.absolute()),
+                    },
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": str(steps_dir.absolute()),
+                    },
+                ],
+            }
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy v1")
+
+        def _run_count() -> int | None:
+            cnt_file = (
+                output_dir
+                / "result"
+                / sorted((output_dir / "result").iterdir())[-1].name
+                / "intermediates"
+                / "pre"
+                / "00-pre"
+                / "run_count.txt"
+            )
+            if cnt_file.exists():
+                return int(cnt_file.read_text())
+            return None
+
+        # 1) 完整跑一次（输入 pdfs）
+        r1 = run_pipeline(_pipeline_yaml(), pdf_dir)
+        assert _run_count() == 1
+
+        # 2) 不同目录、相同 subject 名（subjects 相等）后续做
+        pdf_dir2 = tmp_path / "pdfs2"
+        pdf_dir2.mkdir()
+        (pdf_dir2 / "a.pdf").write_text("dummy v2")
+        with caplog.at_level(logging.WARNING):
+            run_pipeline(_pipeline_yaml(), pdf_dir2, resume_task_dir=r1.task_dir)
+        # Pre 必须重跑（input 不一致），且给出告警
+        assert _run_count() == 2, f"input 不一致应重跑 Pre: {_run_count()}"
+        assert any("previous task input" in rec.message for rec in caplog.records)
+
+    def test_resume_skips_only_ok_or_skipped(self, tmp_path):
+        """续做：output.json 记录 status=error 的步骤不跳过（重跑重试），失败不被固化。
+
+        回归：曾只检查 output.json 是否存在——失败的步骤（带 error 产物）在续做时被
+        跳过并永久复用错误，永不重试。
+        """
+        from paper_review.orchestrator import _run_steps_for_subject
+
+        calls: list[str] = []
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                calls.append(step.stem)
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        done_dir = tmp_path / "out" / "intermediates" / "s1" / "01-a"
+        done_dir.mkdir(parents=True)
+        (done_dir / "output.json").write_text(
+            json.dumps({"step": "01-a", "status": "error", "error": "LLM transient", "data": {}})
+        )
+
+        steps = [StepFile(path=Path("01-a.md"), stem="01-a", step_type="md")]
+        results = _run_steps_for_subject(
+            subject="s1",
+            steps=steps,
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            output_dir=tmp_path / "out",
+            base_env={},
+            executor=RecordingExecutor(),
+            skip_completed=True,
+        )
+
+        assert calls == ["01-a"], f"error 产物不应被跳过（应重跑）: {calls}"
+        assert results[0].status == "ok"
+
+    def test_resume_no_pre_phase_does_not_skip_post(self, tmp_path):
+        """回归：无 pre 的 [review, post] 管线续做不得跳过 post。
+
+        曾把 active_phases 中第一个 batch 阶段当 Pre——对无 pre 的管线会误判为
+        post，续做时整个 Post 阶段被跳过（最终报告缺 Post 产物）。
+        """
+        from paper_review.orchestrator import write_task_manifest
+
+        output_dir = tmp_path / "output"
+        r_dir = tmp_path / "r"
+        p_dir = tmp_path / "p"
+        r_dir.mkdir()
+        p_dir.mkdir()
+        (r_dir / "01-r.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR']); d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'output.json').write_text(json.dumps({'step':'01-r','status':'ok','data':{}}))\n"
+        )
+        (p_dir / "01-p.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR']); d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'output.json').write_text(json.dumps({'step':'01-p','status':'ok','data':{}}))\n"
+        )
+        pdf = tmp_path / "a.pdf"
+        pdf.write_text("dummy")
+        yaml = {
+            "name": "no-pre",
+            "output_dir": str(output_dir),
+            "phases": [
+                {"name": "review", "mode": "per_subject", "directory": str(r_dir)},
+                {"name": "post", "mode": "batch", "directory": str(p_dir)},
+            ],
+        }
+
+        r1 = run_pipeline(yaml, pdf)
+        # 模拟“post 最后一步已完成但任务被中断”（曾触发 Post 被误跳过）
+        write_task_manifest(r1.task_dir, status="interrupted")
+
+        r2 = run_pipeline(yaml, pdf, resume_task_dir=r1.task_dir)
+        names = [sr.step_name for sr in r2.step_results]
+        assert "01-p" in names, f"无 pre 管线续做不得跳过 post: {names}"
+
+        # --phase post + resume 同样必须执行 post（曾因 pre_phase 误判而被跳过）
+        r3 = run_pipeline(yaml, pdf, resume_task_dir=r1.task_dir, target_phase="post")
+        names3 = [sr.step_name for sr in r3.step_results]
+        assert "01-p" in names3, f"--phase post 续做必须执行 post: {names3}"
+
+    def test_resume_input_mismatch_reruns_review_steps(self, tmp_path):
+        """续做：输入路径不一致时 review 步骤不得跳过（即使已有产物）。
+
+        回归：曾只对 Pre 做 input/subjects 门控，review 步骤仅按
+        `intermediates/{subject}/{step}/output.json` 是否存在跳过——换输入目录且
+        文件名相同（subjects 相等）时，新批次的同名 subject 静默复用旧产物。
+        """
+        output_dir = tmp_path / "output"
+        r_dir = tmp_path / "r"
+        r_dir.mkdir()
+        (r_dir / "01-r.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR']); d.mkdir(parents=True, exist_ok=True)"
+            "\n"
+            "cnt = d / 'run_count.txt'\n"
+            "n = 0\n"
+            "if cnt.exists(): n = int(cnt.read_text())\n"
+            "n += 1\n"
+            "cnt.write_text(str(n))\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step':'01-r','status':'ok','data':{'run': n}}))\n"
+        )
+        yaml = {
+            "name": "resume-mismatch",
+            "output_dir": str(output_dir),
+            "phases": [
+                {"name": "review", "mode": "per_subject", "directory": str(r_dir)},
+            ],
+        }
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy v1")
+
+        def _run_count(task_dir) -> int | None:
+            cnt = task_dir / "intermediates" / "a" / "01-r" / "run_count.txt"
+            return int(cnt.read_text()) if cnt.exists() else None
+
+        # 1) 完整跑一次（输入 pdfs）→ review 步骤执行 1 次
+        r1 = run_pipeline(yaml, pdf_dir)
+        assert _run_count(r1.task_dir) == 1
+
+        # 2) 同一输入续做 → 已有产物跳过（run_count 不变）
+        r2 = run_pipeline(yaml, pdf_dir, resume_task_dir=r1.task_dir)
+        assert _run_count(r2.task_dir) == 1, f"同输入续做应跳过 review: {_run_count(r2.task_dir)}"
+
+        # 3) 不同目录、相同 subject 名（subjects 相等）续做 → review 必须重跑
+        pdf_dir2 = tmp_path / "pdfs2"
+        pdf_dir2.mkdir()
+        (pdf_dir2 / "a.pdf").write_text("dummy v2")
+        r3 = run_pipeline(yaml, pdf_dir2, resume_task_dir=r1.task_dir)
+        assert _run_count(r3.task_dir) == 2, (
+            f"输入不一致 review 不得跳过: {_run_count(r3.task_dir)}"
+        )
+
+    def test_no_active_phases_writes_done_manifest(self, tmp_path):
+        """无 active phase（如 --phase 不存在）也写 task.json status=done。
+
+        回归：曾早退只生成 report.md，result/ 下目录无 task.json——
+        detect_unfinished_tasks 视其为未完成，下次 review 提示续做一个空任务。
+        """
+        output_dir = tmp_path / "output"
+        pdf = tmp_path / "a.pdf"
+        pdf.write_text("dummy")
+        yaml = {
+            "name": "no-active",
+            "output_dir": str(output_dir),
+            "phases": [
+                {"name": "review", "mode": "per_subject", "directory": str(tmp_path / "r")},
+            ],
+        }
+
+        result = run_pipeline(yaml, pdf, target_phase="nonexistent")
+        manifest_path = result.task_dir / "task.json"
+        assert manifest_path.exists(), f"早退路径应写 manifest: {manifest_path}"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["status"] == "done"
+        # 不应再被检测为未完成任务
+        from paper_review.orchestrator import detect_unfinished_tasks
+
+        assert detect_unfinished_tasks(output_dir) == []
+
+    def test_partial_phase_run_keeps_running(self, tmp_path):
+        """--phase/--step 部分运行完成后任务保持 running（未完成整条管线）。
+
+        回归：部分运行写 done 会把未执行的阶段/步骤永久掩盖——后续 review 不再
+        检测到未完成任务，review 阶段的缺口被静默接受。
+        """
+        output_dir = tmp_path / "output"
+        r_dir = tmp_path / "r"
+        r_dir.mkdir()
+        (r_dir / "01-r.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR']); d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'output.json').write_text(json.dumps({'step':'01-r','status':'ok','data':{}}))\n"
+        )
+        pdf = tmp_path / "a.pdf"
+        pdf.write_text("dummy")
+        yaml = {
+            "name": "partial",
+            "output_dir": str(output_dir),
+            "phases": [{"name": "review", "mode": "per_subject", "directory": str(r_dir)}],
+        }
+
+        # 完整运行 → done
+        r1 = run_pipeline(yaml, pdf)
+        assert json.loads((r1.task_dir / "task.json").read_text())["status"] == "done"
+        # 部分运行（--phase review）→ 保持 running（仍属未完成）
+        r2 = run_pipeline(yaml, pdf, target_phase="review")
+        manifest = json.loads((r2.task_dir / "task.json").read_text())
+        assert manifest["status"] == "running", f"部分运行不应标 done: {manifest}"
+        assert detect_unfinished_tasks(output_dir), "部分运行任务应仍被检测为未完成"
+
+    def test_resume_manifest_source_subjects_rewritten(self, tmp_path):
+        """manifest 来源（docx）管线：Pre 重发现后同步重写 manifest.subjects，续做可跳过。
+
+        回归：曾运行开始时写入 Pre 前 CLI 扫描列表（漏 docx 转换产物），续做时
+        discover 读到 subject-manifest.json 的真实列表 → subjects_match 恒不成立 →
+        续做静默退化为全量重跑。
+        """
+        output_dir = tmp_path / "output"
+        steps = tmp_path / "steps"
+        steps.mkdir()
+        # pre 步骤：写 subject-manifest.json（含 docx 转换出的 paper + PDF 的 other）
+        (steps / "00-pre.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR']); d.mkdir(parents=True, exist_ok=True)\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step': '00-pre', 'status': 'ok', 'data': {}}))\n"
+            "out = Path(os.environ['PIPELINE_OUTPUT_DIR']); out.mkdir(parents=True, exist_ok=True)\n"
+            "(out / 'subject-manifest.json').write_text(json.dumps("
+            "    {'subjects': [{'name': 'paper'}, {'name': 'other'}]}))\n"
+        )
+        # review 步骤：每执行一次 run_count +1（验证续做是否跳过）
+        (steps / "01-r.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR']); d.mkdir(parents=True, exist_ok=True)\n"
+            "cnt = d / 'run_count.txt'\n"
+            "n = 0\n"
+            "if cnt.exists(): n = int(cnt.read_text())\n"
+            "n += 1\n"
+            "cnt.write_text(str(n))\n"
+            "(d / 'output.json').write_text(json.dumps("
+            "    {'step':'01-r','status':'ok','data':{'run': n}}))\n"
+        )
+        yaml = {
+            "name": "manifest-src",
+            "output_dir": str(output_dir),
+            "phases": [
+                {
+                    "name": "pre",
+                    "mode": "batch",
+                    "directory": str(steps),
+                    "manifest_step": "00-pre",
+                },
+                {
+                    "name": "review",
+                    "mode": "per_subject",
+                    "directory": str(steps),
+                    "subject_source": {
+                        "type": "manifest",
+                        "path": "{{ output_dir }}/subject-manifest.json",
+                    },
+                },
+            ],
+        }
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "other.pdf").write_text("x")  # 输入目录含 docx（paper.docx 不被 PDF 扫描）
+        (pdf_dir / "paper.docx").write_text("x")
+
+        def _run_count(subject: str) -> int | None:
+            cnt = (
+                output_dir
+                / "result"
+                / sorted((output_dir / "result").iterdir())[-1].name
+                / "intermediates"
+                / subject
+                / "01-r"
+                / "run_count.txt"
+            )
+            return int(cnt.read_text()) if cnt.exists() else None
+
+        # 1) 首次运行：Pre 重发现后 manifest.subjects 应为真实列表（含 paper）
+        r1 = run_pipeline(yaml, pdf_dir)
+        manifest = json.loads((r1.task_dir / "task.json").read_text(encoding="utf-8"))
+        assert sorted(manifest["subjects"]) == ["other", "paper"], manifest["subjects"]
+        assert _run_count("paper") == 1 and _run_count("other") == 1
+
+        # 2) 模拟中断（running）后续做：subjects 一致 → review 步骤跳过（run_count 不变）
+        from paper_review.orchestrator import write_task_manifest
+
+        write_task_manifest(r1.task_dir, status="running")
+        r2 = run_pipeline(yaml, pdf_dir, resume_task_dir=r1.task_dir)
+        assert r2.task_id == r1.task_id
+        assert _run_count("paper") == 1, f"续做应跳过 review 步骤: {_run_count('paper')}"
+        assert _run_count("other") == 1
 
 
 # ============================================================================
@@ -730,8 +1626,16 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
         assert result.success
         assert len(result.step_results) == 2
 
-    def test_pool_waits_for_running_timed_out_workers(self, tmp_path, monkeypatch):
-        """超时 Subject 的 worker 线程仍在运行时，池化执行必须等待。"""
+    def test_pool_waits_for_running_timed_out_workers(self, tmp_path):
+        """超时 Subject 的 worker 线程仍在运行时，池化执行必须等待并收割其真实结果。
+
+        构造：单 subject 总耗时 1.2s > pool.timeout=0.5s——首个轮询（t≈1s）即判
+        超时，但 worker 仍在运行；排空等待（_TIMEOUT_DRAIN_FUTURES）必须等到
+        worker 实质完成，把真实结果恢复到 all_results（而非丢弃为 error 占位）。
+
+        曾：step 0.8s × 2 = 1.6s vs timeout=1s，严格 > 判定在轮询边界恰好不触发，
+        测试从未走到排空路径（名字声称的场景没被测到）。
+        """
         import threading
         import time as _time
 
@@ -748,11 +1652,11 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
         step_lock = threading.Lock()
 
         class SlowExecutor:
-            """Executor that simulates slow steps, injectable via StepExecutor seam."""
+            """每步 0.6s：单 subject 总耗时 1.2s，保证在 t≈1s 轮询时仍处于 RUNNING。"""
 
             def execute(self, step, step_dir, env, prior_results, subject_name):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
-                _time.sleep(0.8)
+                _time.sleep(0.6)
                 with step_lock:
                     step_count[subject] = step_count.get(subject, 0) + 1
                 return StepResult(step_name=step.stem, status="ok", subject=subject)
@@ -785,7 +1689,761 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
         assert step_count == {"subj-a": 2, "subj-b": 2}, (
             f"Expected all steps done, got {step_count}"
         )
+        # 超时 worker 的结果被排空收割（status=ok 而非超时的 error 占位）
+        assert all(
+            r.status == "ok" for subj_results in all_results.values() for r in subj_results
+        ), all_results
         assert len(all_results) == 2
+        assert all(len(rs) == 2 for rs in all_results.values())
+
+    def test_pool_timeout_recovered_reports_complete_only(self, tmp_path):
+        """subject 粒度：超时后 worker 在排空窗口内完成 → 只上报 complete（无 fail 双报）。
+
+        回归：曾超时即上报 fail、排空恢复又补 complete——同一 subject 双报导致
+        PoolProgress pending 出现负值（total - completed - failed）。
+        """
+        import time as _time
+
+        from paper_review.orchestrator import _execute_per_subject_pooled
+        from paper_review.pipeline_models import PoolProgress
+
+        class SlowExecutor:
+            """3 步共 2.4s > 单 subject 预算 1s：t≈2s 轮询必判超时（worker 仍在跑）；
+            2.4s 完成（排空窗口内）→ 走排空恢复路径。"""
+
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                _time.sleep(0.8)
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        steps = [
+            StepFile(path=Path("01-test.py"), stem="01-test", step_type="py"),
+            StepFile(path=Path("02-test.py"), stem="02-test", step_type="py"),
+            StepFile(path=Path("03-test.py"), stem="03-test", step_type="py"),
+        ]
+        pool_progress = PoolProgress()
+        all_results = _execute_per_subject_pooled(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, timeout=1, ordered=False),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=steps,
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=SlowExecutor(),
+            pool_cfg=PoolConfig(workers=2, timeout=1, ordered=False),
+            pool_progress=pool_progress,
+        )
+        # 超时 worker 在排空窗口内完成 → 结果收割为真实 ok
+        assert all(r.status == "ok" for subj in all_results.values() for r in subj), all_results
+        # 每个 subject 恰好一个终止事件（complete），无 fail 双报 → pending = 0
+        assert pool_progress.failed == 0, [e for e in pool_progress.events]
+        assert pool_progress.completed == 2
+        assert pool_progress.pending == 0
+
+    def test_pool_stuck_worker_wall_clock_fallback(self, tmp_path, monkeypatch):
+        """回归：worker 卡死（.py 步骤进程内无限执行）时，排队未开始的 Subject
+        由墙钟上限收尾，池化执行不再无限挂起。
+
+        曾：超时改为“实际开始起算”后，从未开始的排队 Subject 永不超时；若一个
+        worker 被卡死的步骤占住，主循环 wait 无限空转（CLI 整体挂死）。
+        """
+        import threading
+        import time as _time
+
+        from paper_review.orchestrator import _execute_per_subject_pooled
+        from paper_review.pipeline_models import (
+            PhaseConfig,
+            PoolConfig,
+            RetryConfig,
+            StepFile,
+            StepResult,
+        )
+
+        # 缩短“已超时但仍运行”worker 的排空等待，避免测试慢
+        monkeypatch.setattr("paper_review.orchestrator._TIMEOUT_DRAIN_FUTURES", 1)
+
+        release = threading.Event()
+
+        class StuckExecutor:
+            """模拟卡死的 .py 步骤：阻塞直到测试释放（进程内无限执行）。"""
+
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                release.wait(timeout=60)
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        steps = [StepFile(path=Path("01-hang.py"), stem="01-hang", step_type="py")]
+        subjects = ["s1", "s2", "s3"]
+        try:
+            t0 = _time.monotonic()
+            all_results = _execute_per_subject_pooled(
+                phase=PhaseConfig(
+                    name="review",
+                    mode="per_subject",
+                    directory="dummy",
+                    pool=PoolConfig(workers=1, timeout=1, ordered=False),
+                    retry=RetryConfig(max_attempts=1, on_failure="skip"),
+                ),
+                steps=steps,
+                subjects=subjects,
+                output_dir=tmp_path / "output",
+                base_env={},
+                executor=StuckExecutor(),
+                pool_cfg=PoolConfig(workers=1, timeout=1, ordered=False),
+            )
+            elapsed = _time.monotonic() - t0
+        finally:
+            release.set()  # 释放卡死 worker，避免阻塞解释器退出
+
+        # 墙钟上限 = ceil(3/1)×1 = 3s：s1 在 1s 超时；s2/s3 在墙钟处被放弃（而非无限挂起）
+        assert elapsed < 10, f"池化应被墙钟收尾而非无限挂起: {elapsed:.1f}s"
+        assert set(all_results) == {"s1", "s2", "s3"}
+        assert all(r.status == "error" for s in subjects for r in all_results[s])
+
+
+# ============================================================================
+# Step 级粒度（granularity=step）
+# ============================================================================
+
+
+class TestStepGranularity:
+    """granularity=step：按 Step 分波次（barrier），波内多 Subject 并行。"""
+
+    def test_step_granularity_barrier_order(self, tmp_path):
+        """barrier：所有 Subject 完成 Step1 之前，任何 Step2 都不开始。"""
+        from paper_review.pipeline_models import PoolConfig
+
+        events: list[tuple[str, str]] = []
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                events.append((step.stem, subject))
+                return StepResult(step_name=step.stem, status="ok", subject=subject)
+
+        steps = [
+            StepFile(path=Path("01-a.py"), stem="01-a", step_type="py"),
+            StepFile(path=Path("02-b.py"), stem="02-b", step_type="py"),
+        ]
+        subjects = ["s1", "s2", "s3"]
+
+        from paper_review.orchestrator import _execute_per_subject
+
+        all_results = _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=3, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=steps,
+            subjects=subjects,
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=RecordingExecutor(),
+        )
+
+        step1_idx = [i for i, (st, _) in enumerate(events) if st == "01-a"]
+        step2_idx = [i for i, (st, _) in enumerate(events) if st == "02-b"]
+        assert len(step1_idx) == 3 and len(step2_idx) == 3
+        # barrier：全部 Step1 事件先于全部 Step2 事件
+        assert max(step1_idx) < min(step2_idx), f"barrier 被破坏: {events}"
+        # 每个 subject 两个 step 都有结果
+        assert all(len(r) == 2 for r in all_results.values())
+        assert all(r.status == "ok" for subj in all_results.values() for r in subj)
+
+    def test_step_granularity_results_contain_each_step_once(self, tmp_path):
+        """结果列表按步骤顺序各含一次，不重复不缺失。
+
+        回归：波次收集取 res[0]——第 2 波起取到前序波次产物，当前步骤结果被丢弃，
+        结果列表变成 [step1, step1, step1]（报告/CLI 统计缺后续步骤）。
+        """
+        from paper_review.orchestrator import _execute_per_subject
+        from paper_review.pipeline_models import PoolConfig
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                return StepResult(
+                    step_name=step.stem, status="ok", subject=subject, data={"step": step.stem}
+                )
+
+        steps = [
+            StepFile(path=Path("01-a.py"), stem="01-a", step_type="py"),
+            StepFile(path=Path("02-b.py"), stem="02-b", step_type="py"),
+            StepFile(path=Path("03-c.py"), stem="03-c", step_type="py"),
+        ]
+        all_results = _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=steps,
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=RecordingExecutor(),
+        )
+        for s, rs in all_results.items():
+            assert [r.step_name for r in rs] == ["01-a", "02-b", "03-c"], (
+                f"结果应按步骤顺序各一次: {[r.step_name for r in rs]}"
+            )
+            assert [r.data.get("step") for r in rs] == ["01-a", "02-b", "03-c"]
+
+    def test_step_granularity_abort_stops_subject(self, tmp_path):
+        """on_failure=abort：失败 subject 不再参与后续波次。
+
+        回归：曾每波无条件提交全部 subject——step 粒度下 abort 被静默忽略，
+        失败 subject 继续跑后续步骤（与 subject 粒度 break 语义不一致）。
+        """
+        from paper_review.orchestrator import _execute_per_subject
+        from paper_review.pipeline_models import PoolConfig
+
+        calls: list[tuple[str, str]] = []
+
+        class FlakyExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                calls.append((step.stem, subject))
+                if step.stem == "01-a" and subject == "s2":
+                    return StepResult(
+                        step_name=step.stem, status="error", error="boom", subject=subject
+                    )
+                return StepResult(step_name=step.stem, status="ok", subject=subject)
+
+        steps = [
+            StepFile(path=Path("01-a.py"), stem="01-a", step_type="py"),
+            StepFile(path=Path("02-b.py"), stem="02-b", step_type="py"),
+        ]
+        all_results = _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="abort"),
+            ),
+            steps=steps,
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=FlakyExecutor(),
+        )
+        # s2 在 01-a 失败（abort）后不再提交 02-b；s1 正常跑完两个步骤
+        assert ("02-b", "s2") not in calls, f"abort 后不应再提交 s2: {calls}"
+        assert ("02-b", "s1") in calls
+        # s2 只保留失败步骤结果（与 subject 粒度 break 一致，不追加伪造 error）
+        assert [(r.step_name, r.status) for r in all_results["s2"]] == [("01-a", "error")]
+        assert [(r.step_name, r.status) for r in all_results["s1"]] == [
+            ("01-a", "ok"),
+            ("02-b", "ok"),
+        ]
+
+    def test_step_granularity_timeout_abort_stops_subject(self, tmp_path, monkeypatch):
+        """step 粒度 + on_failure=abort：步骤超时的 subject 不再参与后续波次。
+
+        回归：曾只对 error-status/异常失败 abort——超时分支漏掉 aborted.add，
+        abort 策略对超时静默失效（与 error 失败行为不一致，也与 subject 粒度
+        超时即整体停止的语义不符）。
+        """
+        import time as _time
+
+        from paper_review.orchestrator import _execute_per_subject
+
+        # 缩短超时僵尸的排空窗口：s2 的 step1 超时后仍会跑完（3.5s），在窗口内未
+        # 完成才能保留 error 结果（否则被收割为 ok——那是另一条路径的语义）
+        monkeypatch.setattr("paper_review.orchestrator._TIMEOUT_DRAIN_FUTURES", 0.5)
+
+        calls: list[tuple[str, str]] = []
+
+        class MixedExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                calls.append((step.stem, subject))
+                if step.stem == "01-a" and subject == "s2":
+                    _time.sleep(3.5)  # > 单步预算 1s → 超时；排空窗口（0.5s）内不完成
+                return StepResult(step_name=step.stem, status="ok", subject=subject)
+
+        steps = [
+            StepFile(path=Path("01-a.py"), stem="01-a", step_type="py"),
+            StepFile(path=Path("02-b.py"), stem="02-b", step_type="py"),
+        ]
+        all_results = _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, timeout=1, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="abort"),
+            ),
+            steps=steps,
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=MixedExecutor(),
+            step_timeout=0,
+        )
+        # s2 的 01-a 超时（abort）后不再提交 02-b；s1 正常跑完两个步骤
+        assert ("02-b", "s2") not in calls, f"超时 abort 后不应再提交 s2: {calls}"
+        assert ("02-b", "s1") in calls
+        # s2 只保留超时失败步骤结果（与 error abort 一致，不追加伪造结果）
+        assert [(r.step_name, r.status) for r in all_results["s2"]] == [("01-a", "error")]
+        assert [(r.step_name, r.status) for r in all_results["s1"]] == [
+            ("01-a", "ok"),
+            ("02-b", "ok"),
+        ]
+
+    def test_step_granularity_abort_reports_progress(self, tmp_path):
+        """step 粒度 + abort：error-status 失败的 subject 上报 fail，不泄漏 pending。
+
+        回归：曾只对异常/超时分支上报失败——.py 步骤失败返回 status=error 的
+        StepResult（非异常），abort 后 subject 既不到最后波次（无 complete）也不
+        上报 fail，PoolProgress 结束时报 N pending（CLI 摘要与实际完成状态矛盾）。
+        """
+        from paper_review.orchestrator import _execute_per_subject
+        from paper_review.pipeline_models import PoolConfig, PoolProgress
+
+        class FlakyExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                if step.stem == "01-a" and subject == "s2":
+                    return StepResult(
+                        step_name=step.stem, status="error", error="boom", subject=subject
+                    )
+                return StepResult(step_name=step.stem, status="ok", subject=subject)
+
+        steps = [
+            StepFile(path=Path("01-a.py"), stem="01-a", step_type="py"),
+            StepFile(path=Path("02-b.py"), stem="02-b", step_type="py"),
+        ]
+        pool_progress = PoolProgress()
+        _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="abort"),
+            ),
+            steps=steps,
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=FlakyExecutor(),
+            pool_progress=pool_progress,
+        )
+        assert pool_progress.total == 2
+        assert pool_progress.completed == 1
+        assert pool_progress.failed == 1
+        assert pool_progress.pending == 0, (
+            f"abort 的 subject 不得泄漏 pending: {pool_progress.summary()}"
+        )
+        fail_events = [e for e in pool_progress.events if e.event_type == "subject_fail"]
+        assert [e.subject for e in fail_events] == ["s2"]
+
+    def test_step_granularity_wave_concurrent(self, tmp_path):
+        """波内多 Subject 并行：慢 step 下 2 subject 总时长约等于 1 个（而非串行 2 个）。"""
+        import time as _time
+
+        from paper_review.pipeline_models import PoolConfig
+
+        class SlowExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                _time.sleep(0.4)
+                return StepResult(step_name=step.stem, status="ok", subject=subject)
+
+        steps = [StepFile(path=Path("01-a.py"), stem="01-a", step_type="py")]
+        subjects = ["s1", "s2"]
+
+        from paper_review.orchestrator import _execute_per_subject
+
+        t0 = _time.monotonic()
+        all_results = _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=steps,
+            subjects=subjects,
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=SlowExecutor(),
+        )
+        elapsed = _time.monotonic() - t0
+
+        # 并发 2 worker → 总时长 ≈ 0.4s（串行则是 ~0.8s）
+        assert elapsed < 0.75, f"波内未并发: elapsed={elapsed:.2f}s"
+        assert len(all_results) == 2
+
+    def test_pool_queue_waiting_subjects_not_timed_out(self, tmp_path):
+        """排队等待的 Subject 不计入超时——只有实际开始执行的才计时。
+
+        回归：旧逻辑在 submit 时即对全部 Subject 计时，排队中的任务在
+        timeout 后集体被 cancel（从未运行的论文被判超时）。
+        """
+        import threading
+        import time as _time
+
+        from paper_review.orchestrator import _execute_per_subject_pooled
+        from paper_review.pipeline_models import (
+            PhaseConfig,
+            PoolConfig,
+            RetryConfig,
+            StepFile,
+            StepResult,
+        )
+
+        step_count: dict[str, int] = {}
+        step_lock = threading.Lock()
+
+        class SlowExecutor:
+            """每个 step 慢 0.3s——串行 8 个 subject 总耗时 > 超时预算。"""
+
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                _time.sleep(0.3)
+                with step_lock:
+                    step_count[subject] = step_count.get(subject, 0) + 1
+                return StepResult(step_name=step.stem, status="ok", subject=subject)
+
+        steps = [StepFile(path=Path("01-test.py"), stem="01-test", step_type="py")]
+        subjects = [f"subj-{i}" for i in range(8)]
+
+        phase_config = PhaseConfig(
+            name="review",
+            mode="per_subject",
+            directory="dummy",
+            pool=PoolConfig(workers=1, timeout=1, ordered=False),
+            retry=RetryConfig(max_attempts=1, on_failure="skip"),
+        )
+
+        all_results = _execute_per_subject_pooled(
+            phase=phase_config,
+            steps=steps,
+            subjects=subjects,
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=SlowExecutor(),
+            pool_cfg=PoolConfig(workers=1, timeout=1, ordered=False),
+        )
+
+        # 修复前：排队 subject（第 3 个起）在 1s 后被集体 cancel，只有 ~3 个完成
+        assert len(all_results) == 8, f"排队 Subject 不应被误判超时: {list(all_results)}"
+        assert step_count == {s: 1 for s in subjects}
+
+    def test_step_granularity_queued_subjects_not_timed_out(self, tmp_path):
+        """step 粒度：排队（未开始）的 Subject 不计入波次超时。
+
+        回归：波次 barrier 曾以 submit 起算墙钟超时，worker < subjects 时
+        排队未运行的 Subject 在单步预算后集体被 cancel（从未执行即报超时）。
+        """
+        import threading
+        import time as _time
+
+        from paper_review.orchestrator import _execute_per_subject
+
+        step_count: dict[str, int] = {}
+        step_lock = threading.Lock()
+
+        class SlowExecutor:
+            """每步 0.4s：2 worker 下 6 个 subject 分 3 波，排队者晚于预算才开始。"""
+
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                subject = env.get("PIPELINE_SUBJECT", subject_name)
+                _time.sleep(0.4)
+                with step_lock:
+                    step_count[subject] = step_count.get(subject, 0) + 1
+                return StepResult(step_name=step.stem, status="ok", subject=subject)
+
+        steps = [StepFile(path=Path("01-test.py"), stem="01-test", step_type="py")]
+        subjects = [f"subj-{i}" for i in range(6)]
+
+        all_results = _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=steps,
+            subjects=subjects,
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=SlowExecutor(),
+            step_timeout=1,
+        )
+
+        # 修复前：subj-4/subj-5 排队未运行即被判超时（从未执行）
+        assert len(all_results) == 6, f"排队 Subject 不应被误判超时: {list(all_results)}"
+        assert all(r.status == "ok" for subj in all_results.values() for r in subj)
+        assert step_count == {s: 1 for s in subjects}
+
+    def test_step_granularity_pool_timeout_is_step_budget(self, tmp_path, monkeypatch):
+        """step 粒度：pool.timeout 作为单步超时上限生效（YAML 注释契约）。
+
+        回归：曾忽略 pool.timeout，波次预算回退估算 step_timeout（=0 时 30s 兜底），
+        配置的单步上限静默失效。
+        """
+        import time as _time
+
+        from paper_review.orchestrator import _execute_per_subject
+
+        # 缩短超时僵尸的排空窗口：3.5s 步骤在超时（t≈1s）后不会被排空收割为 ok，
+        # error 结果得以保留（否则与"预算未生效、步骤正常完成"不可区分）
+        monkeypatch.setattr("paper_review.orchestrator._TIMEOUT_DRAIN_FUTURES", 0.5)
+
+        def _run(step_duration: float):
+            class SlowExecutor:
+                def execute(self, step, step_dir, env, prior_results, subject_name):
+                    _time.sleep(step_duration)
+                    return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+            return _execute_per_subject(
+                phase=PhaseConfig(
+                    name="review",
+                    mode="per_subject",
+                    directory="dummy",
+                    pool=PoolConfig(workers=2, timeout=1, granularity="step", ordered=True),
+                    retry=RetryConfig(max_attempts=1, on_failure="skip"),
+                ),
+                steps=[StepFile(path=Path("01-test.py"), stem="01-test", step_type="py")],
+                subjects=["s1", "s2", "s3", "s4"],
+                output_dir=tmp_path / "output",
+                base_env={},
+                executor=SlowExecutor(),
+                step_timeout=0,  # pool.timeout=1 应覆盖此预算
+            )
+
+        # 0.4s < pool.timeout=1 → 全部完成
+        fast = _run(0.4)
+        assert all(r.status == "ok" for subj in fast.values() for r in subj)
+        # 3.5s > pool.timeout=1 → 单步预算生效：t≈1s 超时终止运行中的 subject，
+        # 排空窗口（0.5s）内未完成 → error 保留（若预算回退 0/30s 兜底则 3.5s
+        # 步骤正常完成 → ok——结果可区分）
+        slow = _run(3.5)
+        assert all(r.status == "error" for subj in slow.values() for r in subj)
+
+    def test_step_granularity_zombie_recovery_updates_result(self, tmp_path):
+        """step 粒度：波次超时后 worker 在排空窗口内实质完成 → 结果收割为真实 ok。
+
+        回归：曾静默丢弃僵尸结果——报告 error 但磁盘产物 ok、续做又跳过该步骤，
+        运行视图与续做视图分裂（与 subject 粒度排空回收不一致）。
+        """
+        import time as _time
+
+        from paper_review.orchestrator import _execute_per_subject
+
+        class SlowExecutor:
+            """2.5s > 单步预算 1s，但 < 排空窗口 30s：t≈2s 判超时后完成 → 应被收割为 ok。"""
+
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                _time.sleep(2.5)
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        all_results = _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, timeout=1, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=[StepFile(path=Path("01-test.py"), stem="01-test", step_type="py")],
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=SlowExecutor(),
+            step_timeout=0,
+        )
+        # 超时（t≈2s）后 worker 在排空窗口内完成（t=2.5s）→ 结果收割为 ok
+        assert all(r.status == "ok" for subj in all_results.values() for r in subj), all_results
+
+    def test_step_granularity_seeds_prior_results(self, tmp_path):
+        """step 粒度：后一波次步骤的 prior_results 包含前序波次产物。
+
+        回归：每个波次新建 _run_steps_for_subject 调用，prior_results 恒空——
+        .md 步骤模板的 {intermediates.*} 变量解析不到前序步骤，占位符原样进 prompt。
+        """
+        from paper_review.orchestrator import _execute_per_subject
+
+        captured: dict[str, list[str]] = {}
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                captured[step.stem] = [r.step_name for r in prior_results]
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        steps = [
+            StepFile(path=Path("01-a.md"), stem="01-a", step_type="md"),
+            StepFile(path=Path("02-b.md"), stem="02-b", step_type="md"),
+        ]
+        _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=steps,
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=RecordingExecutor(),
+        )
+        assert captured["01-a"] == []  # 首波无前序
+        assert captured["02-b"] == ["01-a"], f"第二波应携带前序波次产物: {captured}"
+
+    def test_step_granularity_executor_timeout_is_pool_budget(self, tmp_path):
+        """step 粒度：executor 超时（PIPELINE_STEP_TIMEOUT）= pool.timeout 单步预算。
+
+        回归：曾只把 pool.timeout 用于外层 watchdog，executor 仍用估算的
+        step_timeout——估算值小于配置上限时步骤被提前杀掉，配置的单步上限静默失效。
+        """
+        from paper_review.orchestrator import _execute_per_subject
+
+        captured: dict[str, int] = {}
+
+        class CapturingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                captured[step.stem] = int(env.get("PIPELINE_STEP_TIMEOUT", "-1"))
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        steps = [StepFile(path=Path("01-a.py"), stem="01-a", step_type="py")]
+        _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, timeout=7, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=steps,
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=CapturingExecutor(),
+            step_timeout=60,  # 估算值 60s，pool.timeout=7 应覆盖它
+        )
+        assert captured["01-a"] == 7
+
+    def test_step_granularity_pool_progress_events(self, tmp_path):
+        """step 粒度：PoolProgress 按 subject 上报（不按波次重复计数）。"""
+        from paper_review.orchestrator import _execute_per_subject
+        from paper_review.pipeline_models import PoolProgress
+
+        class OkExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        pool_progress = PoolProgress()
+        steps = [
+            StepFile(path=Path("01-a.py"), stem="01-a", step_type="py"),
+            StepFile(path=Path("02-b.py"), stem="02-b", step_type="py"),
+        ]
+        _execute_per_subject(
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                pool=PoolConfig(workers=2, granularity="step", ordered=True),
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            steps=steps,
+            subjects=["s1", "s2"],
+            output_dir=tmp_path / "output",
+            base_env={},
+            executor=OkExecutor(),
+            pool_progress=pool_progress,
+        )
+        assert pool_progress.total == 2
+        assert pool_progress.completed == 2
+        assert pool_progress.failed == 0
+        # 回归：曾传 [res]（嵌套列表）导致 step_count 恒为 1——应等于实际步骤数
+        complete_events = [e for e in pool_progress.events if e.event_type == "subject_complete"]
+        assert [e.step_count for e in complete_events] == [2, 2], [
+            e.step_count for e in complete_events
+        ]
+
+    def test_step_granularity_dynamic_wall_limit_uses_workers_min(self, tmp_path, monkeypatch):
+        """step 粒度 + dynamic：波次墙钟上限按 workers_min 预算（而非初始 workers）。
+
+        回归：曾用初始 workers（ceil(subjects/workers)）——DynamicPool 收缩并发后
+        真实串行化时间超出上限，排队中的 Subject 被集体误杀（与 subject 粒度用
+        workers_min 避免误杀不一致）。
+        """
+        import threading
+        import time as _time
+
+        from paper_review.orchestrator import _execute_per_subject
+        from paper_review.pipeline_models import (
+            PhaseConfig,
+            PoolConfig,
+            RetryConfig,
+            StepFile,
+            StepResult,
+        )
+
+        monkeypatch.setattr("paper_review.orchestrator._TIMEOUT_DRAIN_FUTURES", 1)
+        release = threading.Event()
+
+        class StuckExecutor:
+            """模拟卡死的 .py 步骤：阻塞直到测试释放。"""
+
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                release.wait(timeout=60)
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        steps = [StepFile(path=Path("01-hang.py"), stem="01-hang", step_type="py")]
+        subjects = ["s1", "s2", "s3"]
+        # dynamic：initial=2, min=1, max=2 —— 墙钟上限 = ceil(3/1)×1 = 3s
+        # （若按初始 workers 预算则为 ceil(3/2)×1 = 2s）
+        pool_cfg = PoolConfig(
+            workers=2,
+            workers_min=1,
+            workers_max=2,
+            profile="dynamic",
+            timeout=1,
+            granularity="step",
+            ordered=False,
+        )
+        try:
+            t0 = _time.monotonic()
+            all_results = _execute_per_subject(
+                phase=PhaseConfig(
+                    name="review",
+                    mode="per_subject",
+                    directory="dummy",
+                    pool=pool_cfg,
+                    retry=RetryConfig(max_attempts=1, on_failure="skip"),
+                ),
+                steps=steps,
+                subjects=subjects,
+                output_dir=tmp_path / "output",
+                base_env={},
+                executor=StuckExecutor(),
+            )
+            elapsed = _time.monotonic() - t0
+        finally:
+            release.set()
+
+        assert set(all_results) == {"s1", "s2", "s3"}
+        # 排队未开始的 s3 应在墙钟（3s，按 workers_min）处被放弃
+        s3_err = all_results["s3"][0].error
+        assert s3_err is not None and "after 3s" in s3_err, f"墙钟应按 workers_min 预算: {s3_err}"
+        assert elapsed < 10, f"池化应被墙钟收尾而非无限挂起: {elapsed:.1f}s"
 
 
 # ============================================================================
@@ -1058,6 +2716,30 @@ class TestCliTree:
         )
         assert "2 ok" in tree
         assert "1 error" in tree
+
+    def test_empty_batch_phase_shows_skipped(self, tmp_path):
+        """batch 阶段无产物（续做跳过的 Pre / 0 步骤）渲染为 skipped，而非误导性的 ✅ 0/0。
+
+        回归：resume 跳过 Pre 后 phase_results={}，原渲染 b_err==0 恒真显示
+        “✅ 0/0”，看起来像空批次成功。
+        """
+        from paper_review.orchestrator import _build_cli_tree
+        from paper_review.pipeline_models import StepResult
+
+        config, pipe_dir = self._make_config(tmp_path)
+        (pipe_dir / "pre-review" / "00-convert.py").write_text("")
+        (pipe_dir / "post-review" / "02-excel.py").write_text("")
+
+        all_results = {
+            "pre": {},  # 续做跳过的 Pre
+            "review": {
+                "subj1": [StepResult(step_name="01-search", status="ok")],
+            },
+            "post": {"_batch_": [StepResult(step_name="02-excel", status="ok")]},
+        }
+        tree = _build_cli_tree("id", "test", config, all_results, pipe_dir, Path("/tmp/t"))
+        assert "⏭ skipped" in tree, tree
+        assert "0/0" not in tree, tree
 
     def test_leaf_output_shows_file_path(self, tmp_path):
         """终端叶子节点有文件路径数据时展示文件路径。"""

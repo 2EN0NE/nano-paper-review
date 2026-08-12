@@ -39,7 +39,7 @@ _Avoid_: PDF import, paper archive, file mirroring
 _Avoid_: Review workflow, orchestrator, pipeline definition
 
 **Review Run**:
-一次 review pipeline 执行实例。输入一个 Subject（单篇）或多个 Subjects（目录），输出对应的 Review Report(s)。
+一次 review pipeline 执行实例。输入一个 Subject（单篇）或多个 Subjects（目录），输出对应的 Review Report(s)。每次运行分配唯一 Task ID（`YYYYMMDD-HHMMSS-哈希`，含发起时间）并落盘于 `{output_dir}/result/{task_id}/`。运行全程带状态（见 Task Status），是断点续做（Resume）的检测与操作单元。
 _Avoid_: Review session, review job
 
 **Review Phase**:
@@ -123,7 +123,22 @@ Step 执行失败时的重试策略：重试次数、是否跳过继续（skip-a
 _Avoid_: Pipeline runner, executor, engine
 
 **Pipeline CLI**:
-统一入口命令：`paper-review review <path>`。path 可以是单篇 PDF 或 PDF 目录。Orchestrator 自动检测并选择单篇/目录模式。
+统一入口命令：`paper-review review <path>`。path 可以是单篇 PDF 或 PDF 目录。Orchestrator 自动检测并选择单篇/目录模式。检测到未完成（中断）的 Review Run 时，交互式询问续做（Resume）还是重新发起一批。
+
+**Worker Granularity**:
+Review Phase 并发调度的拆分粒度，通过 `pipeline.yaml` 的 `review.pool.granularity` 配置（默认 `subject`）。
+
+- **subject 级**：worker = 一个 Subject，顺序跑完其全部 Steps 再领下一个。
+- **step 级**：Review Phase 按 Step 分波次（barrier）——所有 Subject 先并行完成 Step1，全部完成后统一进入 Step2；波内多 worker 并行不同 Subject。同一 Subject 的 Step 顺序由 barrier 保证（Step N 对全部 Subject 完成/超时后才进入 Step N+1）。前序波次产物经 `prior_results` 传给后续波次（`.md` 步骤的 `{intermediates.*}` 模板变量依赖它）。
+_Avoid_: Concurrency mode, parallelism unit, scheduling mode
+
+**Task Status**:
+Review Run 的状态，记录在 task-manifest 中。取值：`running`（进行中/中断后遗留，即“未完成”）、`done`（正常完成）、`interrupted`（SIGINT 优雅中断）、`abandoned`（用户选择重新一批后弃置）。未完成（running/interrupted）的任务是 Resume 的候选；多批未完成时“继续”指最近一批。
+_Avoid_: Run state, job status
+
+**Resume**:
+对未完成的 Review Run 原地续做：复用原 task 目录的 intermediates，已完成 Steps（有 output.json 且状态为 ok/skipped 的 Subject-Step）跳过——失败产物（status=error）不跳过、会重跑重试；从断点继续，最终报告合并进原 task。Pre Phase（仅指首个 per_subject 阶段之前的 batch 阶段）在前序 Pre 产物确证（最后一步 output.json 存在且 status 为 ok/skipped）、subjects 与输入路径均一致时跳过；任一条件不满足则重跑 Pre，避免混批。
+_Avoid_: Resume run, continue job, restart
 
 **Output Root**:
 评审产出的根目录。由 `data_dir` 推导为 `{data_dir}/output/`，也可通过 `pipeline.yaml` 的 `output_dir` 字段覆盖（优先级更高）。
