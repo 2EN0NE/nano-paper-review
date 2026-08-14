@@ -22,12 +22,17 @@ import os
 import sys
 import threading
 
-from paper_review.progress import PipelineProgress
+from paper_review.progress import (
+    _BOX_WIDTH,
+    PhaseProgressInfo,
+    PipelineProgress,
+    _display_width,
+)
 
 # ── 模块级常量 ──
-# _BOX_WIDTH = 62（─ 字符的宽度），实际 box 行宽 = 62 + 2 个边框字符 = 64
-_BOX_INNER = 62  # ─ 字符数量（_BOX_WIDTH 在 progress.py 中的名称）
-_BOX_TOTAL = 64  # 含边框的总宽度 = _BOX_INNER + 2
+# 盒宽从 progress.py 动态导入，避免测试硬编码值与源码漂移
+_BOX_INNER = _BOX_WIDTH  # ─ 字符数量
+_BOX_TOTAL = _BOX_WIDTH + 2  # 含边框的总宽度
 _BAR_WIDTH = 20
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -359,11 +364,10 @@ class TestProgressRendering:
         pp.review_subject_running("p")
         # 不设 workers 信息（dyn_active=0），为 ×1.5 留空间
         pp.update_dynamic_workers(active=0, current=4, timeout_multiplier=1.5)
-        # ×1.5 在 review_extra 的尾部，用 _build_lines 验证确保不被截断
+        # ×1.5 现在在总结行（动态池信息移到 summary），用 _build_lines 验证不被截断
         lines = _build_lines(pp)
         # 在极端空间紧张时，× 至少会渲染（虽然尾部可能截断）
-        # 验证宽度安全已在 TestProgressWidthSafety 中覆盖
-        assert "×" in lines[2], f"Multiplier marker should appear: {repr(lines[2])}"
+        assert "×" in lines[4], f"Multiplier marker should appear in summary: {repr(lines[4])}"
 
     def test_timeout_multiplier_default_hidden(self):
         pp = PipelineProgress(review_subjects=3, review_steps_per_subject=5)
@@ -1178,3 +1182,62 @@ class TestStdoutMute:
         finally:
             sys.stdout = original_stdout
             sys.stderr = original_stderr
+
+
+# ============================================================================
+# 中文 display_name 与双宽对齐（Ticket 03 新形态）
+# ============================================================================
+
+
+class TestChineseDisplayName:
+    def _chinese_pp(self) -> PipelineProgress:
+        return PipelineProgress(
+            [
+                PhaseProgressInfo(name="pre", display="预处理", kind="batch", total=2),
+                PhaseProgressInfo(
+                    name="review",
+                    display="逐篇评审",
+                    kind="per_subject",
+                    total=35,
+                    subjects=7,
+                    steps_per=5,
+                ),
+                PhaseProgressInfo(name="post", display="后处理", kind="batch", total=2),
+            ]
+        )
+
+    def test_chinese_display_name_shown(self):
+        """中文 display_name 三阶段都显示。"""
+        pp = self._chinese_pp()
+        pp._started = True
+        pp._start_time = 0.0
+        content = "\n".join(_build_lines(pp))
+        assert "预处理" in content
+        assert "逐篇评审" in content
+        assert "后处理" in content
+
+    def test_double_width_name_alignment(self):
+        """中文双宽名：三行 icon 前的显示宽度一致（bar 起始列对齐）。"""
+        pp = self._chinese_pp()
+        pp._started = True
+        pp._start_time = 0.0
+        lines = _build_lines(pp)
+        widths = []
+        for line in lines[1:4]:
+            icon_idx = line.index("·")
+            widths.append(_display_width(line[:icon_idx]))
+        assert widths[0] == widths[1] == widths[2], f"name columns misaligned: {widths}"
+
+    def test_workers_move_to_summary(self):
+        """动态池信息（workers/×倍数）在总结行，不在 per_subject 行。"""
+        pp = self._chinese_pp()
+        pp._started = True
+        pp._start_time = 0.0
+        pp.phase_subject_running("review", "p1")
+        pp.update_dynamic_workers(active=5, current=5, timeout_multiplier=1.5)
+        lines = _build_lines(pp)
+        review_line = lines[2]
+        summary_line = lines[4]
+        assert "workers=" not in review_line
+        assert "workers=5/5" in summary_line
+        assert "×1.5" in summary_line

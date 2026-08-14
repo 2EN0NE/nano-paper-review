@@ -72,6 +72,36 @@ class TestPhaseConfigModes:
         cfg = PhaseConfig(name="pre", mode="batch", directory="pre/")
         assert cfg.manifest_step == ""
 
+    def test_display_label_falls_back_to_name_capitalize(self):
+        """未写 display_name 时，显示名回退到 name 首字母大写。"""
+        cfg = PhaseConfig(name="review", mode="per_subject", directory="rev/")
+        assert cfg.display_label == "Review"
+
+    def test_display_label_uses_explicit_display_name(self):
+        """显式 display_name 优先于 name 回退。"""
+        cfg = PhaseConfig(
+            name="review", mode="per_subject", directory="rev/", display_name="逐篇评审"
+        )
+        assert cfg.display_label == "逐篇评审"
+
+    def test_parse_phase_reads_display_name(self):
+        """PipelineConfig.from_dict 解析 phase 的 display_name 字段。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "test",
+                "phases": [
+                    {
+                        "name": "review",
+                        "mode": "per_subject",
+                        "directory": "rev/",
+                        "display_name": "逐篇评审",
+                    }
+                ],
+            }
+        )
+        assert cfg.phases[0].display_name == "逐篇评审"
+        assert cfg.phases[0].display_label == "逐篇评审"
+
     def test_pipeline_config_phases_list(self):
         """PipelineConfig 正确解析 phases 列表。"""
         cfg = PipelineConfig.from_dict(

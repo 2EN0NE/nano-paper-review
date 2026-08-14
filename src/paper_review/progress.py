@@ -1,5 +1,5 @@
 """
-Pipeline progress display — ANSI terminal progress for Pre/Review/Post phases.
+Pipeline progress display — ANSI terminal progress for the pipeline phases.
 
 Renders a fixed-height progress box to stderr, refreshed in-place via ANSI
 cursor-move escape codes.  Suppresses console logging AND stdout output while
@@ -7,13 +7,17 @@ active to avoid corrupting the display — stderr logs or .py-step prints would
 push the box down, desyncing the fixed-line cursor moves and leaving ghost
 frames (residual old box rows) at the top of the card.
 
+每个 phase（batch / per_subject）渲染一行；per_subject 行携带
+`X/Y done, N running`；动态池信息（workers/超时倍数）追加在总结行；
+盒高随 phase 数量动态变化。
+
 Layout:
-┌──────────────────────────────────────────────────────────────┐
-│  Pre     ✓ ████████████████████ 2/2                            │
-│  Review  ⠋ ████████░░░░░░░░░░░ 4/7 done, 3 running   14/35   │
-│  Post    · ···················· 0/2                           │
-│  总进度 ⠋ 16/39 (41%)    23:21:13  已耗时 00:03:01             │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  预处理   ✓ ████████████████████ 2/2                                      │
+│  逐篇评审 ⠋ ████████░░░░░░░░░░░ 4/7 done, 3 running              14/35   │
+│  后处理   · ···················· 0/2                                     │
+│  总进度 ⠋ 16/39 (41%)    23:21:13  已耗时 00:03:01 · workers=5/5 · ×1.5  │
+└──────────────────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -25,61 +29,108 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _BAR_WIDTH = 20
-_BOX_WIDTH = 62
+_BOX_WIDTH = 72
 
 logger = logging.getLogger(__name__)
 
 
+def _display_width(text: str) -> int:
+    """字符显示宽度：东亚宽字符（W/F）按 2 列，其余按 1 列。"""
+    width = 0
+    for ch in text:
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+@dataclass
+class PhaseProgressInfo:
+    """进度卡单个 phase 的静态描述（orchestrator 构造，progress 只读）。"""
+
+    name: str  # phase.name（标识，方法按它定位）
+    display: str  # 显示名（display_label）
+    kind: str  # 'batch' | 'per_subject'
+    total: int = 0  # 总 step 数（per_subject = subjects × steps_per）
+    subjects: int = 0  # per_subject 的 subject 总数
+    steps_per: int = 0  # per_subject 的每 subject step 数
+
+
 @dataclass
 class _PhaseState:
-    total: int = 0
+    """进度卡单个 phase 的运行时状态。"""
+
+    info: PhaseProgressInfo
     done: int = 0
     running: int = 0
-    phase_name: str = ""
+    # per_subject 专用
+    done_subjects: int = 0
+    running_subjects: set[str] = field(default_factory=set)
+    subject_step_done: dict[str, int] = field(default_factory=dict)
 
 
 class PipelineProgress:
-    """Terminal progress display for the three-phase pipeline.
+    """Terminal progress display for the multi-phase pipeline.
 
     Usage::
 
-        pp = PipelineProgress(pre_steps=2, review_subjects=7,
-                              review_steps_per_subject=5, post_steps=2)
+        pp = PipelineProgress([
+            PhaseProgressInfo(name="pre", display="Pre", kind="batch", total=2),
+            PhaseProgressInfo(name="review", display="Review", kind="per_subject",
+                              total=35, subjects=7, steps_per=5),
+            PhaseProgressInfo(name="post", display="Post", kind="batch", total=2),
+        ])
         pp.start()
-        pp.pre_step_done()
-        pp.review_subject_running("paper-1")
+        pp.phase_step_done("pre")
+        pp.phase_subject_running("review", "paper-1")
         # ...
         pp.finish()
     """
 
     def __init__(
         self,
+        phases: list[PhaseProgressInfo] | None = None,
+        *,
         pre_steps: int = 0,
         review_subjects: int = 0,
         review_steps_per_subject: int = 0,
         post_steps: int = 0,
     ):
-        self._pre = _PhaseState(total=pre_steps, phase_name="Pre")
-        self._review = _PhaseState(
-            total=review_subjects * review_steps_per_subject,
-            phase_name="Review",
-        )
-        self._post = _PhaseState(total=post_steps, phase_name="Post")
-        self._review_subjects = review_subjects
-        self._review_steps_per = review_steps_per_subject
-        self._review_done_subjects: int = 0
-        self._review_running_subjects: set[str] = set()
-        self._subject_step_done: dict[str, int] = {}
+        # Deprecated 兼容：旧三槽位关键字签名 → 三个固定 phase。
+        # 新调用方（orchestrator）传 phases 列表；旧测试仍用关键字签名。
+        if phases is None:
+            phases = [
+                PhaseProgressInfo(name="pre", display="Pre", kind="batch", total=pre_steps),
+                PhaseProgressInfo(
+                    name="review",
+                    display="Review",
+                    kind="per_subject",
+                    total=review_subjects * review_steps_per_subject,
+                    subjects=review_subjects,
+                    steps_per=review_steps_per_subject,
+                ),
+                PhaseProgressInfo(name="post", display="Post", kind="batch", total=post_steps),
+            ]
+        self._phases: list[_PhaseState] = []
+        self._by_name: dict[str, _PhaseState] = {}
+        for info in phases:
+            st = _PhaseState(info=info)
+            self._phases.append(st)
+            self._by_name[info.name] = st
+
+        # name 列宽：最长显示名（按显示宽度），最小 7 保持英文兼容
+        self._name_width = max((_display_width(st.info.display) for st in self._phases), default=7)
 
         # 动态池信息
         self._dyn_active: int = 0
         self._dyn_current: int = 0
         self._dyn_timeout_mult: float = 1.0
-        self.subject_step_done = self._subject_step_done
 
         self._spinner_idx = 0
         self._started = False
@@ -106,11 +157,13 @@ class PipelineProgress:
             # 非 TTY 环境：静默日志 + 打印简单文本进度
             self._mute_console_logging()
             self._started = True
-            sys.stderr.write(
-                f"[进度] Pre {self._pre.total} steps / "
-                f"Review {self._review_subjects}×{self._review_steps_per} steps / "
-                f"Post {self._post.total} steps\n"
-            )
+            parts = []
+            for st in self._phases:
+                if st.info.kind == "batch":
+                    parts.append(f"{st.info.display} {st.info.total} steps")
+                else:
+                    parts.append(f"{st.info.display} {st.info.subjects}×{st.info.steps_per} steps")
+            sys.stderr.write(f"[进度] {' / '.join(parts)}\n")
             sys.stderr.flush()
             return
 
@@ -130,25 +183,31 @@ class PipelineProgress:
         self._spinner_thread.start()
 
     def set_subject_count(self, n: int):
-        """更新 review subject 总数（在 manifest 生成后 subject 列表可能变化时调用）。
+        """更新所有 per_subject phase 的 subject 总数（manifest 生成后调用）。
 
-        此时进度条已启动，_review.running 和 _review.done 皆以旧 subject 列表为基准——
+        此时进度条已启动，各 phase 的 done/running 以旧 subject 列表为基准——
         此处仅重算总量，不重置进度（已完成步骤不回溯）。
         """
         with self._lock:
-            self._review_subjects = n
-            self._review.total = n * self._review_steps_per
+            for st in self._phases:
+                if st.info.kind == "per_subject":
+                    st.info.subjects = n
+                    st.info.total = n * st.info.steps_per
 
-    def pre_step_done(self):
+    def phase_step_done(self, name: str):
+        """batch phase 的一个 step 完成。"""
+        st = self._by_name[name]
         with self._lock:
-            self._pre.done += 1
+            st.done += 1
             self._render()
 
-    def review_subject_running(self, subject: str):
+    def phase_subject_running(self, name: str, subject: str):
+        """per_subject phase 的一个 subject 开始执行。"""
+        st = self._by_name[name]
         with self._lock:
-            self._review_running_subjects.add(subject)
-            self._review.running = len(self._review_running_subjects)
-            self._subject_step_done.setdefault(subject, 0)
+            st.running_subjects.add(subject)
+            st.running = len(st.running_subjects)
+            st.subject_step_done.setdefault(subject, 0)
             self._render()
 
     def update_dynamic_workers(self, active: int, current: int, timeout_multiplier: float = 1.0):
@@ -159,30 +218,29 @@ class PipelineProgress:
             self._dyn_timeout_mult = timeout_multiplier
             self._render()
 
-    def review_step_done(self, subject: str):
+    def phase_subject_step_done(self, name: str, subject: str):
+        """per_subject phase 的某个 subject 完成一个 step。"""
+        st = self._by_name[name]
         with self._lock:
-            self._subject_step_done[subject] = self._subject_step_done.get(subject, 0) + 1
-            if self._subject_step_done[subject] >= self._review_steps_per:
-                self._review_done_subjects += 1
-                self._review_running_subjects.discard(subject)
-                self._review.running = len(self._review_running_subjects)
-            self._review.done += 1
+            st.subject_step_done[subject] = st.subject_step_done.get(subject, 0) + 1
+            if st.subject_step_done[subject] >= st.info.steps_per:
+                st.done_subjects += 1
+                st.running_subjects.discard(subject)
+                st.running = len(st.running_subjects)
+            st.done += 1
             self._render()
 
-    def review_subject_done(self, subject: str):
+    def phase_subject_done(self, name: str, subject: str):
+        """per_subject phase 的某个 subject 整体完成（补齐剩余 step）。"""
+        st = self._by_name[name]
         with self._lock:
-            remaining = self._review_steps_per - self._subject_step_done.get(subject, 0)
+            remaining = st.info.steps_per - st.subject_step_done.get(subject, 0)
             if remaining > 0:
-                self._review.done += remaining
-                self._subject_step_done[subject] = self._review_steps_per
-            self._review_done_subjects += 1
-            self._review_running_subjects.discard(subject)
-            self._review.running = len(self._review_running_subjects)
-            self._render()
-
-    def post_step_done(self):
-        with self._lock:
-            self._post.done += 1
+                st.done += remaining
+                st.subject_step_done[subject] = st.info.steps_per
+            st.done_subjects += 1
+            st.running_subjects.discard(subject)
+            st.running = len(st.running_subjects)
             self._render()
 
     def finish(self):
@@ -198,6 +256,62 @@ class PipelineProgress:
             sys.stderr.flush()
         self._restore_console_logging()
         self._restore_stdout()
+
+    # ── Deprecated 兼容层（旧三槽位 API；测试与遗留调用方使用，未来删除）──
+
+    @property
+    def _pre(self) -> _PhaseState:
+        st = self._by_name.get("pre")
+        assert st is not None, "compat layer requires a 'pre' phase"
+        return st
+
+    @property
+    def _review(self) -> _PhaseState:
+        st = self._by_name.get("review")
+        assert st is not None, "compat layer requires a 'review' phase"
+        return st
+
+    @property
+    def _post(self) -> _PhaseState:
+        st = self._by_name.get("post")
+        assert st is not None, "compat layer requires a 'post' phase"
+        return st
+
+    @property
+    def _review_running_subjects(self) -> set[str]:
+        st = self._by_name.get("review")
+        return st.running_subjects if st else set()
+
+    @property
+    def _review_done_subjects(self) -> int:
+        st = self._by_name.get("review")
+        return st.done_subjects if st else 0
+
+    @_review_done_subjects.setter
+    def _review_done_subjects(self, value: int):
+        st = self._by_name.get("review")
+        if st is not None:
+            st.done_subjects = value
+
+    def pre_step_done(self):
+        """Deprecated: use phase_step_done('pre')."""
+        self.phase_step_done("pre")
+
+    def post_step_done(self):
+        """Deprecated: use phase_step_done('post')."""
+        self.phase_step_done("post")
+
+    def review_subject_running(self, subject: str):
+        """Deprecated: use phase_subject_running('review', subject)."""
+        self.phase_subject_running("review", subject)
+
+    def review_step_done(self, subject: str):
+        """Deprecated: use phase_subject_step_done('review', subject)."""
+        self.phase_subject_step_done("review", subject)
+
+    def review_subject_done(self, subject: str):
+        """Deprecated: use phase_subject_done('review', subject)."""
+        self.phase_subject_done("review", subject)
 
     # ── Internal: logging mute ──
 
@@ -262,10 +376,10 @@ class PipelineProgress:
             time.sleep(0.1)
 
     def _total_done(self) -> int:
-        return self._pre.done + self._review.done + self._post.done
+        return sum(st.done for st in self._phases)
 
     def _total_steps(self) -> int:
-        return self._pre.total + self._review.total + self._post.total
+        return sum(st.info.total for st in self._phases)
 
     def _pct(self) -> int:
         t = self._total_steps()
@@ -291,21 +405,22 @@ class PipelineProgress:
             else "--:--:--"
         )
 
-    def _phase_line(self, phase: _PhaseState, extra: str = "") -> str:
+    def _phase_line(self, st: _PhaseState, extra: str = "") -> str:
         spinner = _SPINNER[self._spinner_idx]
-        name = phase.phase_name
+        name = st.info.display
+        name_padded = name + " " * (self._name_width - _display_width(name))
 
-        if phase.total > 0 and phase.done >= phase.total:
+        if st.info.total > 0 and st.done >= st.info.total:
             icon = "✓"
-        elif phase.done > 0 or phase.running > 0:
+        elif st.done > 0 or st.running > 0:
             icon = spinner
         else:
             icon = "·"
 
-        bar = self._bar(phase.done, phase.total)
-        count = f"{phase.done}/{phase.total}"
+        bar = self._bar(st.done, st.info.total)
+        count = f"{st.done}/{st.info.total}"
         suffix = f" {extra}" if extra else ""
-        return f"  {name:<7} {icon} {bar} {count}{suffix}"
+        return f"  {name_padded} {icon} {bar} {count}{suffix}"
 
     def _render_first(self):
         """First render: draw box and record how many lines it takes."""
@@ -336,20 +451,17 @@ class PipelineProgress:
 
     def _build_lines(self) -> list[str]:
         spinner = _SPINNER[self._spinner_idx]
+        safe = self._safe_line
 
-        # Review extra info
-        parts = []
-        if self._review.running > 0:
-            parts.append(
-                f"{self._review_done_subjects}/{self._review_subjects} done, {self._review.running} running"
-            )
-            if self._dyn_active > 0:
-                parts.append(f"workers={self._dyn_active}/{self._dyn_current}")
-            if self._dyn_timeout_mult > 1.01:
-                parts.append(f"×{self._dyn_timeout_mult:.1f}")
-        elif self._review.total > 0 and self._review.done >= self._review.total:
-            parts.append(f"{self._review_subjects}/{self._review_subjects} done")
-        review_extra = " · ".join(parts)
+        lines = ["┌" + "─" * _BOX_WIDTH + "┐"]
+        for st in self._phases:
+            extra = ""
+            if st.info.kind == "per_subject":
+                if st.running > 0:
+                    extra = f"{st.done_subjects}/{st.info.subjects} done, {st.running} running"
+                elif st.info.total > 0 and st.done >= st.info.total:
+                    extra = f"{st.info.subjects}/{st.info.subjects} done"
+            lines.append(safe(self._phase_line(st, extra), _BOX_WIDTH))
 
         # Summary line
         if self._finished:
@@ -361,23 +473,35 @@ class PipelineProgress:
             elapsed = self._elapsed_str()
             summary = f"  总进度 {spinner} {self._total_done()}/{self._total_steps()} ({self._pct()}%)    {ts}  已耗时 {elapsed}"
 
-        safe = self._safe_line
-        return [
-            "┌" + "─" * _BOX_WIDTH + "┐",
-            safe(self._phase_line(self._pre), _BOX_WIDTH),
-            safe(self._phase_line(self._review, review_extra), _BOX_WIDTH),
-            safe(self._phase_line(self._post), _BOX_WIDTH),
-            safe(summary, _BOX_WIDTH),
-            "└" + "─" * _BOX_WIDTH + "┘",
-        ]
+        # 动态池信息（workers / 超时倍数）追加到总结行
+        dyn_parts = []
+        if self._dyn_active > 0:
+            dyn_parts.append(f"workers={self._dyn_active}/{self._dyn_current}")
+        if self._dyn_timeout_mult > 1.01:
+            dyn_parts.append(f"×{self._dyn_timeout_mult:.1f}")
+        if dyn_parts:
+            summary += " · " + " · ".join(dyn_parts)
+
+        lines.append(safe(summary, _BOX_WIDTH))
+        lines.append("└" + "─" * _BOX_WIDTH + "┘")
+        return lines
 
     @staticmethod
     def _safe_line(text: str, width: int) -> str:
-        """Ensure line fits exactly within width.
+        """Ensure line fits exactly within width (by display width).
 
-        Truncates if text is too long; pads with spaces if too short.
-        This is the render safety net — every line must pass through here.
+        Truncates/pads by display width so CJK double-width characters don't
+        misalign or get cut mid-character.
         """
-        if len(text) > width:
-            return text[:width]
-        return text.ljust(width)
+        dw = _display_width(text)
+        if dw > width:
+            result = ""
+            w = 0
+            for ch in text:
+                cw = _display_width(ch)
+                if w + cw > width:
+                    break
+                result += ch
+                w += cw
+            return result
+        return text + " " * (width - dw)

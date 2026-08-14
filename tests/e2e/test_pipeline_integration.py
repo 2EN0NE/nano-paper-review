@@ -1652,3 +1652,602 @@ json.dump({"step": "00-convert", "status": "ok", "data": {"manifest": manifest}}
         intermediates = _find_task_dir(data_dir / "output") / "intermediates"
         pre_outs = list(intermediates.rglob("00-convert/output.json"))
         assert pre_outs, f"pre 00-convert output.json 未找到: {intermediates}"
+
+
+class TestChunkLevelRetrievalPipeline:
+    """Ticket 5: Pre 批量预检索 → Review 读产物的全链路 E2E。
+
+    验证 chunk 级检索前移到 Pre Phase 后：
+      1. 03-batch-search 批量检索写 per-subject intermediates（history/pending 分组）
+      2. Review 的 .md prompt 通过模板变量读到检索结果（seed 注入）
+      3. content_hash 相同的自身旧副本被排除
+      4. 检索默认常量从源码动态导入 + 可运行
+    无 faiss/无 ONNX 环境：内存暴力搜索 + 哈希向量降级仍能跑通。
+    """
+
+    # ---- helpers ----
+
+    def _make_ascii_paper(self, pid: str, text: str, pool: str = "history"):
+        """构造 ASCII 内容的 Paper（避免 CJK 在 PDF 内联渲染不稳）。"""
+        from paper_review.search.store import Paper, PaperMeta
+
+        meta = PaperMeta(
+            filename=f"{pid}.pdf",
+            title_hint=pid.replace("-", " ").replace("_", " "),
+            year=2023,
+            author_hint="Zhang",
+        )
+        return Paper(
+            paper_id=pid,
+            filepath=f"data/history/{pid}.pdf",
+            meta=meta,
+            raw_text=text,
+            pages=1,
+            pool=pool,
+        )
+
+    def _build_index(self, data_dir: Path, papers: list) -> Path:
+        """用 Store（无 faiss）预先建索引，返回 store_dir。"""
+        from helpers import make_mock_chunk_vecs
+        from paper_review.search.chunker import chunk_paper
+        from paper_review.search.store import Store
+
+        store_dir = data_dir / "index"
+        store_dir.mkdir(parents=True, exist_ok=True)
+        store = Store(str(store_dir / "index.sqlite"))
+        for paper in papers:
+            chunks = chunk_paper(paper)
+            cvs = make_mock_chunk_vecs(chunks, dim=4)
+            store.add_paper(paper, cvs)
+        store.close()
+        return store_dir
+
+    def _setup_chunk_level_pipeline(self, pipelines_dir: Path) -> Path:
+        """复制真实 pre 02/03/04 + review 03/04/05；01-auto-index 用 noop（索引预先建好）。"""
+        src = Path(__file__).resolve().parent.parent.parent / "src" / "paper_review" / "templates"
+        pipeline_dir = pipelines_dir / "chunk-retrieval-test"
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+
+        (pipeline_dir / "pipeline.yaml").write_text("""\
+name: "chunk-retrieval-test"
+version: "2.0"
+phases:
+  - name: pre
+    mode: batch
+    directory: pre-review/
+    manifest_step: "00-convert"
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+  - name: review
+    mode: per_subject
+    directory: review-pipeline/
+    subject_source:
+      type: manifest
+      path: "{{ output_dir }}/subject-manifest.json"
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+    subject_order:
+      sort_by: name
+      direction: asc
+    pool:
+      workers: 1
+      timeout: 120
+  - name: post
+    mode: batch
+    directory: post-review/
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+""")
+
+        pre_dir = pipeline_dir / "pre-review"
+        pre_dir.mkdir()
+        review_dir = pipeline_dir / "review-pipeline"
+        review_dir.mkdir()
+        post_dir = pipeline_dir / "post-review"
+        post_dir.mkdir()
+
+        # 真实 00-convert + 02/03/04 pre 步骤
+        shutil.copy(src / "pre-review" / "00-convert.py", pre_dir / "00-convert.py")
+        shutil.copy(src / "pre-review" / "02-generate-query.py", pre_dir / "02-generate-query.py")
+        shutil.copy(src / "pre-review" / "03-batch-search.py", pre_dir / "03-batch-search.py")
+        shutil.copy(
+            src / "pre-review" / "04-extract-keywords.py", pre_dir / "04-extract-keywords.py"
+        )
+        # 01-auto-index noop（索引已在 _build_index 预先建好，避免 faiss 依赖）
+        (pre_dir / "01-auto-index.py").write_text(
+            "import json, os\n"
+            "d = os.environ['PIPELINE_STEP_DIR']\n"
+            "os.makedirs(d, exist_ok=True)\n"
+            "json.dump({'step':'01-auto-index','status':'ok','data':{}},"
+            "open(os.path.join(d,'output.json'),'w'))\n"
+        )
+
+        # 真实 review 03/04/05
+        shutil.copy(
+            src / "review-pipeline" / "03-direct-scoring.md", review_dir / "03-direct-scoring.md"
+        )
+        shutil.copy(
+            src / "review-pipeline" / "04-indirect-scoring.md",
+            review_dir / "04-indirect-scoring.md",
+        )
+        shutil.copy(src / "review-pipeline" / "05-summarize.py", review_dir / "05-summarize.py")
+
+        # post 步骤（空，但目录需要存在）
+        (post_dir / "01-archive-reports.py").write_text(
+            "import json, os\n"
+            "d = os.environ['PIPELINE_STEP_DIR']\n"
+            "os.makedirs(d, exist_ok=True)\n"
+            "json.dump({'step':'01-archive-reports','status':'ok','data':{}},"
+            "open(os.path.join(d,'output.json'),'w'))\n"
+        )
+        return pipeline_dir
+
+    def _make_capturing_pi(self, bindir: Path) -> Path:
+        """fake pi：捕获 prompt.md 内容 + 按步骤输出完整评分 data。"""
+        script = bindir / "pi"
+        script.write_text(
+            "#!/bin/sh\n"
+            'cat "$PIPELINE_STEP_DIR/prompt.md" > "$PIPELINE_STEP_DIR/captured_prompt.md" 2>/dev/null\n'
+            'STEP="$PIPELINE_STEP_NAME"\n'
+            'if [ "$STEP" = "03-direct-scoring" ]; then\n'
+            '  echo \'{"step":"03-direct-scoring","status":"ok","data":{"创新性":{"score":3},"质量提升效果":{"score":3},"效能提升效果":{"score":3},"风险敏感性":{"score":3},"难度":{"score":3},"业务价值提升效果":{"score":3}}}\'\n'
+            'elif [ "$STEP" = "04-indirect-scoring" ]; then\n'
+            '  echo \'{"step":"04-indirect-scoring","status":"ok","data":{"行文严谨性":{"score":3},"问题关键性":{"score":3},"公式堆砌度":{"score":3},"源码深度":{"score":3},"业务规模真实性":{"score":3},"前人调研充分度":{"score":3}}}\'\n'
+            "else\n"
+            '  echo \'{"step":"test","status":"ok","data":{}}\'\n'
+            "fi\n"
+            "exit 0\n"
+        )
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        return script
+
+    def _run_review(self, data_dir: Path, input_dir: Path, mock_bin: Path, fake_pi: Path):
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = str(fake_pi)
+        return subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(input_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+
+    # ---- tests ----
+
+    def test_pre_batch_search_writes_intermediates_and_review_reads(self, tmp_path):
+        """全链路：pre 批量检索写 per-subject intermediates，review prompt 读到检索结果。"""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+
+        history_paper = self._make_ascii_paper(
+            "credit-assessment-history",
+            "This paper proposes a credit assessment method using deep learning for risk control.",
+        )
+        self._build_index(data_dir, [history_paper])
+
+        pipelines_dir = data_dir / "pipelines"
+        self._setup_chunk_level_pipeline(pipelines_dir)
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        fake_pi = self._make_capturing_pi(mock_bin)
+        _make_mock_pandoc(mock_bin)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _make_pdf(
+            input_dir / "credit-assessment.pdf",
+            "credit assessment method research for risk control",
+        )
+
+        result = self._run_review(data_dir, input_dir, mock_bin, fake_pi)
+        assert result.returncode == 0, f"STDOUT:{result.stdout[:600]}\nSTDERR:{result.stderr[:600]}"
+
+        task_dir = _find_task_dir(data_dir / "output")
+        intermediates = task_dir / "intermediates"
+
+        # 03-batch-search 写了 per-subject intermediates，history 非空
+        batch_out = intermediates / "credit-assessment" / "03-batch-search" / "output.json"
+        assert batch_out.exists(), f"03-batch-search 产物缺失: {batch_out}"
+        batch_data = json.loads(batch_out.read_text())
+        assert batch_data["data"]["history_count"] >= 1
+        assert batch_data["data"]["history"][0]["paper_id"] == "credit-assessment-history"
+
+        # review 的 03-direct-scoring prompt 通过模板变量读到了检索结果
+        prompt_out = (
+            intermediates / "credit-assessment" / "03-direct-scoring" / "captured_prompt.md"
+        )
+        assert prompt_out.exists()
+        prompt_text = prompt_out.read_text()
+        assert "credit-assessment-history" in prompt_text, "检索结果未注入 review prompt"
+
+    def test_self_exclusion_in_batch_search(self, tmp_path):
+        """排除自身：历史池中内容相同的旧副本不出现在 references。"""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+
+        subject_text = "unique subject content for self exclusion test"
+        # 历史池：内容与 subject 完全相同的旧副本 + 一篇无关历史论文
+        old_copy = self._make_ascii_paper("old-copy-of-subject", subject_text)
+        other = self._make_ascii_paper(
+            "unrelated-history",
+            "A totally different paper about graph neural networks.",
+        )
+        self._build_index(data_dir, [old_copy, other])
+
+        pipelines_dir = data_dir / "pipelines"
+        self._setup_chunk_level_pipeline(pipelines_dir)
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        fake_pi = self._make_capturing_pi(mock_bin)
+        _make_mock_pandoc(mock_bin)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _make_pdf(input_dir / "subject.pdf", subject_text)
+
+        result = self._run_review(data_dir, input_dir, mock_bin, fake_pi)
+        assert result.returncode == 0, f"STDOUT:{result.stdout[:600]}\nSTDERR:{result.stderr[:600]}"
+
+        task_dir = _find_task_dir(data_dir / "output")
+        batch_out = task_dir / "intermediates" / "subject" / "03-batch-search" / "output.json"
+        assert batch_out.exists()
+        batch_data = json.loads(batch_out.read_text())
+        history_ids = [r["paper_id"] for r in batch_data["data"]["history"]]
+        assert "old-copy-of-subject" not in history_ids, "自身旧副本未被排除"
+
+    def test_retrieval_constants_runnable_with_defaults(self, tmp_path):
+        """检索默认常量从源码动态导入 + hybrid_search 用默认值可运行。"""
+        from helpers import make_mock_chunk_vecs
+        from paper_review.search import search_types
+        from paper_review.search.chunker import chunk_paper
+        from paper_review.search.retriever import hybrid_search
+        from paper_review.search.store import Store
+
+        # 动态导入（不硬编码具体值）
+        history_top_n = search_types.HISTORY_TOP_N
+        pending_top_n = search_types.PENDING_TOP_N
+        max_rerank = search_types.MAX_RERANK_CHUNKS
+        max_cpp = search_types.MAX_CHUNKS_PER_PAPER
+        evidence = search_types.EVIDENCE_CHUNKS_PER_PAPER
+
+        # 值关系合理（不硬编码，只验证约束）
+        assert history_top_n > 0 and pending_top_n > 0 and max_rerank > 0
+        assert max_cpp >= 1
+        assert evidence > 0
+
+        # 默认值可运行：内存 store + 无模型 hybrid_search 不报错
+        store = Store(":memory:")
+        paper = self._make_ascii_paper(
+            "credit-assessment-history",
+            "This paper proposes a credit assessment method using deep learning for risk control.",
+        )
+        chunks = chunk_paper(paper)
+        cvs = make_mock_chunk_vecs(chunks, dim=4)
+        store.add_paper(paper, cvs)
+
+        results = hybrid_search(store, "credit assessment method")
+        assert isinstance(results, list)
+        history = [r for r in results if r.pool == "history"]
+        assert len(history) <= history_top_n
+        store.close()
+
+
+# ============================================================================
+# 真实模型 + 真实 FAISS 建索引 → 批量预检索链路（有模型才跑）
+# ============================================================================
+
+
+def _embedding_model_available() -> bool:
+    """检测本地是否有可用 embedding 模型（供真实 FAISS 链路 e2e 使用）。
+
+    真实 01-auto-index 的 build_index 依赖 ONNX embedding 模型；无模型时
+    虽然哈希降级也能建 FAISS 索引，但该降级路径已由
+    TestChunkLevelRetrievalPipeline（noop 01-auto-index + 内存 store）覆盖。
+    这里只测「真实模型 + 真实 FAISS」的完整链路，无模型则跳过。
+    """
+    try:
+        from paper_review.model_discovery import scan_huggingface_cache, scan_model_cache
+    except ImportError:
+        return False
+
+    try:
+        model_cache = Path.home() / ".cache" / "paper-review" / "models"
+        for m in scan_model_cache(model_cache):
+            if m.model_type == "embedding":
+                return True
+        for m in scan_huggingface_cache():
+            if m.model_type == "embedding":
+                return True
+    except Exception:  # noqa: BLE001 — 模型检测尽力而为，任何异常都视为无模型
+        return False
+    return False
+
+
+_HAS_EMBEDDING_MODEL = _embedding_model_available()
+
+
+class TestRealModelChunkRetrieval:
+    """真实模型 + 真实 FAISS 建索引 → 批量预检索的端到端链路。
+
+    覆盖审查 P1 缺口：TestChunkLevelRetrievalPipeline 用 noop 01-auto-index 绕过
+    FAISS 建索引，导致「真实 01-auto-index 写 chunks.index → 03-batch-search
+    load_faiss → FAISS chunk 检索」这条 Pre→Review 链路零 e2e 覆盖。
+    有 embedding 模型时真跑（真实 ONNX embedding + FAISS），无模型时跳过。
+    """
+
+    def _make_capturing_pi(self, bindir: Path) -> Path:
+        """fake pi：捕获 prompt.md 内容 + 按步骤输出完整评分 data。"""
+        script = bindir / "pi"
+        script.write_text(
+            "#!/bin/sh\n"
+            'cat "$PIPELINE_STEP_DIR/prompt.md" > "$PIPELINE_STEP_DIR/captured_prompt.md" 2>/dev/null\n'
+            'STEP="$PIPELINE_STEP_NAME"\n'
+            'if [ "$STEP" = "03-direct-scoring" ]; then\n'
+            '  echo \'{"step":"03-direct-scoring","status":"ok","data":{"创新性":{"score":3},"质量提升效果":{"score":3},"效能提升效果":{"score":3},"风险敏感性":{"score":3},"难度":{"score":3},"业务价值提升效果":{"score":3}}}\'\n'
+            'elif [ "$STEP" = "04-indirect-scoring" ]; then\n'
+            '  echo \'{"step":"04-indirect-scoring","status":"ok","data":{"行文严谨性":{"score":3},"问题关键性":{"score":3},"公式堆砌度":{"score":3},"源码深度":{"score":3},"业务规模真实性":{"score":3},"前人调研充分度":{"score":3}}}\'\n'
+            "else\n"
+            '  echo \'{"step":"test","status":"ok","data":{}}\'\n'
+            "fi\n"
+            "exit 0\n"
+        )
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        return script
+
+    def _setup_real_pipeline(self, pipelines_dir: Path) -> Path:
+        """复制真实 pre 01/02/03/04 + review 03/04/05；01-auto-index 用真实模板。"""
+        src = Path(__file__).resolve().parent.parent.parent / "src" / "paper_review" / "templates"
+        pipeline_dir = pipelines_dir / "chunk-retrieval-real"
+        pipeline_dir.mkdir(parents=True, exist_ok=True)
+
+        (pipeline_dir / "pipeline.yaml").write_text("""\
+name: "chunk-retrieval-real"
+version: "2.0"
+index:
+  store_dir: ""
+  reference_dir: ""
+  auto_index: true
+  copy_subjects: true
+phases:
+  - name: pre
+    mode: batch
+    directory: pre-review/
+    manifest_step: "00-convert"
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+  - name: review
+    mode: per_subject
+    directory: review-pipeline/
+    subject_source:
+      type: manifest
+      path: "{{ output_dir }}/subject-manifest.json"
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+    subject_order:
+      sort_by: name
+      direction: asc
+    pool:
+      workers: 1
+      timeout: 120
+  - name: post
+    mode: batch
+    directory: post-review/
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+""")
+
+        pre_dir = pipeline_dir / "pre-review"
+        pre_dir.mkdir()
+        review_dir = pipeline_dir / "review-pipeline"
+        review_dir.mkdir()
+        post_dir = pipeline_dir / "post-review"
+        post_dir.mkdir()
+
+        # 真实 pre 步骤（01-auto-index 真实建 FAISS 索引）
+        shutil.copy(src / "pre-review" / "00-convert.py", pre_dir / "00-convert.py")
+        shutil.copy(src / "pre-review" / "01-auto-index.py", pre_dir / "01-auto-index.py")
+        shutil.copy(src / "pre-review" / "02-generate-query.py", pre_dir / "02-generate-query.py")
+        shutil.copy(src / "pre-review" / "03-batch-search.py", pre_dir / "03-batch-search.py")
+        shutil.copy(
+            src / "pre-review" / "04-extract-keywords.py", pre_dir / "04-extract-keywords.py"
+        )
+
+        # 真实 review 03/04/05
+        shutil.copy(
+            src / "review-pipeline" / "03-direct-scoring.md", review_dir / "03-direct-scoring.md"
+        )
+        shutil.copy(
+            src / "review-pipeline" / "04-indirect-scoring.md",
+            review_dir / "04-indirect-scoring.md",
+        )
+        shutil.copy(src / "review-pipeline" / "05-summarize.py", review_dir / "05-summarize.py")
+
+        # post 步骤（空，但目录需要存在）
+        (post_dir / "01-archive-reports.py").write_text(
+            "import json, os\n"
+            "d = os.environ['PIPELINE_STEP_DIR']\n"
+            "os.makedirs(d, exist_ok=True)\n"
+            "json.dump({'step':'01-archive-reports','status':'ok','data':{}},"
+            "open(os.path.join(d,'output.json'),'w'))\n"
+        )
+        return pipeline_dir
+
+    def _run_review(self, data_dir: Path, input_dir: Path, mock_bin: Path, fake_pi: Path):
+        """真实链路需加载 embedding + reranker 模型，放宽外层 timeout 到 300s。"""
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = str(fake_pi)
+        return subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(input_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+
+    @pytest.mark.skipif(
+        not _HAS_EMBEDDING_MODEL, reason="无本地 embedding 模型，跳过真实 FAISS 链路 e2e"
+    )
+    def test_real_auto_index_faiss_and_batch_search(self, tmp_path):
+        """真实 01-auto-index 建 FAISS 索引 → 03-batch-search FAISS 检索的完整链路。"""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+
+        pipelines_dir = data_dir / "pipelines"
+        self._setup_real_pipeline(pipelines_dir)
+
+        # reference_dir 放 history PDF（真实 01-auto-index 首次运行扫描建 FAISS 索引）
+        reference_dir = data_dir / "origin" / "pdf"
+        reference_dir.mkdir(parents=True)
+        _make_pdf(
+            reference_dir / "credit-history.pdf",
+            "This paper proposes a credit assessment method using deep learning for risk control.",
+        )
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        fake_pi = self._make_capturing_pi(mock_bin)
+        _make_mock_pandoc(mock_bin)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _make_pdf(
+            input_dir / "credit-assessment.pdf",
+            "credit assessment method research for risk control",
+        )
+
+        result = self._run_review(data_dir, input_dir, mock_bin, fake_pi)
+        assert result.returncode == 0, f"STDOUT:{result.stdout[:800]}\nSTDERR:{result.stderr[:800]}"
+
+        # 1. FAISS chunks.index 真实落盘（01-auto-index 建索引而非 noop）
+        chunks_index = data_dir / "index" / "chunks.index"
+        assert chunks_index.exists(), f"chunks.index 未落盘: {chunks_index}"
+
+        task_dir = _find_task_dir(data_dir / "output")
+        intermediates = task_dir / "intermediates"
+
+        # 2. 03-batch-search 检索到 history 参考
+        batch_out = intermediates / "credit-assessment" / "03-batch-search" / "output.json"
+        assert batch_out.exists(), f"03-batch-search 产物缺失: {batch_out}"
+        batch_data = json.loads(batch_out.read_text())
+        assert batch_data["data"]["history_count"] >= 1
+
+        # 3. 真实 embedding 参与（非哈希降级）
+        summary_out = intermediates / "pre" / "03-batch-search" / "output.json"
+        assert summary_out.exists()
+        summary = json.loads(summary_out.read_text())
+        assert summary["data"]["model"]["embedding_used"], (
+            "真实 embedding 应参与检索（若 config 与模型缓存不一致会触发哈希降级）"
+        )
+
+
+# ============================================================================
+# display_name 全链路（progress-display-name Ticket 5）
+# ============================================================================
+
+
+class TestDisplayNamePipeline:
+    """pipeline.yaml 写 display_name 后，进度卡/报告/CLI 树三处阶段名一致为中文。"""
+
+    def test_display_name_shown_across_pipeline(self, tmp_path: Path):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "index").mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        pipeline_dir = _setup_pipeline_steps(data_dir / "pipelines")
+
+        # 注入 display_name 三词（_setup_pipeline_steps 生成的 yaml 无 display_name）
+        yaml_path = pipeline_dir / "pipeline.yaml"
+        content = yaml_path.read_text(encoding="utf-8")
+        content = content.replace(
+            "  - name: pre\n    mode: batch\n",
+            "  - name: pre\n    mode: batch\n    display_name: 预处理\n",
+        )
+        content = content.replace(
+            "  - name: review\n    mode: per_subject\n",
+            "  - name: review\n    mode: per_subject\n    display_name: 逐篇评审\n",
+        )
+        content = content.replace(
+            "  - name: post\n    mode: batch\n",
+            "  - name: post\n    mode: batch\n    display_name: 后处理\n",
+        )
+        yaml_path.write_text(content, encoding="utf-8")
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        _make_mock_pandoc(mock_bin)
+
+        pdf = input_dir / "test-paper.pdf"
+        _make_pdf(pdf, "Test paper for display name")
+
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+        env["PAPER_REVIEW_FORCE_TTY"] = "1"
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(pdf),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        assert result.returncode == 0, (
+            f"Pipeline failed:\nSTDOUT:{result.stdout[:800]}\nSTDERR:{result.stderr[:800]}"
+        )
+
+        # 1. 进度卡（stderr）中文三词
+        assert "预处理" in result.stderr
+        assert "逐篇评审" in result.stderr
+        assert "后处理" in result.stderr
+
+        # 2. report.md 阶段标题中文
+        task_dir = _find_task_dir(data_dir / "output")
+        report = (task_dir / "report.md").read_text(encoding="utf-8")
+        assert "## 逐篇评审 阶段" in report
+
+        # 3. CLI 树（stdout）阶段名中文
+        assert "逐篇评审" in result.stdout

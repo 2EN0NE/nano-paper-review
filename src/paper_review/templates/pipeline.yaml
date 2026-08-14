@@ -22,10 +22,12 @@ version: "2.0"
 phases:
   # ── Pre Phase（批量执行）────────────────────────────────────────────────
   # mode=batch: 所有待审 Subject 依次执行每个 Step（不并行）。
-  # 用途：格式归一化（doc→PDF）、元数据提取、临时建索引等批量操作。
+  # 用途：格式归一化（doc→PDF）、自动建索引、批量预检索相似 Reference（模型加载一次）、
+  #       关键词提取（从 Subject 首段提取，作为辅助信号）。
   - name: pre
     mode: batch
     directory: pre-review/ # 步骤脚本目录（相对于此 yaml 所在目录）
+    display_name: 预处理 # 进度卡/报告显示名（空 → name 首字母大写）
     # manifest_step: 产 subject-manifest.json 的 step 名称（不含扩展名）
     manifest_step: "00-convert"
     # duplicate_policy: 同名 Subject 去重策略
@@ -39,11 +41,12 @@ phases:
 
   # ── Review Phase（逐篇执行）──────────────────────────────────────────────
   # mode=per_subject: 每篇论文独立走完所有 Step，互不干扰。
-  # 用途：检索相似文章 → 关键词提取 → Agent 逐维度评审 → 综合打分。
+  # 用途：Agent 逐维度评审 → 综合打分（检索结果与关键词由 Pre 阶段批量预检索注入）。
   # 特点：支持 Worker 池并发处理多篇论文。
   - name: review
     mode: per_subject
     directory: review-pipeline/ # 步骤脚本目录
+    display_name: 逐篇评审 # 进度卡/报告显示名（空 → name 首字母大写）
     # subject_source: Subject 来源声明
     #   type: manifest — 从 {{ output_dir }}/subject-manifest.json 读取
     #   type: cli       — 直接从 CLI 输入路径发现（默认）
@@ -79,6 +82,7 @@ phases:
   - name: post
     mode: batch
     directory: post-review/
+    display_name: 后处理 # 进度卡/报告显示名（空 → name 首字母大写）
     duplicate_policy: skip
     retry:
       max_attempts: 2

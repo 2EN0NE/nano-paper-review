@@ -5,11 +5,10 @@
 ```
 pipeline/
 ├── pipeline.yaml              # 编排定义
-├── pre-review/                # Pre Phase：批量格式归一化
-│   └── 01-convert-docs.py
+├── pre-review/                # Pre Phase：批量格式归一化 + 批量预检索
+│   ├── 01-convert-docs.py
+│   └── 03-batch-search.py     # 脚本：批量预检索相似文章（模型加载一次）
 ├── review-pipeline/           # Review Phase：逐篇评审步骤
-│   ├── 01-search.py           # 脚本：检索相似文章
-│   ├── 02-extract-keywords.py # 脚本：提取技术关键词
 │   ├── 03-novelty.md          # Agent：创新性评审
 │   ├── 04-methodology.md      # Agent：方法合理性评审
 │   └── 05-synthesis.md        # Agent：综合评审
@@ -85,20 +84,20 @@ Pre 的中间产物目录：`{output_dir}/intermediates/pre/{step_name}/`
 
 ```
 review-pipeline/
-  ├── 01-search.py
-  ├── 02-novelty.md
-  └── 03-synthesis.md
+  ├── 01-direct-scoring.md
+  ├── 02-indirect-scoring.md
+  └── 03-summarize.py
 ```
 
 为每个 Subject 独立创建 intermediates 目录：
 
 ```
 {output_dir}/intermediates/{subject_name}/
-    ├── 01-search/
+    ├── 01-direct-scoring/
     │   └── output.json
-    ├── 02-novelty/
+    ├── 02-indirect-scoring/
     │   └── output.json
-    └── 03-synthesis/
+    └── 03-summarize/
         └── output.json
 ```
 
@@ -196,9 +195,9 @@ Agent Prefix Prompt 模板：
 
 | 变量 | 值 |
 | ------ | ---- |
-| `{intermediates.01-search.output}` | 01-search 步骤的整个 output.json |
-| `{intermediates.01-search.data.KEY}` | output.json 中 data.KEY 字段 |
-| `{intermediates.01-search.status}` | output.json 中 status 字段 |
+| `{intermediates.03-batch-search.output}` | 03-batch-search 步骤的整个 output.json |
+| `{intermediates.03-batch-search.data.KEY}` | output.json 中 data.KEY 字段 |
+| `{intermediates.03-batch-search.status}` | output.json 中 status 字段 |
 
 ### 替换规则
 
@@ -211,7 +210,7 @@ Agent Prefix Prompt 模板：
 
 ```json
 {
-  "step": "01-search",
+  "step": "03-batch-search",
   "status": "ok",
   "error": null,
   "data": {
@@ -246,3 +245,24 @@ paper-review review ./dir/ --step 02-novelty # 重跑单个步骤
 ```
 
 `path` 判断规则：存在且是目录 → 批量模式；存在且是文件（.pdf） → 单篇模式。
+
+## 阶段显示名（display_name）
+
+进度卡、报告（report.md）、CLI 树形总结三处展示的阶段名，可通过 phase 的
+`display_name` 字段自定义：
+
+```yaml
+phases:
+  - name: review
+    mode: per_subject
+    directory: review-pipeline/
+    display_name: 逐篇评审   # 进度卡/报告显示名
+```
+
+未写 `display_name` 时回退为 `name` 首字母大写（如 `review` → `Review`）。
+`display_name` 仅影响展示，不改变内部标识——intermediates 目录名、`--phase`
+参数、报告 key 仍使用 `name`。
+
+> **注意**：`display_name` 在 `init` 时随模板写入数据目录的 pipeline.yaml。
+> 已初始化的数据目录不会自动更新，需重新 `init`（或手动编辑其
+> pipeline.yaml）才会生效。

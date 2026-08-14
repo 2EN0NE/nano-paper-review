@@ -16,8 +16,10 @@ import pytest
 
 from paper_review.orchestrator import (
     PipelineConfig,
+    _build_cli_tree,
     _estimate_subject_chars,
     _execute_batch,
+    _generate_report,
     _retry_step,
     detect_unfinished_tasks,
     discover_steps,
@@ -476,6 +478,26 @@ with open(os.path.join(step_dir, 'output.json'), 'w') as f:
 
 
 class TestResumeDetection:
+    @pytest.fixture(autouse=True)
+    def _ensure_paper_review_log_propagates(self):
+        """确保 caplog 能捕获 paper_review 日志（含续做告警）。
+
+        setup_logging() 将 paper_review / paper_review.orchestrator logger 设为
+        propagate=False（避免控制台重复输出）；若同进程内更早的测试（如 test_cli
+        通过 CliRunner）调过 setup_logging()，该全局状态会残留，导致本类依赖 caplog
+        的测试变成顺序依赖。此处为本类恢复 propagate=True，测试后还原。
+        """
+        loggers = [
+            logging.getLogger("paper_review"),
+            logging.getLogger("paper_review.orchestrator"),
+        ]
+        originals = [lg.propagate for lg in loggers]
+        for lg in loggers:
+            lg.propagate = True
+        yield
+        for lg, orig in zip(loggers, originals):
+            lg.propagate = orig
+
     def test_detect_unfinished_tasks_recent_first(self, tmp_path):
         """只返回未完成任务，最近优先；done/abandoned 排除。"""
         result_root = tmp_path / "result"
@@ -640,6 +662,59 @@ class TestResumeDetection:
         )
 
         assert calls == ["01-a"]  # 正常模式：仍执行
+
+    def test_review_reads_pre_per_subject_intermediates(self, tmp_path):
+        """Review Phase 的 .md 模板变量能读到 Pre 阶段按 Subject 写的 intermediates。
+
+        批量预检索（03-batch-search）在 Pre Phase 执行，但按 Subject 布局写入
+        intermediates/{subject}/03-batch-search/output.json。Review Phase 的评分
+        .md 步骤通过 {intermediates.03-batch-search.data.*} 读取，依赖 orchestrator
+        把这些 Pre 产物作为 prior_results 种子注入。
+        """
+        from paper_review.orchestrator import _run_steps_for_subject
+
+        captured_prior: list[list[StepResult]] = []
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name):
+                captured_prior.append(list(prior_results))
+                return StepResult(step_name=step.stem, status="ok", subject=subject_name)
+
+        result_base = tmp_path / "out"
+        batch_dir = result_base / "intermediates" / "s1" / "03-batch-search"
+        batch_dir.mkdir(parents=True)
+        (batch_dir / "output.json").write_text(
+            json.dumps(
+                {
+                    "step": "03-batch-search",
+                    "status": "ok",
+                    "data": {"history": [{"title": "参考论文A"}], "pending": []},
+                }
+            )
+        )
+
+        steps = [
+            StepFile(path=Path("03-direct-scoring.md"), stem="03-direct-scoring", step_type="md"),
+        ]
+        _run_steps_for_subject(
+            subject="s1",
+            steps=steps,
+            phase=PhaseConfig(
+                name="review",
+                mode="per_subject",
+                directory="dummy",
+                retry=RetryConfig(max_attempts=1, on_failure="skip"),
+            ),
+            output_dir=tmp_path / "out",
+            base_env={},
+            executor=RecordingExecutor(),
+        )
+
+        # 第一个 review step 的 prior_results 应包含 Pre 的 03-batch-search 产物
+        assert len(captured_prior) == 1
+        seeded = [r for r in captured_prior[0] if r.step_name == "03-batch-search"]
+        assert len(seeded) == 1
+        assert seeded[0].data == {"history": [{"title": "参考论文A"}], "pending": []}
 
     def test_resume_pre_skip_depends_on_manifest_match(self, tmp_path):
         """Pre 跳过判定基于前序 manifest subjects（与当前输入一致才跳过）。
@@ -2689,7 +2764,7 @@ class TestCliTree:
         (pipe_dir / "post-review" / "02-excel.py").write_text("")
 
         tree = _build_cli_tree("id", "test", config, all_results, pipe_dir, Path("/tmp/t"))
-        assert "PRE (batch)" in tree
+        assert "Pre (batch)" in tree
         assert "1/1" in tree
 
     def test_per_subject_shows_aggregated_counts(self, tmp_path):
@@ -2874,3 +2949,71 @@ class TestEstimateSubjectChars:
         output_dir.mkdir()
         chars_list = _estimate_subject_chars([], output_dir)
         assert chars_list == []
+
+
+# ============================================================================
+# display_name 报告/CLI 树一致性
+# ============================================================================
+
+
+class TestDisplayNameInReportAndCliTree:
+    def test_generate_report_uses_display_label(self, tmp_path):
+        """_generate_report 阶段标题用 display_label（显式 display_name 优先）。"""
+        sr = StepResult(step_name="s1", status="ok", subject="_batch_")
+        report_path = tmp_path / "report.md"
+        conclusion = _generate_report(
+            report_path,
+            "task1",
+            "test-pipeline",
+            {"review": {"_batch_": [sr]}},
+            [sr],
+            True,
+            {"review": "逐篇评审"},
+        )
+        content = report_path.read_text(encoding="utf-8")
+        assert "## 逐篇评审 阶段" in content
+        assert "REVIEW 阶段" not in content
+        assert "逐篇评审: " in conclusion
+
+    def test_generate_report_falls_back_to_name_capitalize(self, tmp_path):
+        """无 phase_display 映射时回退 name.capitalize()。"""
+        sr = StepResult(step_name="s1", status="ok", subject="_batch_")
+        report_path = tmp_path / "report.md"
+        _generate_report(
+            report_path,
+            "task1",
+            "test-pipeline",
+            {"review": {"_batch_": [sr]}},
+            [sr],
+            True,
+        )
+        content = report_path.read_text(encoding="utf-8")
+        assert "## Review 阶段" in content
+
+    def test_build_cli_tree_uses_display_label(self, tmp_path):
+        """_build_cli_tree 阶段概览用 phase.display_label。"""
+        rev_dir = tmp_path / "rev"
+        rev_dir.mkdir()
+        (rev_dir / "01-s1.py").write_text("", encoding="utf-8")
+        config = PipelineConfig(
+            name="test",
+            phases=[
+                PhaseConfig(
+                    name="review",
+                    display_name="逐篇评审",
+                    mode="per_subject",
+                    directory="rev/",
+                )
+            ],
+        )
+        sr = StepResult(step_name="01-s1", status="ok", subject="paper1")
+        tree = _build_cli_tree(
+            "task1",
+            "test",
+            config,
+            {"review": {"paper1": [sr]}},
+            tmp_path,
+            tmp_path,
+        )
+        assert "逐篇评审 (per_subject)" in tree
+        assert "REVIEW (per_subject)" not in tree

@@ -218,6 +218,7 @@ class PhaseConfig:
     name: str = ""
     mode: str = "batch"  # 'batch' | 'per_subject'
     directory: str = ""
+    display_name: str = ""  # 进度卡/报告显示名（空 → name.capitalize() 回退）
     retry: RetryConfig = field(default_factory=RetryConfig)
     duplicate_policy: str = "skip"  # 'skip' | 'rename' | 'error'
     step_timeout: int = 0  # 单 Step 超时秒数（0=无超时，或从 pool.timeout 继承）
@@ -229,6 +230,11 @@ class PhaseConfig:
     subject_source: SubjectSourceConfig | None = None
     subject_order: SubjectOrderConfig | None = None
     pool: PoolConfig | None = None
+
+    @property
+    def display_label(self) -> str:
+        """阶段显示名：显式 display_name 优先，否则 name 首字母大写回退。"""
+        return self.display_name or self.name.capitalize()
 
 
 @dataclass
@@ -250,6 +256,7 @@ def _parse_phase(data: dict) -> PhaseConfig:
         name=data.get("name", ""),
         mode=mode,
         directory=data.get("directory", ""),
+        display_name=data.get("display_name", ""),
         retry=RetryConfig(
             max_attempts=data.get("retry", {}).get("max_attempts", 1),
             on_failure=data.get("retry", {}).get("on_failure", "skip"),

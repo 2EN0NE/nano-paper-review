@@ -41,7 +41,7 @@ from paper_review.pipeline_steps import (
     StepExecutor,
     _execute_step,
 )
-from paper_review.progress import PipelineProgress
+from paper_review.progress import PhaseProgressInfo, PipelineProgress
 from paper_review.subject_discovery import discover_subjects
 from paper_review.timeout_estimator import estimate_step_timeout
 
@@ -227,12 +227,9 @@ def _execute_batch(
         )
         results.append(result)
 
-        # Progress — first batch phase is conventionally "pre", others "post"
+        # Progress — batch phase step done
         if pp:
-            if phase.name == "pre":
-                pp.pre_step_done()
-            else:
-                pp.post_step_done()
+            pp.phase_step_done(phase.name)
 
         if result.status == "error" and phase.retry.on_failure == "abort":
             logger.error("Aborting batch phase '%s' due to %s failure", phase.name, step.stem)
@@ -305,7 +302,7 @@ def _execute_per_subject(
     all_results: dict[str, list[StepResult]] = {}
     for subject in subjects:
         if pp:
-            pp.review_subject_running(subject)
+            pp.phase_subject_running(phase.name, subject)
         if pool_progress:
             pool_progress.on_subject_start(subject)
 
@@ -357,6 +354,35 @@ def _run_steps_for_subject(
 
     subject_results: list[StepResult] = list(seed_results) if seed_results else []
     result_base = base_env.get("PIPELINE_RESULT_DIR", str(output_dir))
+
+    # 加载 Pre Phase 为当前 Subject 写的 per-subject intermediates 作为 seed。
+    # 批量预检索（03-batch-search / 04-extract-keywords）在 Pre Phase 执行，但按
+    # Subject 布局写入 intermediates/{subject}/{step}/output.json。Review Phase 的
+    # .md 步骤模板变量 {intermediates.STEP.data.KEY} 依赖 prior_results，必须把
+    # 这些 Pre 产物带进来（否则评分 prompt 读不到检索结果）。
+    review_step_names = {step.stem for step in steps}
+    subject_intermediates = Path(result_base) / "intermediates" / subject
+    if subject_intermediates.is_dir():
+        loaded_names = {r.step_name for r in subject_results}
+        for output_file in sorted(subject_intermediates.glob("*/output.json")):
+            step_name = output_file.parent.name
+            if step_name in review_step_names or step_name in loaded_names:
+                continue
+            try:
+                out = json.loads(output_file.read_text(encoding="utf-8"))
+                subject_results.append(
+                    StepResult(
+                        step_name=step_name,
+                        status=out.get("status", "ok"),
+                        error=out.get("error"),
+                        subject=subject,
+                        data=out.get("data", {}),
+                    )
+                )
+                logger.debug("  [%s] ↳ seeded Pre intermediate '%s'", subject, step_name)
+            except (json.JSONDecodeError, OSError) as e:
+                logger.debug("  [%s] 跳过损坏的 Pre 产物 '%s': %s", subject, step_name, e)
+
     t0 = time.monotonic()
 
     logger.info(
@@ -391,7 +417,7 @@ def _run_steps_for_subject(
                     step.stem,
                 )
                 if pp:
-                    pp.review_step_done(subject)
+                    pp.phase_subject_step_done(phase.name, subject)
                 continue
 
         # 动态池：用 with 保护槽位生命周期，异常时自动释放
@@ -438,7 +464,7 @@ def _run_steps_for_subject(
                 )
 
         if pp:
-            pp.review_step_done(subject)
+            pp.phase_subject_step_done(phase.name, subject)
 
         if result.status == "error" and phase.retry.on_failure == "abort":
             logger.error("Aborting pipeline for %s due to %s failure", subject, step.stem)
@@ -576,7 +602,7 @@ def _execute_per_subject_pooled(
             if pool_progress:
                 pool_progress.on_subject_start(s)
             if pp:
-                pp.review_subject_running(s)
+                pp.phase_subject_running(phase.name, s)
 
         pending = set(future_map.keys())
         while pending:
@@ -804,7 +830,7 @@ def _execute_per_step_pooled(
                     if pool_progress:
                         pool_progress.on_subject_start(s)
                     if pp:
-                        pp.review_subject_running(s)
+                        pp.phase_subject_running(phase.name, s)
 
             # barrier：轮询等待波内全部完成。每个 Subject 的超时从“实际开始”起算
             # （worker 入口记录于 started），排队未开始的 Subject 不计入超时——
@@ -1015,7 +1041,7 @@ def _build_cli_tree(
         if phase.mode == "batch" and not phase_results:
             # batch 阶段无任何产物：续做跳过的 Pre（或 0 步骤阶段）——避免显示
             # 误导性的“✅ 0/0”（b_err==0 恒真，看起来像空批次成功）。
-            lines.append(f"{phase_prefix} {phase.name.upper()} (batch) ⏭ skipped（无产物）")
+            lines.append(f"{phase_prefix} {phase.display_label} (batch) ⏭ skipped（无产物）")
             lines.append("")
             continue
         if phase.mode == "batch":
@@ -1023,11 +1049,11 @@ def _build_cli_tree(
             b_ok = sum(1 for r in batch if r.status == "ok")
             b_err = sum(1 for r in batch if r.status == "error")
             icon = "✅" if b_err == 0 else "❌"
-            lines.append(f"{phase_prefix} {phase.name.upper()} (batch) {icon} {b_ok}/{len(batch)}")
+            lines.append(f"{phase_prefix} {phase.display_label} (batch) {icon} {b_ok}/{len(batch)}")
         else:
             subjects_in_phase = [s for s in phase_results if s != "_batch_"]
             lines.append(
-                f"{phase_prefix} {phase.name.upper()} (per_subject) "
+                f"{phase_prefix} {phase.display_label} (per_subject) "
                 f"{len(subjects_in_phase)} subject(s)"
             )
 
@@ -1189,9 +1215,14 @@ def _generate_report(
     all_phase_results: dict,
     all_step_results: list[StepResult],
     success: bool,
+    phase_display: dict[str, str] | None = None,
 ) -> str:
     """生成最终报告 markdown 文件，返回 CLI 可输出的结构化结论摘要。"""
     import datetime
+
+    def _phase_label(phase_name: str) -> str:
+        """阶段显示名：显式 display_name 优先，否则 name 首字母大写回退。"""
+        return (phase_display or {}).get(phase_name, phase_name.capitalize())
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1237,7 +1268,7 @@ def _generate_report(
 
     # ── 按阶段输出详情 ──
     for phase_name, phase_results in all_phase_results.items():
-        lines.append(f"## {phase_name.upper()} 阶段")
+        lines.append(f"## {_phase_label(phase_name)} 阶段")
         lines.append("")
         for subject_name, subj_results in phase_results.items():
             is_batch = subject_name == "_batch_"
@@ -1292,7 +1323,7 @@ def _generate_report(
             batch_err = sum(1 for r in batch if r.status == "error")
             status_icon = "✅" if batch_err == 0 else "❌"
             conclusion_lines.insert(
-                0, f"{phase_name.upper()}: {status_icon} {batch_ok}/{len(batch)} 步通过"
+                0, f"{_phase_label(phase_name)}: {status_icon} {batch_ok}/{len(batch)} 步通过"
             )
 
     summary = f"共 {len(all_step_results)} 步（✅ {ok_count} / ❌ {error_count}）"
@@ -1564,6 +1595,7 @@ def run_pipeline(
             all_phase_results,
             all_step_results,
             overall_success,
+            {p.name: p.display_label for p in config.phases},
         )
         conclusion = _build_cli_tree(
             task_id, config.name, config, all_phase_results, pipeline_dir, task_dir
@@ -1743,26 +1775,32 @@ def run_pipeline(
     md_executor = MdStepExecutor()
 
     # ── Progress ──
-    pre_steps_count = 0
+    phase_infos: list[PhaseProgressInfo] = []
     review_subjects = len(subjects) if subjects else 0
-    review_steps_per = 0
-    post_steps_count = 0
     for phase in active_phases:
         step_count = len(discover_steps(pipeline_dir / phase.directory))
         if phase.mode == "batch":
-            if not pre_steps_count:
-                pre_steps_count = step_count
-            else:
-                post_steps_count = step_count
+            phase_infos.append(
+                PhaseProgressInfo(
+                    name=phase.name,
+                    display=phase.display_label,
+                    kind="batch",
+                    total=step_count,
+                )
+            )
         elif phase.mode == "per_subject":
-            review_steps_per = step_count
+            phase_infos.append(
+                PhaseProgressInfo(
+                    name=phase.name,
+                    display=phase.display_label,
+                    kind="per_subject",
+                    total=step_count * review_subjects,
+                    subjects=review_subjects,
+                    steps_per=step_count,
+                )
+            )
 
-    pp = PipelineProgress(
-        pre_steps=pre_steps_count,
-        review_subjects=review_subjects,
-        review_steps_per_subject=review_steps_per,
-        post_steps=post_steps_count,
-    )
+    pp = PipelineProgress(phases=phase_infos)
     pp.start()
 
     # ── 阶段遍历 ──
@@ -1902,6 +1940,7 @@ def run_pipeline(
         all_phase_results,
         all_step_results,
         overall_success,
+        {p.name: p.display_label for p in config.phases},
     )
     conclusion = _build_cli_tree(
         task_id, config.name, config, all_phase_results, pipeline_dir, task_dir
