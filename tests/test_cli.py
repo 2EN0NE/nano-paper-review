@@ -36,17 +36,21 @@ class TestInitCommand:
         assert pool["workers_max"] == 5
 
     def test_init_generates_all_default_step_files(self, tmp_path):
-        """全新 data_dir 下 init 生成全部 9 个默认 step 文件。"""
+        """全新 data_dir 下 init 生成全部 10 个默认 step 文件。"""
         dd = tmp_path / "data"
         result = runner.invoke(app, ["--data-dir", str(dd), "init"])
         assert result.exit_code == 0
 
         pipeline_dir = dd / "pipelines" / "standard"
         expected = {
-            "pre-review": ["00-convert.py", "01-auto-index.py"],
+            "pre-review": [
+                "00-convert.py",
+                "01-auto-index.py",
+                "02-generate-query.py",
+                "03-batch-search.py",
+                "04-extract-keywords.py",
+            ],
             "review-pipeline": [
-                "01-search.py",
-                "02-extract-keywords.py",
                 "03-direct-scoring.md",
                 "04-indirect-scoring.md",
                 "05-summarize.py",
@@ -119,6 +123,21 @@ class TestInitResetCommand:
         assert result.exit_code == 0
         assert list(dd.glob("config.yaml.bak-*"))
 
+    def test_reset_removes_orphan_files_from_old_snapshot(self, tmp_path):
+        """旧快照（无 manifest）+ 残留孤儿 step → init --reset 备份后删除。"""
+        dd = tmp_path / "data"
+        runner.invoke(app, ["--data-dir", str(dd), "init"])
+        # 模拟旧快照：删 manifest + 放一个模板已删除的 step
+        (dd / ".scaffold-manifest").unlink()
+        orphan = dd / "pipelines" / "standard" / "review-pipeline" / "01-search.py"
+        orphan.write_text("print('old')", encoding="utf-8")
+
+        result = runner.invoke(app, ["--data-dir", str(dd), "init", "--reset", "--yes"])
+        assert result.exit_code == 0
+        assert not orphan.exists(), "孤儿文件应被删除"
+        backups = list(dd.glob("pipelines/standard/review-pipeline/01-search.py.bak-*"))
+        assert len(backups) == 1, f"孤儿文件应有备份: {backups}"
+
 
 class TestHelp:
     """--help 输出"""
@@ -144,7 +163,6 @@ class TestStatusCommand:
             "papers": 3,
             "pools": {"history": 2, "pending": 1},
             "chunks": 15,
-            "doc_vectors": 3,
             "chunk_vectors": 15,
         }
         mock_open_store.return_value = mock_store
@@ -163,7 +181,6 @@ class TestStatusCommand:
             "papers": 0,
             "pools": {},
             "chunks": 0,
-            "doc_vectors": 0,
             "chunk_vectors": 0,
         }
         mock_open_store.return_value = mock_store

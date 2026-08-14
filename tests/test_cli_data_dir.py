@@ -30,7 +30,6 @@ class TestGlobalDataDirFlag:
             "papers": 0,
             "pools": {},
             "chunks": 0,
-            "doc_vectors": 0,
             "chunk_vectors": 0,
         }
         mock_open_store.return_value = mock_store
@@ -49,7 +48,6 @@ class TestGlobalDataDirFlag:
             "papers": 0,
             "pools": {},
             "chunks": 0,
-            "doc_vectors": 0,
             "chunk_vectors": 0,
         }
         mock_open_store.return_value = mock_store

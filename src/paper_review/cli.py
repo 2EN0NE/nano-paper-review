@@ -28,6 +28,15 @@ from paper_review.orchestrator import (
     run_pipeline,
     write_task_manifest,
 )
+from paper_review.scaffold import (
+    PHASE_DIRS,
+    SCAFFOLD_VERSION,
+    build_scaffold_files,
+    check_scaffold,
+    find_orphan_files,
+    load_manifest,
+    write_manifest,
+)
 from paper_review.search.store import (
     Paper,
     PaperMeta,
@@ -72,6 +81,31 @@ paper-review 的核心是【评审管线】（Pipeline）——
 """
 
 
+def _apply_resource_limits(config) -> None:
+    """根据 config 应用进程级资源限制（rlimit）。
+
+    0 = 不限制（跳过，保持现状）。rlimit 是进程级且降低后不可逆，故只在
+    CLI 入口（_main_callback）执行一次，绝不放入库代码。
+    """
+    import resource
+
+    if config.max_memory_mb > 0:
+        limit = config.max_memory_mb * 1024 * 1024
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+            logger.info("Applied RLIMIT_AS: %d MB", config.max_memory_mb)
+        except (ValueError, OSError) as e:
+            # macOS 的 RLIMIT_AS 对有限值返回 EINVAL（ValueError）——降级为警告而非崩溃
+            logger.warning("无法应用 RLIMIT_AS=%d MB（%s），忽略内存限制", config.max_memory_mb, e)
+    if config.max_cpu_seconds > 0:
+        s = config.max_cpu_seconds
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (s, s))
+            logger.info("Applied RLIMIT_CPU: %d s", s)
+        except (ValueError, OSError) as e:
+            logger.warning("无法应用 RLIMIT_CPU=%d s（%s），忽略 CPU 时间限制", s, e)
+
+
 @app.callback(invoke_without_command=True)
 def _main_callback(
     ctx: typer.Context,
@@ -108,6 +142,11 @@ def _main_callback(
         log_dir=resolved_log_dir,
         data_dir=str(dd),
     )
+
+    # 业务逻辑前：根据 --data-dir 的 config 应用资源限制（内存 / CPU 时间，0=不限制）
+    from paper_review.config import load_config
+
+    _apply_resource_limits(load_config(data_dir=data_dir))
 
     # 降级 WARN：cwd 下存在 .paper-review 但未初始化（残留目录）→ 回退用户级
     if not data_dir:
@@ -263,11 +302,11 @@ def index(
                     pool=pool,
                 )
 
-                chunks, chunk_vecs, doc_vec = build_index(paper, model)
-                store.bulk_add_paper(paper, chunk_vecs, doc_vec)
+                chunks, chunk_vecs = build_index(paper, model)
+                store.bulk_add_paper(paper, chunk_vecs)
 
                 # 显式释放临时对象
-                del raw_text, paper, chunks, chunk_vecs, doc_vec
+                del raw_text, paper, chunks, chunk_vecs
 
                 typer.echo(f"  ✓ [{global_idx + 1}/{num_papers}] {pdf_file.name}")
                 epoch_success += 1
@@ -384,29 +423,32 @@ def search(
 
 @app.command()
 def status(ctx: typer.Context):
-    """查看索引状态"""
-    store = open_store(data_dir=_get_data_dir(ctx))
+    """查看索引状态与脚手架版本"""
+    dd = resolve_data_dir(_get_data_dir(ctx))
+    store = open_store(data_dir=str(dd))
     s = store.state_summary()
     typer.echo("\n论文检索索引状态")
     typer.echo("─" * 40)
     typer.echo(f"  论文总数: {s['papers']}")
     typer.echo(f"  池分布:   {s['pools']}")
     typer.echo(f"  Chunk 数: {s['chunks']}")
-    typer.echo(f"  文档向量: {s['doc_vectors']}")
     typer.echo(f"  Chunk 向量: {s['chunk_vectors']}")
 
-
-@app.command()
-def rebuild_vectors(ctx: typer.Context):
-    """
-    使用当前配置的加权策略重新计算所有文档向量。
-
-    当分块权重配置变更后执行，确保文档级向量反映最新的加权策略。
-    """
-    typer.echo("重新计算文档向量...")
-    store = open_store(data_dir=_get_data_dir(ctx))
-    store.rebuild_doc_vectors()
-    typer.echo("文档向量重建完成")
+    # 脚手架版本
+    manifest = load_manifest(dd)
+    recorded = manifest.get("version") if manifest else None
+    scaffold_status = check_scaffold(dd)
+    typer.echo()
+    typer.echo("脚手架版本")
+    typer.echo("─" * 40)
+    if scaffold_status == "ok":
+        typer.echo(f"  当前: {recorded or '未初始化'}（最新 {SCAFFOLD_VERSION}）")
+    elif scaffold_status == "missing":
+        typer.echo(f"  当前: 未知（旧快照，无版本记录）→ 最新 {SCAFFOLD_VERSION}")
+        typer.echo("  ⚠ 建议: paper-review init --reset")
+    else:
+        typer.echo(f"  当前: {recorded} → 最新 {SCAFFOLD_VERSION}")
+        typer.echo("  ⚠ 建议: paper-review init --reset")
 
 
 @app.command()
@@ -511,6 +553,9 @@ def review(
 
     # ── 空索引检查 ──
     _maybe_warn_empty_index(dd, skip_warnings)
+
+    # ── 脚手架版本检测 ──
+    _maybe_prompt_scaffold_update(dd, skip_warnings)
 
     default_output = dd / "output"
     progress = PoolProgress()
@@ -726,7 +771,7 @@ def _maybe_warn_empty_index(data_dir: Path, skip_warnings: bool = False) -> None
         typer.echo("\n⚠ 索引数据库尚未建立。")
         typer.echo()
         typer.echo("  影响：评审时将没有历史参考文章用于相似度比对，")
-        typer.echo("        01-search 步骤将返回空结果。")
+        typer.echo("        批量预检索（03-batch-search）将返回空结果。")
         typer.echo()
         typer.echo("  Pre Phase 的 01-auto-index 步骤将自动建立索引。")
         typer.echo("  也可通过 paper-review index 命令提前建立")
@@ -766,6 +811,137 @@ def _maybe_warn_empty_index(data_dir: Path, skip_warnings: bool = False) -> None
         typer.echo("")
 
 
+# ── 脚手架版本检测 ──────────────────────────────────
+
+
+def _collect_reset_actions(dd: Path, templates_dir: Path) -> tuple[list[Path], list[Path]]:
+    """计算 --reset 将覆盖与删除的文件。返回 (to_overwrite, to_delete)。"""
+    pipeline_dir = dd / "pipelines" / "standard"
+    overwrite: list[Path] = []
+    if (dd / "config.yaml").exists():
+        overwrite.append(dd / "config.yaml")
+    if (pipeline_dir / "pipeline.yaml").exists():
+        overwrite.append(pipeline_dir / "pipeline.yaml")
+    for subdir in PHASE_DIRS:
+        src_dir = templates_dir / subdir
+        if not src_dir.is_dir():
+            continue
+        for f in sorted(src_dir.iterdir()):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            dest = pipeline_dir / subdir / f.name
+            if dest.exists():
+                overwrite.append(dest)
+    to_delete = find_orphan_files(dd, templates_dir)
+    return overwrite, to_delete
+
+
+def _reset_scaffold(
+    dd: Path,
+    templates_dir: Path,
+    config_content: str,
+    pipeline_content: str,
+    yes: bool,
+) -> None:
+    """执行脚手架 reset：备份覆盖 + 清理孤儿 + 写 manifest。"""
+    overwrite, to_delete = _collect_reset_actions(dd, templates_dir)
+
+    if overwrite or to_delete:
+        if overwrite:
+            typer.echo("  将覆盖以下已存在文件（旧文件先备份为 <文件名>.bak-<时间戳>）：")
+            for f in overwrite:
+                typer.echo(f"    - {f}")
+        if to_delete:
+            typer.echo("  将删除以下孤儿文件（Scaffold Template 已移除，先备份）：")
+            for f in to_delete:
+                typer.echo(f"    - {f}")
+        if not yes and not typer.confirm("  确认重置？", default=False):
+            typer.echo("  已取消，未做任何改动。")
+            raise typer.Exit(0)
+
+    pipeline_dir = dd / "pipelines" / "standard"
+    dd.mkdir(parents=True, exist_ok=True)
+    pipeline_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for f in overwrite + to_delete:
+        backup = f.with_name(f"{f.name}.bak-{timestamp}")
+        backup.write_bytes(f.read_bytes())
+        typer.echo(f"  ✓ 备份 {f} → {backup}")
+
+    # 写模板文件（覆盖）
+    (dd / "config.yaml").write_text(config_content, encoding="utf-8")
+    (pipeline_dir / "pipeline.yaml").write_text(pipeline_content, encoding="utf-8")
+    for subdir in PHASE_DIRS:
+        src_dir = templates_dir / subdir
+        if not src_dir.is_dir():
+            continue
+        target = pipeline_dir / subdir
+        for f in sorted(src_dir.iterdir()):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            (target / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # 删除孤儿文件（已备份）
+    for f in to_delete:
+        f.unlink()
+        typer.echo(f"  ✓ 删除孤儿 {f}")
+
+    write_manifest(dd, build_scaffold_files(templates_dir))
+    typer.echo(f"  ✓ 脚手架版本 {SCAFFOLD_VERSION}")
+
+
+def _maybe_prompt_scaffold_update(dd: Path, skip_warnings: bool = False) -> bool:
+    """review 启动时的脚手架版本检测。返回 True 表示继续执行，raise 表示停止。"""
+    status = check_scaffold(dd)
+    if status == "ok":
+        return True
+
+    manifest = load_manifest(dd)
+    recorded = manifest.get("version") if manifest else None
+
+    typer.echo()
+    if status == "missing":
+        typer.echo("⚠ 检测到旧版脚手架：未记录版本（可能早于 0.1.0）。")
+    else:
+        typer.echo(f"⚠ 脚手架版本已更新：{recorded} → {SCAFFOLD_VERSION}。")
+    typer.echo(
+        "  Scaffold Template 已变化，当前管线步骤可能过时（如已删除/改名的步骤仍会被扫描执行）。"
+    )
+    typer.echo("  建议：paper-review init --reset")
+
+    if skip_warnings:
+        typer.echo("  （无人值守模式）继续使用当前脚手架执行。")
+        return True
+
+    typer.echo()
+    typer.echo("如何继续？")
+    typer.echo("  [1] 现在 reset（备份并同步到最新脚手架，然后继续本次评审）")
+    typer.echo("  [2] 继续（使用当前脚手架，风险自担）")
+    typer.echo("  [3] 取消")
+    choice = typer.prompt("选择", default="1")
+
+    if choice == "1":
+        templates_dir = _resolve_templates_dir()
+        if templates_dir is None:
+            typer.echo("  ✗ 未找到 Scaffold Template，无法 reset；继续使用当前脚手架。")
+            return True
+        config_content = _read_template("config.yaml")
+        pipeline_content = _read_template("pipeline.yaml")
+        if config_content is None or pipeline_content is None:
+            typer.echo("  ✗ Scaffold Template 不完整，无法 reset；继续使用当前脚手架。")
+            return True
+        _reset_scaffold(dd, templates_dir, config_content, pipeline_content, yes=True)
+        typer.echo("  ✓ 脚手架已重置，继续本次评审。")
+        return True
+    if choice == "3":
+        typer.echo("已取消。")
+        raise typer.Exit(0)
+    # 2 或其他：继续
+    return True
+
+
 # ── init 命令 ──────────────────────────────────────
 
 
@@ -793,9 +969,11 @@ def init(
       - pipelines/standard/pipeline.yaml      （管线编排定义）
       - pipelines/standard/{pre,review-pipeline,post}-review/  （默认步骤）
 
-    不带 --reset：只补齐缺失文件，已存在的文件不动。
-    带 --reset：无条件重置为 Scaffold Template 最新内容，已存在的文件会先备份成
-    <文件名>.bak-<时间戳>，再覆盖（需交互确认，--yes 跳过）。
+    不带 --reset：只补齐缺失文件，已存在的文件不动；若检测到脚手架版本与
+    Scaffold Template 不一致，会提示建议 --reset。
+    带 --reset：无条件重置为 Scaffold Template 最新内容——已存在的文件先备份，
+    孤儿文件（旧版本脚手架残留、模板已移除的步骤）备份后删除，并写入版本
+    manifest（需交互确认，--yes 跳过）。
     """
     # ── 交互式选择：项目级 or 用户级 ──
     cwd_dot = Path.cwd() / ".paper-review"
@@ -832,40 +1010,22 @@ def init(
         raise typer.Exit(1)
 
     pipeline_dir = dd / "pipelines" / "standard"
-    phase_dirs = ["pre-review", "review-pipeline", "post-review"]
+    was_initialized = (dd / "pipelines").is_dir()
 
-    # ── --reset：列出将被覆盖的已存在文件，确认后逐个备份 ──
+    # ── --reset：备份覆盖 + 清理孤儿 + 写 manifest ──
     if reset:
-        existing: list[Path] = []
-        if (dd / "config.yaml").exists():
-            existing.append(dd / "config.yaml")
-        if (pipeline_dir / "pipeline.yaml").exists():
-            existing.append(pipeline_dir / "pipeline.yaml")
-        for subdir in phase_dirs:
-            src_dir = templates_dir / subdir
-            if not src_dir.is_dir():
-                continue
-            for f in sorted(src_dir.iterdir()):
-                if not f.is_file() or f.name.startswith("."):
-                    continue
-                dest = pipeline_dir / subdir / f.name
-                if dest.exists():
-                    existing.append(dest)
+        _reset_scaffold(dd, templates_dir, config_content, pipeline_content, yes)
+        typer.echo()
+        typer.echo(f"配置文件: {dd / 'config.yaml'}")
+        typer.echo(f"管线定义: {pipeline_dir}")
+        typer.echo()
+        typer.echo("快速体验：")
+        typer.echo("  将 PDF 放入 origin/pdf/ 后直接运行 review 即可自动索引。")
+        typer.echo(f"  （或放入 {dd / 'origin' / 'pdf'} 后执行 review）")
+        typer.echo("  paper-review review ./待审论文.pdf")
+        return
 
-        if existing:
-            typer.echo("  --reset 将覆盖以下已存在文件（旧文件会先备份为 <文件名>.bak-<时间戳>）：")
-            for f in existing:
-                typer.echo(f"    - {f}")
-            if not yes and not typer.confirm("  确认重置？", default=False):
-                typer.echo("  已取消，未做任何改动。")
-                raise typer.Exit(0)
-
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            for f in existing:
-                backup = f.with_name(f"{f.name}.bak-{timestamp}")
-                backup.write_bytes(f.read_bytes())
-                typer.echo(f"  ✓ 备份 {f} → {backup}")
-
+    # ── 非 reset：只补齐缺失文件，已存在的文件不动 ──
     dd.mkdir(parents=True, exist_ok=True)
     pipeline_dir.mkdir(parents=True, exist_ok=True)
 
@@ -873,24 +1033,24 @@ def init(
 
     # config.yaml（不变，仍在 data_dir 顶层）
     config_path = dd / "config.yaml"
-    if config_path.exists() and not reset:
+    if config_path.exists():
         typer.echo(f"  ⚠ {config_path} 已存在（使用 --reset 重置）")
     else:
-        config_path.write_text(config_content)
+        config_path.write_text(config_content, encoding="utf-8")
         typer.echo(f"  ✓ 创建 {config_path}")
         cfg_changed = True
 
     # pipeline.yaml → pipelines/standard/
     pipeline_yaml = pipeline_dir / "pipeline.yaml"
-    if pipeline_yaml.exists() and not reset:
+    if pipeline_yaml.exists():
         typer.echo(f"  ⚠ {pipeline_yaml} 已存在（使用 --reset 重置）")
     else:
-        pipeline_yaml.write_text(pipeline_content)
+        pipeline_yaml.write_text(pipeline_content, encoding="utf-8")
         typer.echo(f"  ✓ 创建 {pipeline_yaml}")
         cfg_changed = True
 
     # 各 phase 子目录（相对 pipeline_dir，源自 Scaffold Template）
-    for subdir in phase_dirs:
+    for subdir in PHASE_DIRS:
         src_dir = templates_dir / subdir
         target = pipeline_dir / subdir
         phase_changed = False
@@ -899,7 +1059,7 @@ def init(
                 if not f.is_file() or f.name.startswith("."):
                     continue
                 dest = target / f.name
-                if dest.exists() and not reset:
+                if dest.exists():
                     continue
                 target.mkdir(parents=True, exist_ok=True)
                 dest.write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
@@ -910,6 +1070,18 @@ def init(
 
         if phase_changed:
             cfg_changed = True
+
+    # manifest：仅全新初始化时写入当前版本；已有脚手架不动 manifest——
+    # 否则会错位（manifest 标记为新版本，但已存在的旧文件并未被更新）。
+    if was_initialized:
+        scaffold_status = check_scaffold(dd)
+        if scaffold_status != "ok":
+            typer.echo()
+            typer.echo("  ⚠ 脚手架版本检测：当前脚手架与 Scaffold Template 不一致。")
+            typer.echo("    Scaffold Template 已更新，建议 paper-review init --reset 同步。")
+    else:
+        write_manifest(dd, build_scaffold_files(templates_dir))
+        typer.echo(f"  ✓ 脚手架版本 {SCAFFOLD_VERSION}")
 
     if not cfg_changed:
         typer.echo("  所有文件已存在，无变更。")

@@ -45,7 +45,6 @@ class Config(BaseModel):
 
     # --- 检索参数 ---
     recall_k: int = 50
-    final_top_n: int = 5
     rrf_k: int = 60
 
     # --- 模型参数 ---
@@ -66,6 +65,15 @@ class Config(BaseModel):
     pool_workers: int = 5  # 默认 Worker 数，0=自动探测
     pool_timeout: int = 0  # 默认单 Subject 超时秒数（0=无超时）
 
+    # --- CLI 进程级资源限制（0 = 不限制，保持现状） ---
+    max_memory_mb: int = 0  # RLIMIT_AS 地址空间上限（MB），超限抛 MemoryError 而非 OOM killer
+    max_cpu_seconds: int = 0  # RLIMIT_CPU 秒数上限
+
+    # --- ONNX 推理线程控制 ---
+    # 单算子线程数（同时用于 inter_op_num_threads）。默认 1：2C/4G 目标机器上
+    # ONNX Runtime 默认按核数开线程会抢占全部 CPU，串行单线程更稳。
+    onnx_intra_op_threads: int = 1
+
     def fingerprint(self) -> str:
         """当前配置的嵌入指纹，用于检测配置变更
 
@@ -73,10 +81,9 @@ class Config(BaseModel):
         与 ``OnnxEmbedder.embed_fingerprint`` 保持一致。
         """
         model_name = self.embedding_model.replace("/", "--")
-        return (
-            f"{model_name}/dim={self.vector_dim}/"
-            f"head={self.head_weight}_body={self.body_weight}_tail={self.tail_weight}"
-        )
+        # 指纹只包含真正决定 chunk 向量有效性的因素（模型 + 维度）。
+        # 加权 Mean Pooling 权重已随文档向量移除，不再影响 chunk 向量。
+        return f"{model_name}/dim={self.vector_dim}"
 
     def resolve(self, data_dir_override: str | None = None) -> Config:
         """根据 data_dir 解析所有目录路径，返回新实例。
@@ -90,18 +97,14 @@ class Config(BaseModel):
         dd = resolve_data_dir(data_dir_override or self.data_dir or None)
 
         resolved = self.model_copy()
+        # 展开 ~ 波浪号：config.yaml 中常见 `model_cache_dir: ~/.cache/...` 写法，
+        # YAML 不会自动展开，需在此归一化，否则 find_model_file 拿相对路径 `./~/.cache` 找不到模型。
+        resolved.model_cache_dir = os.path.expanduser(resolved.model_cache_dir)
         if not resolved.index_dir:
             resolved.index_dir = str(dd / "index")
         if not resolved.pdf_dir:
             resolved.pdf_dir = str(dd / "origin" / "pdf")
         return resolved
-
-    def weight_config_str(self) -> str:
-        """权重配置的紧凑字符串表示"""
-        return (
-            f"head={self.head_weight}_body={self.body_weight}_"
-            f"tail={self.tail_weight}_hr={self.head_ratio}_tr={self.tail_ratio}"
-        )
 
 
 # ============================================================================
