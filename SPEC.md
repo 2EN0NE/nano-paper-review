@@ -16,7 +16,7 @@
 一个纯 Python 的离线论文检索系统，关键技术栈：
 
 - **存储**：SQLite（标准库自带，零额外依赖），FTS5 做 BM25 全文检索
-- **向量索引**：FAISS CPU（IndexFlatIP，内积相似度），两套独立索引（文档级 + chunk 级）
+- **向量索引**：FAISS CPU（IndexFlatIP，内积相似度），单一 chunk 级索引（文档级向量已退役，见 ADR 0006）
 - **Embedding 模型**：`BAAI/bge-small-zh-v1.5`（~100MB，512 维）
 - **Reranker 模型**：`BAAI/bge-reranker-v2-m3`（~1.1GB fp16 加载）
 - **PDF 提取**：PyMuPDF（fitz），针对中文单栏论文，简化的过滤策略
@@ -40,9 +40,9 @@
 
 8. 作为一名运维人员，我希望能将系统一键打包并离线部署到无网的老旧 Linux 机器上（Python 3.12 自编译），使得运行过程中不需要任何网络访问
 
-9. 作为一名运维人员，我希望能通过配置文件（YAML）控制检索行为（分块参数、加权策略、Top-K 数量），使得在不改代码的情况下调整检索策略
+9. 作为一名运维人员，我希望能通过配置文件（YAML）控制检索行为（分块参数、召回/精排数量、推理线程数），使得在不改代码的情况下调整检索策略
 
-10. 作为一名评审人员，当模型或加权配置变更后，我希望能收到「向量与当前配置不兼容」的警告，并能一键重新嵌入文档向量
+10. 作为一名评审人员，当模型或向量维度变更后，我希望能收到「向量与当前配置不兼容」的警告，并能重建索引
 
 11. 作为一名评审人员，我希望能将同一篇论文的多个副本（文件名不同、内容相同）去重，避免索引膨胀和检索结果重复
 
@@ -154,14 +154,6 @@ CREATE TABLE chunk_vectors (
     dim INTEGER DEFAULT 512
 );
 
--- 文档级 Mean Pooling 向量
-CREATE TABLE doc_vectors (
-    paper_id TEXT PRIMARY KEY,
-    vector BLOB NOT NULL,
-    dim INTEGER DEFAULT 512,
-    weight_config TEXT
-);
-
 -- Embedding 模型指纹
 CREATE TABLE embed_fingerprint (
     key TEXT PRIMARY KEY,
@@ -177,53 +169,50 @@ CREATE TABLE embed_fingerprint (
 - Overlap：128 字符
 - 切分位置：优先在段落边界（`\n\n`）断开
 - 参考文献过滤：检测中文「参考文献」标题后截断
-- 位置权重：三段式加权（configurable）
+- 位置权重：三段式加权（configurable），仅写入 `position_weight` 标记 chunk 位置
   - Head（前 15% chunk）：`weight=5.0`
   - Body（中间 chunk）：`weight=2.0`
   - Tail（后 10% chunk）：`weight=4.0`
 
-原型验证了加权 Mean Pooling 的行为：每个 chunk 编码后按位置权重加权平均得到论文级向量，可通过 `rebuild_doc_vectors()` 重新计算。
+> 注：文档向量退役后（ADR 0006），`position_weight` 仅作为 chunk 元数据标记，当前检索路径不读取该值。
 
-### 4. 文档级检索管道（retriever.py）
+### 4. chunk 级检索管道（retriever.py）
 
 ```
-查询文本（或论文全文本）
+查询文本
     │
     ▼
 ┌──────────────────────────────┐
-│ 1. BM25 (FTS5)              │  chunk 级检索
-│    返回 chunk_id + BM25 分   │
+│ 1. BM25 (FTS5) + FAISS       │  两条腿都在 chunk 级召回
+│    各返回 Top-K chunk        │
 └──────────┬───────────────────┘
            │
            ▼
 ┌──────────────────────────────┐
-│ 2. BM25 max 聚合到论文      │  chunk_id → paper_id
-│    paper_score = max(chunk)  │  取最高分 chunk
+│ 2. chunk 级 RRF 融合        │  k=60
 └──────────┬───────────────────┘
            │
            ▼
 ┌──────────────────────────────┐
-│ 3. FAISS 文档级检索         │  查询向量 vs 论文级 Mean Pooling 向量
-│    返回 paper_id + cos sim   │
+│ 3. 聚合到论文               │  每篇 ≤3 chunk，总预算 20
+│    + 排除 content_hash 自身  │
 └──────────┬───────────────────┘
            │
            ▼
 ┌──────────────────────────────┐
-│ 4. RRF 融合                 │  k=60
-│    score = Σ 1/(k+rank+1)    │
+│ 4. Cross-Encoder 精排 chunk  │  bge-reranker-v2-m3
 └──────────┬───────────────────┘
            │
            ▼
 ┌──────────────────────────────┐
-│ 5. Cross-Encoder 精排       │  bge-reranker-v2-m3
-│    对 Top-50 候选重排序      │  返回 Top-5
-└──────────┬───────────────────┘
-           │
-           ▼
-          返回结果（含元数据、匹配片段、分数）
+│ 5. 分池截断                 │  history ≤5 / pending ≤3
+│    组装 SearchResult         │
+└──────────────────────────────┘
 ```
 
 **检索范围策略**：全库搜索后按 pool 过滤（B 方案）。即 BM25 + FAISS 在所有池中搜索，RRF 融合后，只返回指定池的结果。这样可以避免遗漏跨池潜在匹配。
+
+> 文档级向量（Mean Pooling）已退役（ADR 0006）。综合相似分 + 四个原始分（bm25/vector/rrf/rerank）+ 完整命中原文见 ADR 0009；分池上限与精排预算见 ADR 0010 / 0011。
 
 ### 5. Embedding 模型与部署
 
@@ -235,9 +224,9 @@ CREATE TABLE embed_fingerprint (
 
 ### 6. FAISS 索引
 
-- 两套独立 IndexFlatIP（内积相似度，结合 L2 归一化等价于余弦相似度）
-  - `papers.index`：文档级向量（N 条，N = 论文数）
+- 单一 chunk 级 IndexFlatIP（内积相似度，结合 L2 归一化等价于余弦相似度）
   - `chunks.index`：chunk 级向量（~20N 条，N = 论文数× 平均 chunk 数）
+  - 文档级向量（`papers.index`）已退役（ADR 0006）
 - 论文量 < 1 万时，IndexFlatIP 够用；> 1 万时切换 IndexIVFFlat 或 HNSWFlat
 - ID 映射：独立 `id_map.json` 文件记录 FAISS 索引位置 ↔ chunk_id/paper_id 的映射
 
@@ -245,13 +234,13 @@ CREATE TABLE embed_fingerprint (
 
 - BM25（SQLite FTS5）支持原生增量 INSERT，无全量重建
 - FAISS `add_with_ids` 支持增量写入
-- 每次 `add_paper` 操作在事务中执行：元数据 + chunks + FTS + chunk向量 + 文档向量 + 内容哈希，全部成功才提交
+- 每次 `add_paper` 操作在事务中执行：元数据 + chunks + FTS + chunk向量 + 内容哈希，全部成功才提交
 - `remove_paper` 级联删除所有关联数据（外键 + 手动 FTS 删除）
 - 内容去重通过 SHA-256 哈希检测：同内容论文仅存储元数据，共享向量
 
 ### 8. Embedding 指纹
 
-每次存储文档向量时同时存储 `embed_fingerprint`，格式为 `"bge-small-zh-v1.5/dim=512/head=5.0_body=2.0_tail=4.0"`。启动加载时对比当前配置，不一致时在日志中输出警告，并提供 `rebuild_doc_vectors()` 方法触重新计算。
+每次索引时同时存储 `embed_fingerprint`，格式为 `"bge-small-zh-v1.5/dim=512"`（模型 + 维度）。启动加载时对比当前配置，模型/维度变更时在日志中输出警告并提示重建索引（旧权重后缀视为兼容，见 ADR 0006）。
 
 ### 9. 文件名元数据提取
 
@@ -331,7 +320,7 @@ GET /status → { "papers": N, "chunks": N, ... }
 ## Testing Decisions
 
 - **测试策略**：纯逻辑单元测试为主，Seam 放在 `Store` 和 `build_index` / `search` 函数
-- **测试什么**：分块逻辑（段落边界、参考文献截断、重叠窗口）、文件名元数据提取、RRF 融合的排名正确性、加权 Mean Pooling 的数学正确性、FTS5 CJK 分词的命中率
+- **测试什么**：分块逻辑（段落边界、参考文献截断、重叠窗口）、文件名元数据提取、RRF 融合的排名正确性、chunk 级向量检索的正确性、FTS5 CJK 分词的命中率
 - **不测试什么**：FAISS 和 embedding 模型的行为（这些是第三方库，假设正确）；HTTP 路由（单独集成测试）
 - **测试数据**：使用原型中已有的确定性模拟数据（`_make_fake_content`），不需要真实 PDF
 - **Seam 位置**：`Store.__init__(:memory:)` 提供纯内存数据库用于测试，无需真实文件系统
@@ -351,5 +340,5 @@ GET /status → { "papers": N, "chunks": N, ... }
   - `prototype/logic.py` — 纯逻辑模块（含 Store、分块、Embedding 模拟、检索管道）
   - `prototype/tui.py` — 交互式 TUI，可通过按键驱动索引/搜索/状态查看
   - 运行方式：`python -m prototype.tui`
-  - 原型已经验证了以下决策：SQLite FTS5 CJK 分词、文档+chunk 双 FAISS 索引、加权 Mean Pooling 重嵌入、池过滤、内容去重、Embedding 指纹检测
+  - 原型已经验证了以下决策：SQLite FTS5 CJK 分词、chunk 级 FAISS 索引、池过滤、内容去重、Embedding 指纹检测
 - 参考项目 QMD（`@tobilu/qmd`）的架构为：SQLite FTS5 + sqlite-vec + GGUF 模型 + RRF 融合 + 位置感知混合。本方案的 CJK 分词、事务化增量索引、内容哈希去重的设计灵感来自 QMD。

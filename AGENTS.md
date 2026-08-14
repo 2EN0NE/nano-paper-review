@@ -11,7 +11,7 @@
 在开始任何开发工作前，按顺序阅读：
 
 1. **[CONTEXT.md](./CONTEXT.md)** — 领域词汇表。**Subject**、**Reference**、**Review Phase**、**Intermediates** 等核心术语的唯一定义来源。涉及管线概念时必须对齐此文件。
-2. **[SPEC.md](./SPEC.md)** — 需求与设计决策规格。检索系统的完整用户故事、技术选型理由（CJK 分词策略、加权 Mean Pooling、后过滤 vs 前过滤等）、接口契约。
+2. **[SPEC.md](./SPEC.md)** — 需求与设计决策规格。检索系统的完整用户故事、技术选型理由（CJK 分词策略、后过滤 vs 前过滤等）、接口契约。
 3. **`docs/SPEC-PIPELINE.md`** — 管线编制的需求规格。管线的用户故事、Phase 执行模型、Step 形态、模板变量系统、重试策略。
 
 ## 项目目的
@@ -35,10 +35,11 @@
 ```
 .paper-review/                  # 或 ~/.paper-review/
 ├── config.yaml                 # CLI 配置文件（自动搜索）
+├── .scaffold-manifest          # 脚手架版本 + 文件清单（版本检测/孤儿清理）
 ├── index/
 │   ├── index.sqlite            # SQLite 数据库（FTS5 BM25 + 元数据）
-│   ├── papers.index            # 文档级 FAISS 向量索引
-│   └── chunks.index            # Chunk 级 FAISS 向量索引
+│   ├── chunks.index            # Chunk 级 FAISS 向量索引
+│   └── chunks_id_map.json      # FAISS ID → chunk_id 映射
 ├── pdfs/                       # PDF 源文件
 ├── output/                     # 管线输出
 │   ├── intermediates/          #  中间产物
@@ -90,13 +91,14 @@ src/paper_review/
 ├── store.py            # SQLite（FTS5 BM25）+ FAISS 持久化
 ├── extractor.py        # PDF 提取（PyMuPDF）+ 文件名元数据解析
 ├── chunker.py          # 512 字分块，overlap 128，参考文献截断
-├── indexer.py          # build_index：分块 → embedding → Mean Pooling → FAISS
+├── indexer.py          # build_index：分块 → embedding → chunk 向量
 ├── models.py           # bge-small-zh-v1.5 embedding 模型管理
 ├── retriever.py        # BM25 + Vector → RRF → (可选) Cross-Encoder 精排
 ├── embedder.py          # ONNX Runtime 嵌入引擎（CPU-only）
 ├── reranker.py         # ONNX Runtime 精排（CPU-only）
 ├── server.py           # Flask HTTP API
 ├── config.py           # Pydantic 配置加载
+├── scaffold.py         # Scaffold 版本检测 + manifest + 孤儿清理
 └── cli.py              # paper-review CLI（Typer）
 
 src/paper_review/templates/   # Scaffold Template —— init 生成脚本的唯一权威内容源
@@ -113,7 +115,7 @@ src/paper_review/templates/   # Scaffold Template —— init 生成脚本的唯
 
 - **`Store` 是唯一持久化入口**：所有索引操作（add/remove/rebuild）通过 Store，不直接操作 SQLite。
 - **配置读取**：`config.py` 的 Pydantic 模型；默认值在 `store.py` 顶层常量。
-- **向量序列化**：`struct.pack("f" * dim, *vec)` 写入 BLOB。
+- **向量序列化**：`np.asarray(vec, dtype=np.float32).tobytes()` 写入 BLOB（本机字节序）。
 - **CLI**：Typer 框架，`paper-review` 统一入口。新增子命令时，docstring 即为 `--help` 文案，必须写清用法和选项含义。
 - **CLI 设计红线**：见 SPEC.md § CLI 命令设计原则。核心约束：
   - `init` 做开箱即用的引导，生成完整脚手架确保用户能直接体验
@@ -130,24 +132,25 @@ src/paper_review/templates/   # Scaffold Template —— init 生成脚本的唯
 详细讨论见 `SPEC.md`，此处仅列要点：
 
 - **CJK 分词**：索引/查询时在汉字间插入空格，FTS5 unicode61 按空格分 token。
-- **双 FAISS 索引**：`papers.index`（文档级）+ `chunks.index`（chunk 级），IndexFlatIP + L2 归一化 = 余弦相似度。
-- **文档向量**：加权 Mean Pooling，按位置三段加权（head=5.0 / body=2.0 / tail=4.0，比例可配置）。
+- **单一 chunk 级 FAISS 索引**：`chunks.index`，IndexFlatIP + L2 归一化 = 余弦相似度；文档级向量（`papers.index` / `doc_vectors`）已退役（ADR 0006）。
 - **检索后过滤**：全库搜索 → RRF 融合 → 按 pool 过滤结果，保证不遗漏跨池匹配。
 - **内容去重**：SHA-256 哈希 → content_dedup 表。
-- **Embedding 指纹**：写入 `embed_fingerprint`，加载时对比，不一致则 warn + `rebuild_doc_vectors()`。
+- **Embedding 指纹**：写入 `embed_fingerprint`，格式 `model/dim=N`；加载时对比，模型/维度变更则 warn 提示重建索引（旧权重后缀视为兼容）。
 - **Agent 步骤**：通过 `subprocess.run(["pi", "-m", prompt])` 调用 pi。理由见 `docs/adr/0001-subprocess-pi-agent-steps.md`。
 - **管线执行模型**：Pre/Post 批量模式，Review 逐篇模式。Step 排序优先级：pipeline.yaml 显式声明 > 文件名前缀 > OS 排序。
+- **脚手架版本检测**：独立 `SCAFFOLD_VERSION`（当前 0.1.0）+ `{data_dir}/.scaffold-manifest` 清单。`review`/`init`/`status` 检测 Scaffold Drift（模板升级后用户侧副本未同步），`init --reset` 备份后清理孤儿文件。见 `docs/adr/0012-scaffold-version-detection.md`。
 
 ## 检索管道
 
 ```
-query → BM25(FTS5, chunk级) → max聚合到论文分
-      → FAISS(文档级向量)     → cosine similarity
-      → RRF融合(k=60)        → Top-30候选
-      → Cross-Encoder精排    → Top-5结果
+query → BM25(FTS5, chunk级)  ┐
+      → FAISS(chunk级向量)    ┘→ chunk 级 RRF 融合(k=60)
+      → 聚合到论文（每篇 ≤3 chunk，总预算 20）→ 排除 content_hash 自身
+      → (可选) Cross-Encoder 精排 chunk
+      → 分池截断（history ≤5 / pending ≤3）→ 组装 SearchResult
 ```
 
-`pool_filter` 在 RRF 后作用（后过滤）。
+`pool_filter` 在召回后作用（后过滤）；无精排时综合分 = RRF 归一化（ADR 0009）。
 
 ## 评审流水线
 
@@ -170,9 +173,9 @@ Pre Phase (batch) → Review Phase (per subject) → Post Phase (batch)
 
 | 层级 | 目录 | 定位 | 运行方式 | 是否用 mock |
 |------|------|------|----------|-------------|
-| 单元测试 | `tests/test_*.py` | 纯 Python 函数/类级别的独立逻辑验证 | `PYTHONPATH=src python -m pytest` | 允许 mock 第三方依赖（onnxruntime、tokenizers 等） |
-| 模型集成测试 | `tests/test_model_integration.py` | 双路径：有模型时真跑 ONNX 推理，无模型时 mock | `PYTHONPATH=src python -m pytest` | mock 当模型不可用时；真实推理当模型可用时 |
-| E2E 测试 | `tests/e2e/` | **以独立空间的 CLI 命令执行**，验证全链路行为 | `python -m pytest tests/e2e/ -v` | **禁止 mock**：必须通过 `subprocess.run([paper-review, ...])` 在隔离的 `--data-dir` 中执行 |
+| 单元测试 | `tests/test_*.py` | 纯 Python 函数/类级别的独立逻辑验证 | `uv run pytest` | 允许 mock 第三方依赖（onnxruntime、tokenizers 等） |
+| 模型集成测试 | `tests/test_model_integration.py` | 双路径：有模型时真跑 ONNX 推理，无模型时 mock | `uv run pytest tests/test_model_integration.py` | mock 当模型不可用时；真实推理当模型可用时 |
+| E2E 测试 | `tests/e2e/` | **以独立空间的 CLI 命令执行**，验证全链路行为 | `uv run pytest tests/e2e/ -v` | **禁止 mock**：必须通过 `subprocess.run([paper-review, ...])` 在隔离的 `--data-dir` 中执行 |
 
 ### E2E 测试的核心约束（红线）
 
@@ -212,19 +215,20 @@ E2E 测试是集成测试的唯一权威标准：
 
 ```bash
 # 单元 + 模型集成测试（不需 onnxruntime，mock 兜底）
-PYTHONPATH=src python -m pytest tests/ --ignore=tests/test_cli.py --ignore=tests/test_cli_data_dir.py
+uv run pytest tests/ -q -m "not integration and not e2e_slow"
 
 # 真模型集成测试（需要 onnxruntime + 已下载的模型）
-uv run --with pytest python -m pytest tests/test_model_integration.py
+uv run pytest tests/test_model_integration.py -q
 
 # E2E 测试（需要 paper-review 已安装）
-PYTHONPATH=src python -m pytest tests/e2e/ -v
+uv run pytest tests/e2e/ -v -m "e2e and not e2e_slow"
 
-# 全量
-PYTHONPATH=src python -m pytest tests/ --ignore=tests/test_cli.py --ignore=tests/test_cli_data_dir.py && PYTHONPATH=src python -m pytest tests/e2e/ -v
+# 全量（与 CI / pre-push hook 一致）
+make test-unit && make test-integration && make test-e2e
 ```
 
-前置条件：`PYTHONPATH=src pip install -e .`
+前置条件：`uv pip install -e .[dev]`（或 `make install`）。本地命令与 CI、
+`.githooks/pre-push`、`Makefile` 完全一致（同一 `uv run pytest` + 同一 marker）。
 
 ## 安装与依赖管理
 
@@ -273,10 +277,10 @@ CI 中也使用 `pip install -e .[dev]` 方式安装，不依赖 `requirements.l
 
 ```bash
 # 全部测试
-PYTHONPATH=src python -m pytest tests/ -v
+uv run pytest tests/ -v
 
-# 分层运行
-python -m pytest tests/ -q -m "not integration"   # 单元测试
-python -m pytest tests/ -q -m "integration"        # 集成测试
-python -m pytest tests/e2e/ -v                      # E2E 测试（需先 pip install -e .）
+# 分层运行（与 CI / Makefile / pre-push hook 一致）
+uv run pytest tests/ -q -m "not integration and not e2e_slow"   # 单元测试
+uv run pytest tests/ -q -m "integration"                        # 集成测试
+uv run pytest tests/e2e/ -v -m "e2e and not e2e_slow"           # E2E 测试
 ```

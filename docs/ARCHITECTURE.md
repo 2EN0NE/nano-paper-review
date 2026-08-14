@@ -16,8 +16,7 @@ Extractor ──▶ Chunker ──▶ Indexer ──▶ Store ──▶ Retrieve
 
 ```
 PDF → extract_text() → chunk_paper()
-    → embed_chunks()           → chunk_vectors BLOB
-    → mean_pool_chunks()       → doc_vectors BLOB + FAISS papers.index
+    → embed_chunks()           → chunk_vectors BLOB + FAISS chunks.index
     → chunks + FTS5 (CJK归一化) → SQLite chunks_fts
     → SHA-256(content)          → content_dedup表
 ```
@@ -25,37 +24,24 @@ PDF → extract_text() → chunk_paper()
 ### 检索路径
 
 ```
-query → normalize_cjk_for_fts()  → FTS5 BM25 → bm25_aggregate_to_papers
-     → deterministic_hash_vector() → FAISS papers.index → vector_search
-     → rrf_fuse(bm25, vector)    → RRF 融合
-     → CrossEncoder.rerank()     → 精排 Top-5
-     → pool_filter (后过滤)       → search results
+query → normalize_cjk_for_fts()  → FTS5 BM25 (chunk 级召回)
+     → deterministic_hash_vector() → FAISS chunks.index → vector_search_chunks
+     → rrf_fuse(bm25, vector)    → RRF chunk 级融合
+     → CrossEncoder.rerank_chunks() → 精排（真实分数）
+     → pool 分组截断（history 5 / pending 3） → search results
 ```
 
-## 两套 FAISS 索引
+## FAISS 索引
 
 | 索引 | 向量 | 数量 | 用途 |
 |------|------|------|------|
-| `papers.index` | 文档级 Mean Pooling 向量 | N (论文数) | 文档级相似检索 |
 | `chunks.index` | Chunk 级编码向量 | ~20N | 片段级精确匹配 |
 
-每个索引伴随一个 `id_map.json`:
+索引伴随一个 `chunks_id_map.json`:
 
 ```json
-{"0": "paper_abc123", "1": "paper_def456", ...}
+{"0": "paper_abc123#0", "1": "paper_abc123#1", ...}
 ```
-
-## 加权 Mean Pooling
-
-Chunk 按在论文中的位置分为三段：
-
-| 段 | 位置 | 默认权重 |
-| ---- | ------ | --------- |
-| Head | 前 15% chunk | 5.0 |
-| Body | 中间 75% | 2.0 |
-| Tail | 后 10% | 4.0 |
-
-所有权重和比例通过 config.yaml 可配置。权重变更后需运行 `rebuild_vectors`。
 
 ## 离线部署资源评估
 

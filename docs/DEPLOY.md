@@ -80,7 +80,6 @@ head_ratio: 0.15
 tail_ratio: 0.10
 recall_k: 50
 rrf_k: 60
-final_top_n: 5
 embedding_model: "BAAI/bge-small-zh-v1.5"   # 由 install/config 自动写入
 reranker_model: "BAAI/bge-reranker-v2-m3"   # 由 install/config 自动写入
 vector_dim: 512
@@ -114,4 +113,4 @@ paper-review serve --port 8765
 | `pip install` 报找不到包 | 目标 Python 版本与 cp312 轮子不一致；或 glibc < 2.28。用 `PYTHON_TAG` 重打包 / 升级系统 |
 | 检索结果没有精排痕迹（纯 RRF 排序） | reranker 模型缺失或 config.reranker_model 与缓存目录名不一致。`paper-review config` 重新选择 |
 | 打包时报某个依赖无轮子 | 该包没有 manylinux x86_64 二进制（罕见）。确认网络/平台后重试 |
-| 索引向量维度报错 | 更换 embedding 模型后旧索引不兼容。删除 `{data_dir}/index/` 重建，或跑 `rebuild_doc_vectors` |
+| 索引向量维度报错 | 更换 embedding 模型后旧索引不兼容。删除 `{data_dir}/index/` 后重新 `paper-review index` 重建 |

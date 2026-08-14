@@ -15,8 +15,32 @@ _Avoid_: Baseline, historical paper, comparison target
 ### 索引子系统
 
 **Reference Index**:
-历史论文的全文检索引擎（SQLite FTS5 BM25 + FAISS 向量索引 + Cross-Encoder 精排）。Review Phase 的 01-search 步骤依赖此索引检索与 Subject 相似的 Reference。
+历史论文的全文检索引擎（SQLite FTS5 BM25 + FAISS 向量索引 + Cross-Encoder 精排）。Pre Phase 的批量预检索步骤依赖此索引检索与 Subject 相似的 Reference。
 _Avoid_: Search index, knowledge base, paper database
+
+**Chunk**:
+论文全文切分出的语义连贯片段，检索的最小匹配单位。
+_Avoid_: 片段, passage, segment, block
+
+**Chunk Vector**:
+单个 Chunk 的语义向量。
+_Avoid_: 块向量, passage embedding
+
+**Document Vector**:
+整篇论文的单一语义向量，由各 Chunk Vector 池化得到。已退役，不再参与检索。
+_Avoid_: 论文向量, doc embedding, paper vector
+
+**Chunk-level Retrieval**:
+以 Chunk 为匹配单位、聚合到论文时保留命中 Chunk 作为对比证据的检索方式。
+_Avoid_: 片段级检索, passage-level search
+
+**History Pool**:
+已索引的历史论文集合（`pool="history"`），检索相似 Reference 的来源。
+_Avoid_: 历史库, historical corpus, reference corpus
+
+**Pending Pool**:
+当前批次待评审的 Subject 集合（`pool="pending"`）。检索结果中与本批次的其他 Subject 分开呈现，并排除内容与 Subject 自身相同的论文。
+_Avoid_: 当前批次, current batch, subject pool
 
 **Origin Directory**:
 原始 PDF 文件的存放目录。位于 `{data_dir}/origin/pdf/`，用作参考论文的持久化归档。由 `pipeline.yaml` 的 `index.reference_dir` 字段指向。
@@ -48,8 +72,8 @@ _Avoid_: Review session, review job
 _Avoid_: Stage
 
 **Pre Phase**:
-格式归一化与索引建立阶段。对输入目录批量处理：doc/docx → PDF（00-convert），随后自动建立 Reference Index（01-auto-index：首次批量索引历史参考文章 + 索引当前 Subjects）。
-输出：subject-manifest.json、索引状态（新增/去重跳过/冲突重命名）。
+批量数据准备阶段。对输入目录批量处理：doc/docx → PDF（00-convert），随后自动建立 Reference Index（01-auto-index），再对所有 Subject 批量预检索相似 Reference（Chunk-level Retrieval）。
+输出：subject-manifest.json、索引状态、每篇 Subject 的相似文章检索结果（供 Review Phase 评分步骤读取）。
 
 **Review Phase**:
 核心单篇评审阶段。对每个 Subject 顺序执行一组 Step。所有 Step 共享 Subject 的同一份提取全文（原文约 5000 字，无需裁剪）。
@@ -91,7 +115,7 @@ _Avoid_: Runner, handler, step runner
 Agent 步骤的 prompt 前自动拼接前序步骤汇总信息。
 
 **Template Variable**:
-.md prompt 文件中的占位变量语法，如 `{intermediates.01-search.result.references}`。Pipeline 在提交给 Agent 前执行模板替换。规则文档写入 `README.md`、`AGENTS.md`、`docs/`。
+.md prompt 文件中的占位变量语法，如 `{intermediates.03-batch-search.data.history}`。Pipeline 在提交给 Agent 前执行模板替换。规则文档写入 `README.md`、`AGENTS.md`、`docs/`。
 
 **Batch Mode**:
 Pre Phase 和 Post Phase 的执行模式——对输入目录中所有条目批量处理一次，而非逐篇逐个 Phase。Review Phase 则是逐篇逐个 Subject 处理。
@@ -149,8 +173,20 @@ _Avoid_: Resume run, continue job, restart
 _Avoid_: Pipeline home, pipeline store
 
 **Scaffold Template**:
-`init` 生成 Pipelines Directory 时使用的默认内容源，即包内 `src/paper_review/templates/`（唯一权威源，含 `config.yaml`、`pipeline.yaml`、全部默认 step 文件）。与 Pipelines Directory 的区别：前者是包内固定不变的"默认蓝图"，后者是用户实例化到 data_dir 后的可编辑副本；`init` 不带 `--reset` 时只补缺失文件，`--reset` 用 Scaffold Template 全量覆盖已存在文件（会先列出受影响文件并要求确认，已存在的文件会自动备份为 `<文件名>.bak-<时间戳>`）。
+`init` 生成 Pipelines Directory 时使用的默认内容源，即包内 `src/paper_review/templates/`（唯一权威源，含 `config.yaml`、`pipeline.yaml`、全部默认 step 文件）。与 Pipelines Directory 的区别：前者是包内固定不变的“默认蓝图”，后者是用户实例化到 data_dir 后的可编辑副本；`init` 不带 `--reset` 时只补缺失文件，`--reset` 用 Scaffold Template 全量覆盖已存在文件（会先列出受影响文件并要求确认，已存在的文件会自动备份为 `<文件名>.bak-<时间戳>`）。版本号见 Scaffold Version。
 _Avoid_: Template source, default pipeline, boilerplate
+
+**Scaffold Version**:
+Scaffold Template 的版本号（当前 `0.1.0`）。与包版本解耦，仅在 `src/paper_review/templates/` 内容实际变化时递增——包升级不等于脚手架变化，避免每次发版都触发漂移警告。`init` 时写入 Scaffold Manifest；`review` / `status` 启动时与当前版本对比，检测 Scaffold Template 升级后用户侧副本未同步的漂移。
+_Avoid_: 脚手架版本号, template version, pipeline schema version
+
+**Scaffold Manifest**:
+`{data_dir}/.scaffold-manifest`，记录 Scaffold Version 与 `init` 写入的全部文件清单（相对 data_dir 的路径）。版本检测读它；`init --reset` 用它区分“脚手架孤儿文件”（manifest 记录、模板已删）与“用户自定义文件”（不在 manifest，保留不动）。无 manifest 的旧快照（早于 0.1.0）首次 `--reset` 退化为无差别扫描 phase 目录，用户自定义文件也可能被列为潜在孤儿（备份可恢复）。
+_Avoid_: 版本标记文件, version marker, scaffold state file
+
+**Scaffold Drift**:
+Pipelines Directory（用户侧可编辑副本）与 Scaffold Template（包内权威源）不一致的状态。表现为孤儿文件残留（模板已删除的 step 仍被扫描执行）或缺失文件。由 Scaffold Version 检测，`init --reset` 修复。
+_Avoid_: 脚手架过期, scaffold outdated, template mismatch
 
 **Pipeline Name**:
 管线的唯一标识符，等于 `pipelines/` 下的子目录名。用于 CLI 选择和产物路径命名。

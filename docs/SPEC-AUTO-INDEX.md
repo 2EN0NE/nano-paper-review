@@ -116,7 +116,7 @@ Subject manifest 中的 `pdf_path` 不受影响，仍然指向原始位置。
 
 - 跨 profile 共享索引（不同 profile 各自维护独立索引）
 - 索引的增量更新（添加新论文到已有索引走独立 `paper-review index` 命令，不受 auto-index 管理）
-- embedding 模型切换后的自动重建（仍由 `rebuild_doc_vectors` 手动触发）
+- embedding 模型切换后的自动重建（需删除 index 目录后重跑 `paper-review index` 手动触发）
 - 多语言 PDF 的场景（当前仅为中英文）
 
 ## Further Notes

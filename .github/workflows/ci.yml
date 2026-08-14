@@ -57,6 +57,7 @@ jobs:
         run: >
           uv run pytest tests/ -q
           -m "not integration and not e2e_slow"
+          --ignore=tests/e2e
           --junitxml=junit-unit-${{ matrix.python-version }}.xml
 
       - name: Upload unit test report
@@ -167,9 +168,30 @@ jobs:
           uv run pytest tests/e2e/test_offline_install.py -v -m "e2e_slow" \
             --timeout=1800 --junitxml=junit-e2e-offline.xml
 
+      # 真实模型推理链路（复用 install.sh --offline 已装入 ~/.cache/paper-review/models
+      # 的 ONNX 模型）。此前该链路在 CI 中零覆盖：test_model_integration 与
+      # TestRealModelChunkRetrieval 在无模型时 skip，而 unit/e2e-smoke job 均不下载模型。
+      # 无模型（install 失败或缓存未命中）时这些测试自动 skip，不阻断本 job。
+      - name: Run real-model retrieval tests
+        run: |
+          uv run pytest tests/test_model_integration.py \
+            -v -m "integration" --junitxml=junit-real-model.xml
+          uv run pytest tests/e2e/test_pipeline_integration.py \
+            -k TestRealModelChunkRetrieval -v \
+            --junitxml=junit-e2e-real-model.xml
+
       - name: Upload e2e offline test report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: junit-e2e-offline
           path: junit-e2e-offline.xml
+
+      - name: Upload real-model test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-real-model
+          path: |
+            junit-real-model.xml
+            junit-e2e-real-model.xml

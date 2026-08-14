@@ -1,5 +1,6 @@
 #!/bin/bash
-# Pre-commit hook: 格式化（自动修复）+ 单元测试
+# Pre-commit hook: 仅快速层（格式化 + lint），不跑测试。
+# 完整门禁（单元/集成/e2e）在 pre-push 阶段执行（与 CI 对齐）。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,7 +15,4 @@ uv run ruff check --fix --exit-zero .
 # 把格式化后的变更重新 stage
 git add -u
 
-echo "=== [pre-commit] 单元测试（全量） ==="
-uv run pytest tests/ -q -m "not integration and not e2e_slow"
-
-echo "=== [pre-commit] ✅ 全部通过 ==="
+echo "=== [pre-commit] ✅ 快速检查通过（完整门禁见 pre-push）==="

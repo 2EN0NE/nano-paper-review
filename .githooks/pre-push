@@ -1,5 +1,6 @@
 #!/bin/bash
-# Pre-push hook: 格式检查（全量）+ lint（src/）+ 单元/集成测试（全量）
+# Pre-push hook: 与 CI 门禁对齐（quality + unit + integration + e2e smoke）。
+# e2e_slow（离线打包测试，约 45 分钟）仅在 CI 的 e2e-offline job 运行。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,13 +12,13 @@ uv run ruff format --check .
 echo "=== [pre-push] ruff lint 检查（src/ + tests/）==="
 uv run ruff check src/ tests/
 
-echo "=== [pre-push] 单元测试（全量）==="
-uv run pytest tests/ -q -m "not integration" --ignore=tests/e2e
+echo "=== [pre-push] 单元测试（对齐 CI unit-tests job）==="
+uv run pytest tests/ -q -m "not integration and not e2e_slow" --ignore=tests/e2e
 
-echo "=== [pre-push] 集成测试（全量）==="
+echo "=== [pre-push] 集成测试（对齐 CI integration-tests job）==="
 uv run pytest tests/ -q -m "integration"
 
-echo "=== [pre-push] E2E smoke（入口点验证）==="
+echo "=== [pre-push] E2E smoke（对齐 CI e2e-smoke job）==="
 uv run pytest tests/e2e/ -q -m "e2e and not e2e_slow"
 
 echo "=== [pre-push] ✅ 全部通过 ==="

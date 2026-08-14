@@ -46,21 +46,12 @@ CREATE VIRTUAL TABLE chunks_fts USING fts5(
     tokenize='unicode61'
 );
 
--- Chunk 向量（持久化，供权重重算使用）
+-- Chunk 向量（持久化，供 chunk 级检索使用）
 CREATE TABLE chunk_vectors (
     chunk_id TEXT PRIMARY KEY,
-    vector   BLOB NOT NULL,       -- float32 LE 序列化
+    vector   BLOB NOT NULL,       -- float32 序列化（本机字节序，np.tobytes/frombuffer）
     dim      INTEGER DEFAULT 512,
     FOREIGN KEY (chunk_id) REFERENCES chunks(chunk_id) ON DELETE CASCADE
-);
-
--- 文档级向量（加权 Mean Pooling 结果）
-CREATE TABLE doc_vectors (
-    paper_id      TEXT PRIMARY KEY,
-    vector        BLOB NOT NULL,
-    dim           INTEGER DEFAULT 512,
-    weight_config TEXT DEFAULT '',   -- 建索引时的权重配置
-    FOREIGN KEY (paper_id) REFERENCES papers(paper_id) ON DELETE CASCADE
 );
 
 -- 内容去重（SHA-256）
@@ -81,15 +72,15 @@ CREATE TABLE embed_fingerprint (
 - **papers.raw_text**: 全文存储。用于重建索引、reranker 取代表段。
 - **chunks.position_weight**: 由 chunker 在建索引时计算。权重本身是配置驱动的，不随配置变更自动更新。
 - **chunks_fts**: 不设自动触发器，手动 INSERT/DELETE。CJK 文本在写入 FTS 前经过 `normalize_cjk_for_fts()` 分字处理。
-- **embed_fingerprint**: 格式 `bge-small-zh-v1.5/dim=512/head=5.0_body=2.0_tail=4.0`。load 时对比当前 config，不一致则 warn。
+- **embed_fingerprint**: 格式 `bge-small-zh-v1.5/dim=512`（模型 + 维度）。load 时对比当前 config，不一致则 warn。
 
 ## 增量操作
 
 | 操作 | 事务内容 |
 | ------ | --------- |
-| add_paper | BEGIN → papers INSERT → chunks ×N INSERT → chunks_fts ×N INSERT → chunk_vectors ×N INSERT → doc_vectors INSERT → content_dedup INSERT → embed_fingerprint UPSERT → COMMIT |
-| remove_paper | chunks_fts DELETE → papers DELETE (CASCADE → chunks, chunk_vectors, doc_vectors, content_dedup) |
-| rebuild_vectors | FOR 每篇论文 ← chunk_vectors → mean_pool → UPDATE doc_vectors + FAISS papers.index |
+| add_paper | BEGIN → papers INSERT → chunks ×N INSERT → chunks_fts ×N INSERT → chunk_vectors ×N INSERT → content_dedup INSERT → embed_fingerprint UPSERT → COMMIT |
+| remove_paper | chunks_fts DELETE → papers DELETE (CASCADE → chunks, chunk_vectors, content_dedup) |
+| rebuild | 删除 index 目录后重跑 `paper-review index`（重建 chunk_vectors + chunks.index） |
 
-FAISS 文件（`papers.index`, `chunks.index`, `id_map.json`）与 SQLite 文件放在同一目录。
+FAISS 文件（`chunks.index`, `chunks_id_map.json`）与 SQLite 文件放在同一目录。
 不在 SQLite 事务保护范围内——FAISS 文件写入失败时 SQLite 仍是完整的（可回档到上一版本 FAISS）。

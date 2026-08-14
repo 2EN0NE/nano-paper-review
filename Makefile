@@ -6,27 +6,27 @@ install:
 # ─── 质量门禁 ──────────────────────────────────────────
 
 fmt:                                           # 自动格式化全部代码
-	ruff format .
-	ruff check --fix .
+	uv run ruff format .
+	uv run ruff check --fix .
 
 fmt-check:                                     # 仅检查格式（CI / pre-push）
-	ruff format --check .
-	ruff check .
+	uv run ruff format --check .
+	uv run ruff check .
 
-test-unit:                                     # 单元测试（全量）
-	PYTHONPATH=src python3 -m pytest tests/ -q -m "not integration"
+test-unit:                                     # 单元测试（对齐 CI unit-tests job）
+	uv run pytest tests/ -q -m "not integration and not e2e_slow"
 
-test-integration:                              # 集成测试（全量）
-	PYTHONPATH=src python3 -m pytest tests/ -q -m "integration"
+test-integration:                              # 集成测试（对齐 CI integration-tests job）
+	uv run pytest tests/ -q -m "integration"
 
 test:                                          # 全部测试
-	PYTHONPATH=src python3 -m pytest tests/ -v
+	uv run pytest tests/ -v
 
 test-one:                                      # 单个测试文件: make test-one t=test_store
-	PYTHONPATH=src python3 -m pytest tests/$(t) -v
+	uv run pytest tests/$(t) -v
 
-test-e2e:                                      # E2E smoke 测试（需要先 make install）
-	python3 -m pytest tests/e2e/ -v -m "e2e and not e2e_slow"
+test-e2e:                                      # E2E smoke 测试（对齐 CI e2e-smoke job）
+	uv run pytest tests/e2e/ -v -m "e2e and not e2e_slow"
 
 smoke: test-e2e                                # 别名
 

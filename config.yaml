@@ -19,22 +19,24 @@
 # pdf_dir: ./data/history
 
 # 模型缓存目录（默认 ~/.cache/paper-review/models，不依赖 data_dir）
-model_cache_dir: ~/.cache/paper-review/models
+# 默认值已展开为绝对路径；如需自定义请写绝对路径（~ 会被 expanduser 展开）
+# model_cache_dir: ~/.cache/paper-review/models
 
 # --- 分块参数 ---
 chunk_size: 512
 chunk_overlap: 128
 
-# --- 加权 Mean Pooling ---
-head_weight: 5.0
-body_weight: 2.0
-tail_weight: 4.0
-head_ratio: 0.15
-tail_ratio: 0.10
+# --- 位置权重（已废弃，不再影响检索）---
+# 文档向量退役后（ADR 0006），加权 Mean Pooling 不再使用；以下权重字段仅用于
+# 标记 chunk 的位置权重（position_weight），当前检索路径不读取该值，保留仅为兼容。
+# head_weight: 5.0
+# body_weight: 2.0
+# tail_weight: 4.0
+# head_ratio: 0.15
+# tail_ratio: 0.10
 
 # --- 检索参数 ---
 recall_k: 50 # RRF 融合后的候选数
-final_top_n: 5 # Reranker 精排后的最终返回数
 rrf_k: 60 # RRF 融合常量
 
 

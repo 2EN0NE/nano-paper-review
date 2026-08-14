@@ -40,7 +40,7 @@
 
 12. As a pipeline author, I want to control which Subjects are processed first via regex priority rules, so that urgent papers get reviewed first.
 
-13. As a pipeline author, I want template variables like `{subject.name}` and `{intermediates.01-search.data.references}` in my `.md` prompt files, so that prompts dynamically adapt to each Subject.
+13. As a pipeline author, I want template variables like `{subject.name}` and `{intermediates.03-batch-search.data.history}` in my `.md` prompt files, so that prompts dynamically adapt to each Subject.
 
 14. As a pipeline author, I want the framework to inject a standard prefix before my prompt content (summarizing prior steps and output constraints), so that agents consistently know their context and where to write results.
 

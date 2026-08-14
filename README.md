@@ -107,12 +107,13 @@ paper-review serve --port 8765           # HTTP API
 ```
 pipeline/
 ├── pipeline.yaml              # 编排定义
-├── pre-review/                # Pre Phase 步骤
+├── pre-review/                # Pre Phase 步骤（批量）
 │   ├── 00-convert.py          # 格式归一化
-│   └── 01-auto-index.py       # 自动建索引
+│   ├── 01-auto-index.py       # 自动建索引
+│   ├── 02-generate-query.py   # 生成检索 query
+│   ├── 03-batch-search.py     # 批量预检索相似文章（模型加载一次）
+│   └── 04-extract-keywords.py # 提取关键词
 ├── review-pipeline/           # Review Phase 步骤
-│   ├── 01-search.py           # 检索相似文章
-│   ├── 02-extract-keywords.py # 提取关键词
 │   ├── 03-direct-scoring.md   # 直接维度评审（Agent）
 │   ├── 04-indirect-scoring.md # 间接维度评审（Agent）
 │   └── 05-summarize.py        # 综合汇总
@@ -127,8 +128,11 @@ pipeline/
 ## 待审论文
 {subject.text}
 
-## 检索到的相似文章
-{intermediates.01-search.data.references}
+## 历史参考（已审论文）
+{intermediates.03-batch-search.data.history}
+
+## 本批次参考（同批待审论文）
+{intermediates.03-batch-search.data.pending}
 
 请按以下维度评审...
 ```
@@ -162,11 +166,11 @@ paper-review review ./dir/ --pipeline ./custom/pipeline.yaml
 ### 检索管道
 
 ```
-query → BM25(FTS5, chunk级) → max聚合到论文分
-      → FAISS(文档级向量)     → cosine similarity
-      → RRF融合(k=60)        → Top-30候选
-      → Cross-Encoder精排    → Top-5结果
-      → pool 过滤             → 最终结果
+query → BM25(FTS5, chunk级)  ┐
+      → FAISS(chunk级向量)    ┘→ chunk 级 RRF 融合(k=60)
+      → 聚合到论文（每篇 ≤3 chunk，总预算 20）→ 排除 content_hash 自身
+      → (可选) Cross-Encoder 精排 chunk
+      → 分池截断（history ≤5 / pending ≤3）→ 组装 SearchResult
 ```
 
 ### 命令行检索
@@ -215,8 +219,8 @@ API 完整文档：[`docs/API.md`](docs/API.md)
 ├── config.yaml                 # CLI 配置文件（自动搜索）
 ├── index/
 │   ├── index.sqlite            # SQLite 数据库（FTS5 BM25 + 元数据）
-│   ├── papers.index            # 文档级 FAISS 向量索引
-│   └── chunks.index            # Chunk 级 FAISS 向量索引
+│   ├── chunks.index            # Chunk 级 FAISS 向量索引
+│   └── chunks_id_map.json      # FAISS ID → chunk_id 映射
 ├── pdfs/                       # PDF 源文件
 ├── output/
 │   ├── intermediates/          # 管线中间产物
@@ -290,16 +294,8 @@ PAPER_REVIEW_DATA_DIR=/custom/data paper-review status
 chunk_size: 512
 chunk_overlap: 128
 
-# 加权 Mean Pooling（文档向量权重）
-head_weight: 5.0
-body_weight: 2.0
-tail_weight: 4.0
-head_ratio: 0.15
-tail_ratio: 0.10
-
 # 检索参数
 recall_k: 50
-final_top_n: 5
 rrf_k: 60
 
 # 模型

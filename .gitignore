@@ -238,3 +238,6 @@ requirements.lock
 # 用户管线数据目录（索引、输出、中间产物）
 .paper-review/
 logs/
+
+# 开发 scratch 工作笔记
+.scratch/
