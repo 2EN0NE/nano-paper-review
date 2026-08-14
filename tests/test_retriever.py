@@ -25,8 +25,8 @@ def _setup_store_with_papers(paper_defs: list[tuple[str, str]]) -> Store:
     for fid, pool in paper_defs:
         paper = make_sample_paper(fid, pool)
         chunks = chunk_paper(paper)
-        cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
-        store.add_paper(paper, cvs, dv)
+        cvs = make_mock_chunk_vecs(chunks, dim=4)
+        store.add_paper(paper, cvs)
     return store
 
 
@@ -267,15 +267,15 @@ class TestRerankerIntegration:
             ]
         )
 
-        # 用一个简单的模拟 reranker：按论文标题排序（为了可测试性）
+        # 用一个简单的模拟 reranker：按 chunk 文本长度倒序（为了可测试性）
         class MockReranker:
             is_loaded = True
 
-            def rerank(self, query, candidates, top_n=5):
+            def rerank_chunks(self, query, chunks):
                 # 倒序排列以验证排序变更
-                scored = [(p, len(p.meta.title_hint)) for p in candidates]
+                scored = [(c, len(c.text)) for c in chunks]
                 scored.sort(key=lambda x: x[1], reverse=True)
-                return [p for p, _ in scored[:top_n]]
+                return scored
 
         results_no_rerank = store.search("方法", with_rerank=False)
         results_rerank = store.search("方法", with_rerank=True, reranker=MockReranker())
@@ -296,8 +296,8 @@ class TestRerankerIntegration:
         class IdentityReranker:
             is_loaded = True
 
-            def rerank(self, query, candidates, top_n=5):
-                return candidates[:top_n]
+            def rerank_chunks(self, query, chunks):
+                return [(c, 1.0) for c in chunks]
 
         results = store.search("方法", with_rerank=True, reranker=IdentityReranker())
         assert len(results) > 0

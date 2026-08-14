@@ -1,0 +1,212 @@
+"""
+03-batch-search.py — 批量预检索相似 Reference（Chunk-level Retrieval）
+
+对所有 Subject 一次性批量检索：模型（embedding + reranker）只加载一次，
+逐个 Subject 调 hybrid_search，结果按 history / pending 两组分别写入
+per-subject intermediates（intermediates/{subject}/03-batch-search/output.json），
+供 Review Phase 评分步骤通过模板变量读取（ADR 0007 / 0011）。
+
+每篇 Reference 携带：综合相似分 + 四个原始分 + 完整命中原文（不截断，
+ADR 0009）；并按 content_hash 排除与 Subject 内容相同的自身旧副本。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def _serialize_result(r) -> dict:
+    """把 SearchResult 序列化为给评审 Agent 呈现的 Reference dict。
+
+    三段呈现（ADR 0009）：综合分主线 + 四个原始分审计 + 完整命中原文。
+    """
+    return {
+        "paper_id": r.paper_id,
+        "title": r.title_hint,
+        "author": r.author_hint,
+        "year": r.year,
+        "pool": r.pool,
+        "combined_score": r.combined_score,
+        "bm25_score": r.bm25_score,
+        "vector_score": r.vector_score,
+        "rrf_score": r.rrf_score,
+        "rerank_score": r.rerank_score,
+        # 完整命中 chunk 原文，不截断（判断相似性的关键证据）
+        "matched_chunks": r.matched_chunks,
+    }
+
+
+def _load_models(cfg):
+    """加载 embedding + reranker（缺失时优雅降级，不抛异常）。"""
+    from paper_review.search.models import EmbeddingModelManager
+    from paper_review.search.reranker import CrossEncoderReranker
+
+    embed_model = None
+    try:
+        mgr = EmbeddingModelManager(config=cfg)
+        mgr.load()
+        if mgr._embedder is not None:
+            embed_model = mgr
+        else:
+            logger.warning("embedding ONNX 模型不可用，向量检索退化为确定性哈希")
+    except Exception as e:
+        logger.warning("embedding 模型加载失败（%s），向量检索退化为确定性哈希", e)
+
+    reranker = None
+    try:
+        reranker = CrossEncoderReranker(config=cfg)
+        reranker.load()
+        if not reranker.is_loaded:
+            logger.warning(
+                "reranker 模型不可用（%s），本次跳过精排，使用 RRF 排序", reranker.model_name
+            )
+    except Exception as e:
+        logger.warning("reranker 模型加载失败（%s），本次跳过精排", e)
+
+    return embed_model, reranker
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    """写 JSON（对齐 01-auto-index 的容错模式）。"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"  ✗ 写入 {path} 失败: {e}")
+
+
+def main():
+    step_dir = os.environ.get("PIPELINE_STEP_DIR", ".")
+    output_dir = os.environ.get("PIPELINE_OUTPUT_DIR", ".")
+    intermediates_dir = os.environ.get("PIPELINE_INTERMEDIATES", ".")
+    data_dir = os.environ.get("PIPELINE_DATA_DIR", "")
+
+    # ── 读 manifest（00-convert 产出）──
+    manifest_path = Path(output_dir) / "subject-manifest.json"
+    subjects: list[dict] = []
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            subjects = manifest.get("subjects", [])
+        except (json.JSONDecodeError, OSError):
+            print(f"  ⚠ 无法读取 manifest: {manifest_path}")
+
+    # ── 读 query 映射（02-generate-query 产出）──
+    queries: dict[str, str] = {}
+    query_path = Path(intermediates_dir) / "pre" / "02-generate-query" / "output.json"
+    if query_path.exists():
+        try:
+            queries = (
+                json.loads(query_path.read_text(encoding="utf-8"))
+                .get("data", {})
+                .get("queries", {})
+            )
+        except (json.JSONDecodeError, OSError):
+            print(f"  ⚠ 无法读取 query 映射: {query_path}")
+
+    # ── 打开 Store + 加载模型一次 ──
+    from paper_review.config import load_config
+    from paper_review.search.retriever import hybrid_search
+    from paper_review.search.search_types import HISTORY_TOP_N, PENDING_TOP_N
+    from paper_review.search.store import Store
+
+    cfg = load_config(data_dir=data_dir or None)
+    store_dir = Path(os.environ.get("PIPELINE_INDEX_STORE_DIR", "./index"))
+    db_path = str(store_dir / "index.sqlite")
+
+    per_subject_results: dict[str, dict] = {}
+    embed_used = False
+    rerank_used = False
+
+    if os.path.exists(db_path):
+        store = Store(db_path=db_path, config=cfg)
+        store.load_for_search()
+        # 显式加载 FAISS 索引：01-auto-index 已写入 chunks.index。无 faiss 或
+        # 索引文件缺失时优雅降级到内存暴力搜索（仍可用，只是大库性能差）。
+        try:
+            store.load_faiss()
+        except Exception as e:
+            logger.warning("FAISS 索引加载失败（%s），向量检索退化为内存暴力搜索", e)
+
+        embed_model, reranker = _load_models(cfg)
+        embed_used = embed_model is not None
+        rerank_used = reranker is not None and reranker.is_loaded
+
+        from paper_review.extractor import extract_pdf
+
+        for subj in subjects:
+            name = subj["name"]
+            query = queries.get(name) or name.replace("-", " ").replace("_", " ")
+            pdf_path = Path(subj["pdf_path"])
+
+            # 排除自身：content_hash = SHA-256(全文)，与 content_dedup 同源
+            exclude_hash: str | None = None
+            try:
+                raw_text = extract_pdf(str(pdf_path))
+                if raw_text.strip():
+                    exclude_hash = hashlib.sha256(raw_text.encode()).hexdigest()
+            except Exception as e:
+                logger.warning("提取 %s 全文失败（%s），无法排除自身", name, e)
+
+            results = hybrid_search(
+                store,
+                query,
+                embed_model=embed_model,
+                reranker=reranker,
+                exclude_content_hash=exclude_hash,
+                history_top_n=HISTORY_TOP_N,
+                pending_top_n=PENDING_TOP_N,
+            )
+
+            history = [_serialize_result(r) for r in results if r.pool == "history"]
+            pending = [_serialize_result(r) for r in results if r.pool == "pending"]
+
+            subj_data = {
+                "query": query,
+                "history": history,
+                "pending": pending,
+                "history_count": len(history),
+                "pending_count": len(pending),
+            }
+            per_subject_results[name] = subj_data
+
+            # per-subject intermediates（Review Phase 模板变量读取）
+            _write_json(
+                Path(intermediates_dir) / name / "03-batch-search" / "output.json",
+                {
+                    "step": "03-batch-search",
+                    "status": "ok",
+                    "error": None,
+                    "data": subj_data,
+                },
+            )
+
+        store.close()
+
+    # ── 汇总输出（intermediates/pre/03-batch-search/output.json）──
+    output = {
+        "step": "03-batch-search",
+        "status": "ok",
+        "error": None,
+        "data": {
+            "subject_count": len(per_subject_results),
+            "model": {"embedding_used": embed_used, "rerank_used": rerank_used},
+        },
+    }
+    _write_json(Path(step_dir) / "output.json", output)
+
+    print(
+        f"03-batch-search: {len(per_subject_results)} subject(s) searched "
+        f"(embed={embed_used}, rerank={rerank_used})"
+    )
+
+
+if __name__ == "__main__":
+    main()

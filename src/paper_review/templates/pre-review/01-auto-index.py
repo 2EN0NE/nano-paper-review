@@ -96,8 +96,8 @@ def main():
                     pool="history",
                 )
 
-                chunks, chunk_vecs, doc_vec = build_index(paper, model)
-                added = store.add_paper(paper, chunk_vecs, doc_vec)
+                chunks, chunk_vecs = build_index(paper, model)
+                added = store.bulk_add_paper(paper, chunk_vecs)
                 if not added:
                     print(f"  · 去重: {pdf_file.name}")
                     dedup_skipped += 1
@@ -105,7 +105,7 @@ def main():
                     print(f"  ✓ {pdf_file.name}")
                     history_indexed += 1
 
-                del raw_text, paper, chunks, chunk_vecs, doc_vec
+                del raw_text, paper, chunks, chunk_vecs
 
             except Exception as e:
                 print(f"  ✗ {pdf_file.name}: {e}")
@@ -170,15 +170,15 @@ def main():
                     pool="pending",
                 )
 
-                chunks, chunk_vecs, doc_vec = build_index(paper, model)
-                added = store.add_paper(paper, chunk_vecs, doc_vec)
+                chunks, chunk_vecs = build_index(paper, model)
+                added = store.bulk_add_paper(paper, chunk_vecs)
                 if not added:
                     print(f"  · 去重: {stem}")
                 else:
                     print(f"  ✓ {stem}")
                     subjects_indexed += 1
 
-                del raw_text, paper, chunks, chunk_vecs, doc_vec
+                del raw_text, paper, chunks, chunk_vecs
 
             except Exception as e:
                 print(f"  ✗ {stem}: {e}")

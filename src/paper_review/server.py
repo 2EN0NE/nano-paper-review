@@ -3,7 +3,7 @@ HTTP API 服务 —— Flask 应用
 
 端点：
 - GET  /health  → {status: 'ok'}
-- GET  /status  → {papers, chunks, doc_vectors, chunk_vectors, pools}
+- GET  /status  → {papers, chunks, chunk_vectors, pools}
 - POST /search  → {results: [...], meta: {...}}
 """
 
@@ -133,12 +133,18 @@ def create_app(store: Store, data_dir: str | None = None) -> Flask:
                     "filename": r.filename,
                     "pool": r.pool,
                     "score": r.score,
+                    "combined_score": r.combined_score,
+                    "bm25_score": r.bm25_score,
+                    "vector_score": r.vector_score,
+                    "rrf_score": r.rrf_score,
+                    "rerank_score": r.rerank_score,
                     "title_hint": r.title_hint,
                     "year": r.year,
                     "author_hint": r.author_hint,
                     "arxiv_id": r.arxiv_id,
                     "pages": r.pages,
                     "match_chunk_snippet": r.match_chunk_snippet,
+                    "matched_chunks": r.matched_chunks,
                     "tags": r.tags,
                 }
             )

@@ -3,7 +3,7 @@ Index builder — converts a Paper into chunks + embedding vectors.
 
 The core indexing pipeline::
 
-    Paper → chunk_paper() → model.encode() → chunk_vecs → mean_pool → doc_vec
+    Paper → chunk_paper() → model.encode() → chunk_vecs
 
 This module is the seam between the chunker, the embedding model, and the store.
 """
@@ -22,9 +22,7 @@ from paper_review.search.store import (
     TAIL_WEIGHT,
     Chunk,
     ChunkVector,
-    DocVector,
     Paper,
-    mean_pool_chunks,
 )
 
 if TYPE_CHECKING:
@@ -43,17 +41,15 @@ def build_index(
     tail_weight: float = TAIL_WEIGHT,
     head_ratio: float = HEAD_RATIO,
     tail_ratio: float = TAIL_RATIO,
-) -> tuple[list[Chunk], list[ChunkVector], DocVector]:
-    """Build chunks, chunk vectors, and document vector from a Paper.
+) -> tuple[list[Chunk], list[ChunkVector]]:
+    """Build chunks and chunk vectors from a Paper.
 
     Steps:
         1. ``chunk_paper()`` splits raw_text into chunks with position weights.
         2. ``model.encode()`` produces normalized embeddings for each chunk text.
-        3. ``mean_pool_chunks()`` pools chunk vectors into a document-level vector.
 
     Returns:
-        (chunks, chunk_vecs, doc_vec) — empty chunks list if the paper has no
-        meaningful content.
+        (chunks, chunk_vecs) — empty chunks list if the paper has no meaningful content.
     """
     # Deferred import to avoid circular dependency
     from paper_review.search.chunker import chunk_paper
@@ -70,17 +66,7 @@ def build_index(
     )
 
     if not chunks:
-        # Return empty result for papers with no extractable text
-        dim = getattr(model, "dim", 512)
-        return (
-            [],
-            [],
-            DocVector(
-                paper_id=paper.paper_id,
-                vector=[0.0] * dim,
-                dim=dim,
-            ),
-        )
+        return [], []
 
     # Encode chunk texts
     texts = [c.text for c in chunks]
@@ -89,28 +75,10 @@ def build_index(
     chunk_vecs = [
         ChunkVector(
             chunk_id=c.chunk_id,
-            vector=embeddings[i].tolist(),
-            dim=int(embeddings.shape[1]),
+            vector=embeddings[i],
+            dim=embeddings.shape[1],
         )
         for i, c in enumerate(chunks)
     ]
 
-    # Weighted mean-pool into document vector
-    pooled = mean_pool_chunks(
-        chunk_vecs,
-        chunks,
-        head_weight=head_weight,
-        body_weight=body_weight,
-        tail_weight=tail_weight,
-        head_ratio=head_ratio,
-        tail_ratio=tail_ratio,
-        dim=model.dim,
-    )
-
-    doc_vec = DocVector(
-        paper_id=paper.paper_id,
-        vector=pooled,
-        dim=len(pooled),
-    )
-
-    return chunks, chunk_vecs, doc_vec
+    return chunks, chunk_vecs

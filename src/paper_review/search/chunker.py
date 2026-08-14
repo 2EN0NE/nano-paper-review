@@ -6,7 +6,7 @@
 - 128 字符 overlap
 - 优先在段落边界（\\n\\n）切断
 - 检测参考文献标题后截断后续内容
-- 位置权重标记（head/body/tail，供加权 Mean Pooling 使用）
+- 位置权重标记（head/body/tail，标记 chunk 位置；文档向量退役后暂未被检索读取）
 """
 
 from __future__ import annotations

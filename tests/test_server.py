@@ -31,8 +31,8 @@ def _populate_store(store: Store, paper_names: list[tuple[str, str]]):
     for name, pool in paper_names:
         paper = make_sample_paper(name, pool)
         chunks = chunk_paper(paper)
-        cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
-        store.add_paper(paper, cvs, dv)
+        cvs = make_mock_chunk_vecs(chunks, dim=4)
+        store.add_paper(paper, cvs)
 
 
 # ============================================================================
@@ -75,7 +75,6 @@ class TestStatusEndpoint:
         data = resp.get_json()
         assert data["papers"] == 0
         assert data["chunks"] == 0
-        assert data["doc_vectors"] == 0
         assert data["chunk_vectors"] == 0
 
     def test_status_with_papers(self):
@@ -89,7 +88,6 @@ class TestStatusEndpoint:
         data = resp.get_json()
         assert data["papers"] == 2
         assert data["chunks"] > 0
-        assert data["doc_vectors"] == 2
         assert data["chunk_vectors"] > 0
         assert data["pools"] == {"history": 1, "pending": 1}
 
@@ -148,6 +146,16 @@ class TestSearchEndpoint:
         assert "author_hint" in result
         assert "match_chunk_snippet" in result
         assert result["pool"] == "history"
+        # ADR 0009 新增字段（综合分 + 四个原始分 + 完整命中原文）——HTTP 契约必须固定
+        assert "combined_score" in result
+        assert "bm25_score" in result
+        assert "vector_score" in result
+        assert "rrf_score" in result
+        assert "rerank_score" in result
+        assert "matched_chunks" in result
+        assert result["combined_score"] >= 0.0
+        assert isinstance(result["matched_chunks"], list)
+        assert len(result["matched_chunks"]) > 0, "应携带完整命中 chunk 原文"
 
     def test_search_with_pool_filter(self):
         store = Store(":memory:")

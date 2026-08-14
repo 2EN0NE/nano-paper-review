@@ -77,11 +77,11 @@ class TestFullChainDimConsistency:
         store = _store_with_config(vector_dim=768)
         paper = make_sample_paper("信用评估", "history")
         chunks = chunk_paper(paper)
-        cvs, dv = make_mock_chunk_vecs(chunks, dim=768)
-        added = store.add_paper(paper, cvs, dv)
+        cvs = make_mock_chunk_vecs(chunks, dim=768)
+        added = store.add_paper(paper, cvs)
         assert added
-        assert store._faiss_papers is not None
-        assert store._faiss_papers.ntotal == 1
+        assert store._faiss_chunks is not None
+        assert store._faiss_chunks.ntotal == 1
 
     def test_search_dim_mismatch_falls_back_to_hash(self):
         """旧 512 索引 + 新 768 模型：store.search 回退哈希向量，不崩溃。"""
@@ -89,8 +89,8 @@ class TestFullChainDimConsistency:
         store.init_faiss()
         paper = make_sample_paper("信用评估", "history")
         chunks = chunk_paper(paper)
-        cvs, dv = make_mock_chunk_vecs(chunks, dim=512)
-        store.add_paper(paper, cvs, dv)
+        cvs = make_mock_chunk_vecs(chunks, dim=512)
+        store.add_paper(paper, cvs)
 
         class _FakeEmbedModel:
             dim = 768  # 与索引 512 不一致
@@ -108,8 +108,8 @@ class TestFullChainDimConsistency:
         store.init_faiss()
         paper = make_sample_paper("信用评估", "history")
         chunks = chunk_paper(paper)
-        cvs, dv = make_mock_chunk_vecs(chunks, dim=512)
-        store.add_paper(paper, cvs, dv)
+        cvs = make_mock_chunk_vecs(chunks, dim=512)
+        store.add_paper(paper, cvs)
 
         class _FakeEmbedModel:
             dim = 512
@@ -130,8 +130,8 @@ class TestHashFallbackDimMatchesIndex:
         store = _store_with_config(vector_dim=768)
         paper = make_sample_paper("信用评估", "history")
         chunks = chunk_paper(paper)
-        cvs, dv = make_mock_chunk_vecs(chunks, dim=768)
-        store.add_paper(paper, cvs, dv)
+        cvs = make_mock_chunk_vecs(chunks, dim=768)
+        store.add_paper(paper, cvs)
 
         # 无 embed_model → store.search 内部降级路径
         results = store.search("信用评估")

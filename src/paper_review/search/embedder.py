@@ -42,11 +42,19 @@ class OnnxEmbedder:
         model_dir: Directory containing ``model.onnx``, ``tokenizer.json``,
             ``config.json``.
         max_length: Maximum token sequence length (truncation).
+        intra_op_threads: ONNX SessionOptions 单算子/算子间线程数（默认 1，
+            避免 2C/4G 机器上 ORT 按核数开线程抢满 CPU）。
     """
 
-    def __init__(self, model_dir: str | os.PathLike, max_length: int = 512):
+    def __init__(
+        self,
+        model_dir: str | os.PathLike,
+        max_length: int = 512,
+        intra_op_threads: int = 1,
+    ):
         self._model_dir = Path(model_dir)
         self._max_length = max_length
+        self._intra_op_threads = max(1, intra_op_threads)
         self._session = None
         self._dim: int = 0
         self._model_name: str = self._model_dir.name
@@ -91,8 +99,12 @@ class OnnxEmbedder:
             )
 
         logger.info("Loading ONNX embedder: %s", onnx_path)
+        sess_options = onnxruntime.SessionOptions()
+        sess_options.intra_op_num_threads = self._intra_op_threads
+        sess_options.inter_op_num_threads = self._intra_op_threads
         self._session = onnxruntime.InferenceSession(
             str(onnx_path),
+            sess_options=sess_options,
             providers=["CPUExecutionProvider"],
         )
 

@@ -50,32 +50,29 @@ class TestContentDedup:
 
         # 先加载相同的 chunker 分块
         chunks1 = chunk_paper(paper1)
-        cvs1, dv1 = make_mock_chunk_vecs(chunks1)
-        store.add_paper(paper1, cvs1, dv1)
+        cvs1 = make_mock_chunk_vecs(chunks1)
+        store.add_paper(paper1, cvs1)
 
         # 记录去重前的计数
         pre_papers = len(store.papers)
-        pre_doc_vecs = len(store.doc_vectors)
         pre_chunk_vecs = len(store.chunk_vectors)
 
         # 相同内容的不同文件
         chunks2 = chunk_paper(paper2)
-        cvs2, dv2 = make_mock_chunk_vecs(chunks2)
-        store.add_paper(paper2, cvs2, dv2)
+        cvs2 = make_mock_chunk_vecs(chunks2)
+        store.add_paper(paper2, cvs2)
 
         # 验证：论文元数据增加，向量条目不变
         assert len(store.papers) == pre_papers + 1, "论文元数据应增加"
         assert "p2" in store.papers, "第二篇论文元数据应存在"
-        assert len(store.doc_vectors) == pre_doc_vecs, "文档向量不应增加"
         assert len(store.chunk_vectors) == pre_chunk_vecs, "chunk 向量不应增加"
-        assert "p2" not in store.doc_vectors, "p2 不应有文档向量"
 
         # 验证日志包含 DEDUP 标记
         assert any("DEDUP" in msg for msg in store.ops_log), "应有 DEDUP 日志"
 
         store.close()
 
-    def test_dedup_skips_doc_vector_faiss(self):
+    def test_dedup_skips_chunk_vector(self):
         """去重后 paper 可被 BM25 搜索到（元数据+chunks 已存）但不进入向量索引"""
         store = Store(":memory:")
 
@@ -84,8 +81,8 @@ class TestContentDedup:
 
         for p in [paper1, paper2]:
             chunks = chunk_paper(p)
-            cvs, dv = make_mock_chunk_vecs(chunks)
-            store.add_paper(p, cvs, dv)
+            cvs = make_mock_chunk_vecs(chunks)
+            store.add_paper(p, cvs)
 
         # BM25 应该能搜到两个文件名
         all_results = store.bm25_search("图神经网络")
@@ -99,10 +96,10 @@ class TestContentDedup:
 
         # 但向量检索只搜到 p1
         query_vec = [0.1] * 4  # 随便一个向量
-        vec_results = store._vector_search(query_vec, top_k=10)
-        vec_pids = [pid for pid, _ in vec_results]
-        assert "p1" in vec_pids, "p1 应在向量索引中"
-        assert "p2" not in vec_pids, "p2 不应在向量索引中"
+        vec_results = store._vector_search_chunks(query_vec, top_k=10)
+        vec_chunk_ids = [cid for cid, _ in vec_results]
+        assert any(cid.startswith("p1") for cid in vec_chunk_ids), "p1 应在向量索引中"
+        assert not any(cid.startswith("p2") for cid in vec_chunk_ids), "p2 不应在向量索引中"
 
         store.close()
 
@@ -114,8 +111,8 @@ class TestContentDedup:
 
         paper = make_paper("p1", "sched.pdf", "系统调度")
         chunks = chunk_paper(paper)
-        cvs, dv = make_mock_chunk_vecs(chunks)
-        store.add_paper(paper, cvs, dv)
+        cvs = make_mock_chunk_vecs(chunks)
+        store.add_paper(paper, cvs)
 
         assert expected_hash in store.content_hashes
         assert store.content_hashes[expected_hash] == "p1"
@@ -128,16 +125,18 @@ class TestContentDedup:
 
         paper1 = make_paper("p1", "credit_v1.pdf", "信用评估")
         chunks1 = chunk_paper(paper1)
-        cvs1, dv1 = make_mock_chunk_vecs(chunks1)
-        store.add_paper(paper1, cvs1, dv1)
+        cvs1 = make_mock_chunk_vecs(chunks1)
+        store.add_paper(paper1, cvs1)
 
         paper2 = make_paper("p2", "credit_v2.pdf", "信用评估")
         chunks2 = chunk_paper(paper2)
-        cvs2, dv2 = make_mock_chunk_vecs(chunks2)
-        store.add_paper(paper2, cvs2, dv2, force_reindex=True)
+        cvs2 = make_mock_chunk_vecs(chunks2)
+        store.add_paper(paper2, cvs2, force_reindex=True)
 
-        # force_reindex 下应该建立完整索引（包括向量）
-        assert "p2" in store.doc_vectors, "force_reindex 应建立文档向量"
+        # force_reindex 下应该建立完整索引（包括 chunk 向量）
+        assert any(cid.startswith("p2") for cid in store.chunk_vectors), (
+            "force_reindex 应建立 chunk 向量"
+        )
         store.close()
 
 
@@ -155,33 +154,23 @@ class TestConfigLoading:
         assert cfg.head_ratio == 0.15
         assert cfg.tail_ratio == 0.10
         assert cfg.recall_k == 50
-        assert cfg.final_top_n == 5
         assert cfg.rrf_k == 60
         assert cfg.vector_dim == 512
         assert cfg.embedding_model == "BAAI/bge-small-zh-v1.5"
         assert cfg.reranker_model == "BAAI/bge-reranker-v2-m3"
 
     def test_fingerprint_format(self):
-        """fingerprint() 输出预期格式"""
+        """fingerprint() 输出预期格式（模型 + 维度，与 OnnxEmbedder.embed_fingerprint 一致）"""
         cfg = Config()
         fp = cfg.fingerprint()
         assert "bge-small-zh-v1.5" in fp
         assert "dim=512" in fp
-        assert "head=5.0_body=2.0_tail=4.0" in fp
 
-    def test_fingerprint_changes_with_weights(self):
-        """改变权重后 fingerprint 不同"""
+    def test_weights_do_not_affect_fingerprint(self):
+        """权重参数不再参与指纹（文档向量已移除，权重不影响 chunk 向量）。"""
         cfg1 = Config(head_weight=5.0, body_weight=2.0, tail_weight=4.0)
         cfg2 = Config(head_weight=3.0, body_weight=1.0, tail_weight=2.0)
-        assert cfg1.fingerprint() != cfg2.fingerprint()
-
-    def test_weight_config_str(self):
-        """weight_config_str() 输出用于 doc_vectors 的标识"""
-        cfg = Config()
-        wcs = cfg.weight_config_str()
-        assert "head=5.0" in wcs
-        assert "body=2.0" in wcs
-        assert "tail=4.0" in wcs
+        assert cfg1.fingerprint() == cfg2.fingerprint()
 
     def test_store_uses_config_defaults(self):
         """Store 默认使用 Config 的默认值创建指纹"""
@@ -195,141 +184,7 @@ class TestConfigLoading:
         cfg = Config(head_weight=3.0, body_weight=1.0, tail_weight=2.0)
         store = Store(":memory:", config=cfg)
         fp = store._current_fingerprint()
-        assert "head=3.0_body=1.0_tail=2.0" in fp
-        store.close()
-
-
-class TestRebuildDocVectors:
-    """T5: 重建文档向量"""
-
-    @staticmethod
-    def _make_long_content(seed: str) -> str:
-        """生成足够长的内容以确保分块 > 1"""
-        paragraphs = [
-            f"标题：{seed}方法研究",
-            "摘  要",
-            f"本文提出了一种{seed}方法，结合了深度学习和传统模型。"
-            "该方法在多个数据集上进行了验证，取得了优异的性能表现。"
-            "我们首先分析了现有方法的局限性，然后提出了改进方案。",
-            f"实验结果表明，{seed}方法在三个公开数据集上表现优异。"
-            "与基线方法相比，我们的方法在准确率上提升了5.2%，"
-            "在召回率上提升了3.8%。",
-            "1  引言",
-            f"近年来，{seed}领域取得了显著进展。深度学习技术的快速发展"
-            "为解决该领域的关键问题提供了新的思路。本文旨在探索一种"
-            "有效的{seed}方法，以满足实际应用的需求。",
-            "2  相关工作",
-            "在本节中，我们回顾了与该领域相关的主要研究工作。"
-            "传统方法主要依赖于手工特征和规则，而深度学习方法则能够"
-            "自动学习特征表示，显著提升了性能。",
-            "3  方法介绍",
-            "本文提出的方法包含三个主要模块：特征提取模块、"
-            "融合模块和决策模块。每个模块都经过精心设计，"
-            "以最大化整体性能。下面我们详细描述每个模块的设计。",
-            "4  实验分析",
-            "我们在多个基准数据集上进行了全面的实验分析。"
-            "实验设置包括数据预处理、参数配置和评估指标。"
-            "所有实验均在相同的硬件环境下进行，以确保公平比较。",
-            "参考文献",
-        ]
-        return "\n\n".join(paragraphs)
-
-    @staticmethod
-    def _add_long_paper(store: Store, seed: str, pid: str, filename: str):
-        content = TestRebuildDocVectors._make_long_content(seed)
-        meta = PaperMeta(filename=filename, title_hint=seed, year=2023, author_hint="张三")
-        paper = Paper(
-            paper_id=pid,
-            filepath=f"data/{filename}",
-            meta=meta,
-            raw_text=content,
-            pages=2,
-            pool="history",
-        )
-        chunks = chunk_paper(paper)
-        cvs, dv = make_mock_chunk_vecs(chunks, dim=4)
-        store.add_paper(paper, cvs, dv)
-
-    def test_rebuild_empty_store(self):
-        """空 store 重建不报错"""
-        store = Store(":memory:")
-        store.rebuild_doc_vectors()
-        assert len(store.ops_log) > 0
-        store.close()
-
-    def test_rebuild_preserves_paper_count(self):
-        """重建后论文数不变"""
-        store = Store(":memory:")
-        self._add_long_paper(store, "深度学习", "p1", "dl.pdf")
-        self._add_long_paper(store, "图神经网络", "p2", "gnn.pdf")
-
-        pre_count = len(store.papers)
-        store.rebuild_doc_vectors()
-        assert len(store.papers) == pre_count
-        assert len(store.doc_vectors) == pre_count
-        store.close()
-
-    def test_rebuild_changes_scores_with_different_weights(self):
-        """不同权重配置下重建 → doc vector 不同 → 相似度分数变化"""
-        store = Store(":memory:")
-        self._add_long_paper(store, "深度学习", "p1", "dl.pdf")
-        self._add_long_paper(store, "图神经网络", "p2", "gnn.pdf")
-
-        query_vec = [0.1, 0.2, 0.3, 0.4]
-        scores_before = store._vector_search(query_vec, top_k=10)
-        score_map_before = dict(scores_before)
-
-        # 切换权重后重建
-        cfg2 = Config(head_weight=1.0, body_weight=1.0, tail_weight=1.0)
-        store.config = cfg2
-        store.rebuild_doc_vectors()
-
-        scores_after = store._vector_search(query_vec, top_k=10)
-        score_map_after = dict(scores_after)
-
-        # 分数应该有变化（至少有一个 paper 的分数不同）
-        changes = [
-            pid
-            for pid in score_map_before
-            if abs(score_map_before.get(pid, 0) - score_map_after.get(pid, 0)) > 1e-6
-        ]
-        assert len(changes) > 0, "权重变化后分数应不同"
-        # 确保确实重建了
-        assert "p1" in store.doc_vectors
-        assert "p2" in store.doc_vectors
-        store.close()
-
-    def test_rebuild_updates_fingerprint(self):
-        """重建后嵌入指纹更新为当前配置"""
-        store = Store(":memory:")
-        self._add_long_paper(store, "深度学习", "p1", "dl.pdf")
-
-        # 初始指纹
-        fp_before = store.embed_fingerprint
-
-        # 切换配置后重建
-        cfg2 = Config(head_weight=1.0, body_weight=1.0, tail_weight=1.0)
-        store.config = cfg2
-        store.rebuild_doc_vectors()
-
-        assert store.embed_fingerprint != fp_before
-        assert store.embed_fingerprint == cfg2.fingerprint()
-        store.close()
-
-    def test_rebuild_requires_chunk_vectors(self):
-        """没有 chunk 向量的论文在重建时被跳过"""
-        store = Store(":memory:")
-        paper = make_paper("p1", "test.pdf", "测试")
-
-        # 手动添加 paper 和 chunks 但不加 chunk_vectors
-        chunks = chunk_paper(paper)
-        store.papers["p1"] = paper
-        for c in chunks:
-            store.chunks[c.chunk_id] = c
-
-        store.rebuild_doc_vectors()
-        # p1 没有 chunk_vectors，应被跳过
-        assert "p1" not in store.doc_vectors
+        assert fp == cfg.fingerprint()
         store.close()
 
 
@@ -347,8 +202,8 @@ class TestLoadAllFingerprint:
             store = Store(db_path)
             paper = make_paper("p1", "test.pdf", "信用评估")
             chunks = chunk_paper(paper)
-            cvs, dv = make_mock_chunk_vecs(chunks)
-            store.add_paper(paper, cvs, dv)
+            cvs = make_mock_chunk_vecs(chunks)
+            store.add_paper(paper, cvs)
             store.close()
 
             store2 = Store(db_path)
@@ -373,16 +228,70 @@ class TestLoadAllFingerprint:
             store = Store(db_path)
             paper = make_paper("p1", "test.pdf", "信用评估")
             chunks = chunk_paper(paper)
-            cvs, dv = make_mock_chunk_vecs(chunks)
-            store.add_paper(paper, cvs, dv)
+            cvs = make_mock_chunk_vecs(chunks)
+            store.add_paper(paper, cvs)
             store.close()
 
-            # 模拟不同配置重新打开
-            cfg2 = Config(head_weight=1.0, body_weight=1.0, tail_weight=1.0)
+            # 模拟不同配置重新打开（改维度——真正影响 chunk 向量的因素）
+            cfg2 = Config(vector_dim=768)
             store2 = Store(db_path, config=cfg2)
             store2.load_all()
             warn_msgs = [m for m in store2.ops_log if "FINGERPRINT MISMATCH" in m]
             assert len(warn_msgs) > 0, "指纹不同应有警告"
+            store2.close()
+        finally:
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+
+class TestLegacyIndexUpgrade:
+    """T5: 旧版本索引（权重段指纹 + doc_vectors 孤儿表）的升级兼容。
+
+    文档向量退役后（ADR 0006），存量索引的指纹含加权 Mean Pooling 权重段
+    （``model/dim=512/head=5.0_body=2.0_tail=4.0``），且残留 ``doc_vectors`` 表。
+    新代码加载时应：不崩溃、不误报重建告警（chunk 向量未变）、chunk 检索仍命中。
+    """
+
+    def test_legacy_weight_suffix_fingerprint_is_compatible(self):
+        """旧指纹权重后缀视为兼容，加载不误报 MISMATCH、检索仍命中。"""
+        import os
+        import sqlite3
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+            db_path = f.name
+        try:
+            store = Store(db_path)
+            paper = make_paper("p1", "test.pdf", "信用评估")
+            chunks = chunk_paper(paper)
+            cvs = make_mock_chunk_vecs(chunks)
+            store.add_paper(paper, cvs)
+            store.close()
+
+            # 模拟旧版本：指纹写入权重后缀段，并残留 doc_vectors 表（旧 schema）
+            conn = sqlite3.connect(db_path)
+            cur_fp = Config().fingerprint()
+            conn.execute(
+                "UPDATE embed_fingerprint SET value = ? WHERE key = 'embed_model'",
+                (f"{cur_fp}/head=5.0_body=2.0_tail=4.0",),
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS doc_vectors ("
+                "paper_id TEXT PRIMARY KEY, vector BLOB NOT NULL, "
+                "dim INTEGER DEFAULT 512, weight_config TEXT DEFAULT '')"
+            )
+            conn.commit()
+            conn.close()
+
+            # 新代码加载：不崩溃、不误报重建告警
+            store2 = Store(db_path)
+            store2.load_for_search()
+            warn_msgs = [m for m in store2.ops_log if "FINGERPRINT MISMATCH" in m]
+            assert len(warn_msgs) == 0, f"权重后缀应兼容，不应有重建告警: {warn_msgs}"
+
+            # chunk 检索仍命中（旧索引 chunk 向量未变）
+            results = store2.search("信用评估", with_rerank=False)
+            assert len(results) > 0, "升级后 chunk 检索应仍命中"
             store2.close()
         finally:
             if os.path.exists(db_path):

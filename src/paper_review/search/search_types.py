@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-import struct
 from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
 
 # ============================================================================
 # 配置常量（与 chunker.py 共享）
@@ -22,6 +24,16 @@ CHUNK_OVERLAP = 128
 RRF_K = 60
 RECALL_K = 50
 FINAL_TOP_N = 5
+
+# 精排输入规模与分池输出上限（ADR 0010 / 0011）
+MAX_RERANK_CHUNKS = 20  # 精排输入 chunk 总预算（history+pending 混合）
+MAX_CHUNKS_PER_PAPER = 3  # 每篇候选论文进精排的最多 chunk 数
+HISTORY_TOP_N = 5  # 精排输出：历史参考上限
+PENDING_TOP_N = 3  # 精排输出：本批次上限
+EVIDENCE_CHUNKS_PER_PAPER = 2  # 每篇给 Agent 的命中 chunk 原文数
+
+# query 生成 / 关键词提取共用的正文首段截断长度（ADR 0008）
+QUERY_FIRST_PARA_CHARS = 500
 
 HEAD_WEIGHT = 5.0
 BODY_WEIGHT = 2.0
@@ -73,17 +85,11 @@ class Chunk:
 
 
 @dataclass
-class DocVector:
-    paper_id: str = ""
-    vector: list[float] = field(default_factory=list)
-    dim: int = 512
-    weight_config: str = ""
-
-
-@dataclass
 class ChunkVector:
     chunk_id: str = ""
-    vector: list[float] = field(default_factory=list)
+    # 向量表示：紧凑反序列化（deserialize_vector）与 build_index 产出为 np.ndarray(float32)；
+    # 哈希降级路径与部分测试仍可能为 list[float]——迁移期两态并存，消费点须经 np.asarray 归一。
+    vector: Any = field(default_factory=list)
     dim: int = 512
 
 
@@ -93,12 +99,19 @@ class SearchResult:
     filename: str = ""
     pool: str = ""
     score: float = 0.0
+    # 综合相似分 + 四个原始分（ADR 0009）
+    combined_score: float = 0.0
+    bm25_score: float = 0.0
+    vector_score: float = 0.0
+    rrf_score: float = 0.0
+    rerank_score: float = 0.0
     title_hint: str = ""
     year: int = 0
     author_hint: str = ""
     arxiv_id: str = ""
     pages: int = 0
     match_chunk_snippet: str = ""
+    matched_chunks: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
 
 
@@ -119,13 +132,14 @@ def normalize_cjk_for_fts(text: str) -> str:
 # ============================================================================
 
 
-def serialize_vector(vec: list[float]) -> bytes:
-    return struct.pack(f"<{len(vec)}f", *vec)
+def serialize_vector(vec) -> bytes:
+    """向量 → float32 BLOB（兼容 list 与 np.ndarray）。"""
+    return np.asarray(vec, dtype=np.float32).tobytes()
 
 
-def deserialize_vector(blob: bytes) -> list[float]:
-    n = len(blob) // 4
-    return list(struct.unpack(f"<{n}f", blob))
+def deserialize_vector(blob: bytes) -> np.ndarray:
+    """BLOB → 紧凑 float32 视图（零拷贝，不产生 Python list 膨胀）。"""
+    return np.frombuffer(blob, dtype=np.float32)
 
 
 # ============================================================================

@@ -7,8 +7,7 @@ Store 封装了所有索引数据的 SQLite 存储，包括：
 - 论文元数据 (papers)
 - Chunk 文本 (chunks)
 - FTS5 BM25 全文索引 (chunks_fts)
-- Chunk 向量 (chunk_vectors, DocVector 的 BLOB)
-- 文档级 Mean Pooling 向量 (doc_vectors)
+- Chunk 向量 (chunk_vectors 的 BLOB)
 - 内容去重哈希 (content_dedup)
 - Embedding 模型指纹 (embed_fingerprint)
 
@@ -20,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import os
 import sqlite3
 import threading
@@ -42,7 +40,6 @@ from paper_review.search.search_types import (  # noqa: F401 — 向后兼容 re
     VECTOR_DIM,
     Chunk,
     ChunkVector,
-    DocVector,
     Paper,
     PaperMeta,
     SearchResult,
@@ -74,6 +71,10 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
+        # 外键级联（papers→chunks→chunk_vectors）需在连接建立时启用：
+        # SQLite 规定事务内无法修改 foreign_keys，延迟到 remove_paper 内再设会变 no-op，
+        # 导致 DELETE FROM papers 不级联、chunks/chunk_vectors 残留孤儿行。
+        self.db.execute("PRAGMA foreign_keys = ON")
         # FAISS 索引路径（持久化模式下用）
         self.index_dir: str | None = None
         if db_path != ":memory:":
@@ -89,20 +90,15 @@ class Store:
         # 运行时缓存
         self.papers: dict[str, Paper] = {}
         self.chunks: dict[str, Chunk] = {}
-        self.doc_vectors: dict[str, DocVector] = {}
         self.chunk_vectors: dict[str, ChunkVector] = {}
 
         self.ops_log: list[str] = []
 
-        # FAISS 向量索引（lazy initialized）
-        self._faiss_papers = None  # IndexIDMap wrapper or None
+        # FAISS 向量索引（lazy initialized，仅 chunk 级）
         self._faiss_chunks = None  # IndexIDMap wrapper or None
-        self._faiss_paper_id_map: dict[int, str] = {}
         self._faiss_chunk_id_map: dict[int, str] = {}
-        self._faiss_paper_rev_map: dict[str, int] = {}
         self._faiss_chunk_rev_map: dict[str, int] = {}
         self._faiss_dim: int = VECTOR_DIM
-        self._next_faiss_paper_id: int = 1
         self._next_faiss_chunk_id: int = 1
         self._faiss_lock = threading.Lock()
 
@@ -111,6 +107,18 @@ class Store:
     def _current_fingerprint(self) -> str:
         """根据当前配置计算嵌入指纹"""
         return self.config.fingerprint()
+
+    def _fingerprints_compatible(self, stored: str, current: str) -> bool:
+        """判断存储指纹与当前指纹是否兼容（无需重建 chunk 索引）。
+
+        旧版本指纹含加权 Mean Pooling 权重段（``model/dim=512/head=5.0_body=2.0_tail=4.0``），
+        文档向量退役后权重不再影响 chunk 向量，指纹精简为 ``model/dim=512``。
+        二者在模型与维度一致时兼容——旧指纹是当前指纹的 ``/`` 后缀形式，
+        不应触发重建告警（chunk 向量未变）。真正的模型/维度变更仍会 mismatch。
+        """
+        if stored == current:
+            return True
+        return stored.startswith(current + "/")
 
     def log(self, msg: str):
         self.ops_log.append(msg)
@@ -179,16 +187,6 @@ class Store:
         """)
 
         db.execute("""
-            CREATE TABLE IF NOT EXISTS doc_vectors (
-                paper_id TEXT PRIMARY KEY,
-                vector BLOB NOT NULL,
-                dim INTEGER DEFAULT 512,
-                weight_config TEXT DEFAULT '',
-                FOREIGN KEY (paper_id) REFERENCES papers(paper_id) ON DELETE CASCADE
-            )
-        """)
-
-        db.execute("""
             CREATE TABLE IF NOT EXISTS content_dedup (
                 sha256 TEXT PRIMARY KEY,
                 paper_id TEXT NOT NULL
@@ -210,9 +208,8 @@ class Store:
         """
         初始化 FAISS 索引（IndexFlatIP + IndexIDMap）。
 
-        创建两个索引：
-        - ``papers.index``: 文档级向量（N 条）
-        - ``chunks.index``: chunk 级向量（~20N 条）
+        创建 chunk 级索引：
+        - ``chunks.index``: chunk 级向量（每篇 ~多个 chunk）
 
         Args:
             dim: 向量维度；未指定时取 config.vector_dim（config 命令选中模型时
@@ -223,17 +220,11 @@ class Store:
         self._faiss_dim = dim or self.config.vector_dim or VECTOR_DIM
         d = self._faiss_dim
 
-        base_papers = faiss.IndexFlatIP(d)
-        self._faiss_papers = faiss.IndexIDMap(base_papers)
-
         base_chunks = faiss.IndexFlatIP(d)
         self._faiss_chunks = faiss.IndexIDMap(base_chunks)
 
-        self._faiss_paper_id_map.clear()
         self._faiss_chunk_id_map.clear()
-        self._faiss_paper_rev_map.clear()
         self._faiss_chunk_rev_map.clear()
-        self._next_faiss_paper_id = 1
         self._next_faiss_chunk_id = 1
 
         self.log(f"FAISS init: dim={d}")
@@ -248,14 +239,6 @@ class Store:
             return
 
         os.makedirs(index_dir, exist_ok=True)
-
-        if self._faiss_papers is not None and self._faiss_papers.ntotal > 0:
-            idx_path = os.path.join(index_dir, "papers.index")
-            map_path = os.path.join(index_dir, "papers_id_map.json")
-            faiss.write_index(self._faiss_papers, idx_path)
-            with open(map_path, "w", encoding="utf-8") as f:
-                json.dump(self._faiss_paper_id_map, f, ensure_ascii=False)
-            self.log(f"FAISS save: papers.index ({self._faiss_papers.ntotal} vecs)")
 
         if self._faiss_chunks is not None and self._faiss_chunks.ntotal > 0:
             idx_path = os.path.join(index_dir, "chunks.index")
@@ -280,26 +263,12 @@ class Store:
 
         loaded_any = False
 
-        papers_path = os.path.join(index_dir, "papers.index")
-        papers_map_path = os.path.join(index_dir, "papers_id_map.json")
-
-        if os.path.exists(papers_path):
-            self._faiss_papers = faiss.read_index(papers_path)
-            self._faiss_dim = self._faiss_papers.d
-            if os.path.exists(papers_map_path):
-                with open(papers_map_path, encoding="utf-8") as f:
-                    raw = json.load(f)
-                self._faiss_paper_id_map = {int(k): v for k, v in raw.items()}
-                self._faiss_paper_rev_map = {v: k for k, v in self._faiss_paper_id_map.items()}
-                self._next_faiss_paper_id = max(self._faiss_paper_id_map.keys(), default=0) + 1
-            self.log(f"FAISS load: papers.index ({self._faiss_papers.ntotal} vecs)")
-            loaded_any = True
-
         chunks_path = os.path.join(index_dir, "chunks.index")
         chunks_map_path = os.path.join(index_dir, "chunks_id_map.json")
 
         if os.path.exists(chunks_path):
             self._faiss_chunks = faiss.read_index(chunks_path)
+            self._faiss_dim = self._faiss_chunks.d
             if os.path.exists(chunks_map_path):
                 with open(chunks_map_path, encoding="utf-8") as f:
                     raw = json.load(f)
@@ -313,21 +282,12 @@ class Store:
 
     # --- FAISS 内部辅助 ---
 
-    def _add_to_faiss(self, paper: Paper, chunk_vecs: list[ChunkVector], doc_vec: DocVector):
-        """将论文的向量添加到 FAISS 索引（线程安全）。"""
-        if self._faiss_papers is None:
+    def _add_to_faiss(self, chunk_vecs: list[ChunkVector]):
+        """将论文的 chunk 向量添加到 FAISS 索引（线程安全）。"""
+        if self._faiss_chunks is None:
             return
         with self._faiss_lock:
-            # 论文级向量
-            paper_vec = np.array([doc_vec.vector], dtype=np.float32)
-            paper_faiss_id = self._next_faiss_paper_id
-            self._faiss_papers.add_with_ids(paper_vec, np.array([paper_faiss_id], dtype=np.int64))
-            self._faiss_paper_id_map[paper_faiss_id] = paper.paper_id
-            self._faiss_paper_rev_map[paper.paper_id] = paper_faiss_id
-            self._next_faiss_paper_id += 1
-
-            # Chunk 级向量
-            if self._faiss_chunks is not None and chunk_vecs:
+            if chunk_vecs:
                 chunk_vec_array = np.array([cv.vector for cv in chunk_vecs], dtype=np.float32)
                 chunk_ids = []
                 for cv in chunk_vecs:
@@ -342,32 +302,22 @@ class Store:
                 )
 
     def _rebuild_faiss(self):
-        """从内存缓存重建两个 FAISS 索引。"""
-        if self._faiss_papers is None:
+        """从内存缓存重建 chunk 级 FAISS 索引。"""
+        if self._faiss_chunks is None:
             return
 
+        # load_for_search 不物化向量（省内存）；重建需要完整 chunk_vectors，
+        # 缺失时按需懒加载——仅在 remove_paper 重建时才反序列化全部向量。
+        self._ensure_chunk_vectors_loaded()
         self.init_faiss(dim=self._faiss_dim)
 
-        # 重建论文索引
-        for paper_id, dv in self.doc_vectors.items():
-            paper = self.papers.get(paper_id)
-            if paper is None:
-                continue
-            paper_vec = np.array([dv.vector], dtype=np.float32)
-            faiss_id = self._next_faiss_paper_id
-            self._faiss_papers.add_with_ids(paper_vec, np.array([faiss_id], dtype=np.int64))
-            self._faiss_paper_id_map[faiss_id] = paper_id
-            self._faiss_paper_rev_map[paper_id] = faiss_id
-            self._next_faiss_paper_id += 1
-
-            # 重建 chunk 索引
-            for chunk_id, cv in self.chunk_vectors.items():
-                chunk_vec = np.array([cv.vector], dtype=np.float32)
-                faiss_id = self._next_faiss_chunk_id
-                self._faiss_chunks.add_with_ids(chunk_vec, np.array([faiss_id], dtype=np.int64))
-                self._faiss_chunk_id_map[faiss_id] = chunk_id
-                self._faiss_chunk_rev_map[chunk_id] = faiss_id
-                self._next_faiss_chunk_id += 1
+        for chunk_id, cv in self.chunk_vectors.items():
+            chunk_vec = np.array([cv.vector], dtype=np.float32)
+            faiss_id = self._next_faiss_chunk_id
+            self._faiss_chunks.add_with_ids(chunk_vec, np.array([faiss_id], dtype=np.int64))
+            self._faiss_chunk_id_map[faiss_id] = chunk_id
+            self._faiss_chunk_rev_map[chunk_id] = faiss_id
+            self._next_faiss_chunk_id += 1
 
     def _checkpoint_faiss(self):
         """FAISS 检查点：将当前 FAISS 索引写入磁盘后重新初始化。
@@ -410,12 +360,12 @@ class Store:
         ).fetchone()
         if row:
             self.embed_fingerprint = row["value"]
-            # 比对指纹，配置变更时发出警告
+            # 比对指纹，配置变更时发出警告（旧权重后缀视为兼容，见 _fingerprints_compatible）
             current_fp = self._current_fingerprint()
-            if current_fp != self.embed_fingerprint:
+            if not self._fingerprints_compatible(self.embed_fingerprint, current_fp):
                 logger.warning(
                     "Embedding fingerprint mismatch: stored=%r current=%r. "
-                    "Run `paper-review rebuild-vectors` to recompute doc vectors.",
+                    "Rebuild the chunk index (delete the index dir, then run `paper-review index`).",
                     self.embed_fingerprint,
                     current_fp,
                 )
@@ -423,12 +373,16 @@ class Store:
                     f"FINGERPRINT MISMATCH: stored={self.embed_fingerprint} current={current_fp}"
                 )
 
-    def load_all(self):
-        """从 SQLite 加载全部数据到内存缓存"""
+    def load_for_search(self):
+        """轻量加载：加载 papers + chunks + content_hashes + embed_fingerprint。
+
+        与 ``load_all`` 相同逻辑，但跳过 chunk_vectors —— 不反序列化向量 BLOB。
+        FAISS 检索只需要 papers/chunks/FAISS 索引；整库向量仅在 FAISS 索引缺失、
+        走内存暴力回退时才按需懒加载（见 ``_ensure_chunk_vectors_loaded``）。
+        """
         db = self.db
         self.papers.clear()
         self.chunks.clear()
-        self.doc_vectors.clear()
         self.chunk_vectors.clear()
         self.content_hashes.clear()
 
@@ -465,23 +419,6 @@ class Store:
                 position_weight=row["position_weight"],
             )
 
-        for row in db.execute("SELECT * FROM doc_vectors"):
-            pid = row["paper_id"]
-            self.doc_vectors[pid] = DocVector(
-                paper_id=pid,
-                vector=deserialize_vector(row["vector"]),
-                dim=row["dim"],
-                weight_config=row["weight_config"],
-            )
-
-        for row in db.execute("SELECT * FROM chunk_vectors"):
-            cid = row["chunk_id"]
-            self.chunk_vectors[cid] = ChunkVector(
-                chunk_id=cid,
-                vector=deserialize_vector(row["vector"]),
-                dim=row["dim"],
-            )
-
         for row in db.execute("SELECT * FROM content_dedup"):
             self.content_hashes[row["sha256"]] = row["paper_id"]
 
@@ -489,16 +426,45 @@ class Store:
         if row:
             self.embed_fingerprint = row["value"]
 
-        # 比对指纹，配置变更时发出警告
+        # 比对指纹，配置变更时发出警告（旧权重后缀视为兼容，见 _fingerprints_compatible）
         current_fp = self._current_fingerprint()
-        if self.embed_fingerprint and self.embed_fingerprint != current_fp:
+        if self.embed_fingerprint and not self._fingerprints_compatible(
+            self.embed_fingerprint, current_fp
+        ):
             logger.warning(
                 "Embedding fingerprint mismatch: stored=%r current=%r. "
-                "Run `paper-review rebuild-vectors` to recompute doc vectors.",
+                "Rebuild the chunk index (delete the index dir, then run `paper-review index`).",
                 self.embed_fingerprint,
                 current_fp,
             )
             self.log(f"FINGERPRINT MISMATCH: stored={self.embed_fingerprint} current={current_fp}")
+
+    def load_all(self):
+        """从 SQLite 加载全部数据到内存缓存（含 chunk_vectors 向量 BLOB）"""
+        self.load_for_search()
+        for row in self.db.execute("SELECT * FROM chunk_vectors"):
+            cid = row["chunk_id"]
+            self.chunk_vectors[cid] = ChunkVector(
+                chunk_id=cid,
+                vector=deserialize_vector(row["vector"]),
+                dim=row["dim"],
+            )
+
+    def _ensure_chunk_vectors_loaded(self):
+        """懒加载 chunk_vectors：仅当内存缓存为空时从 SQLite 反序列化。
+
+        轻量加载（``load_for_search``）不物化向量；FAISS 缺失回退到暴力搜索时，
+        此方法按需加载向量。已有向量时（``load_all`` 或已懒加载过）直接返回。
+        """
+        if self.chunk_vectors:
+            return
+        for row in self.db.execute("SELECT * FROM chunk_vectors"):
+            cid = row["chunk_id"]
+            self.chunk_vectors[cid] = ChunkVector(
+                chunk_id=cid,
+                vector=deserialize_vector(row["vector"]),
+                dim=row["dim"],
+            )
 
     # --- 索引操作 ---
 
@@ -506,7 +472,6 @@ class Store:
         self,
         paper: Paper,
         chunk_vecs: list[ChunkVector],
-        doc_vec: DocVector,
         force_reindex: bool = False,
     ) -> list[Chunk]:
         """
@@ -515,7 +480,6 @@ class Store:
         Args:
             paper: 论文数据
             chunk_vecs: 预计算好的 chunk 向量（来自 build_index）
-            doc_vec: 预计算好的文档向量（来自 build_index）
             force_reindex: 即使内容相同也重新索引（默认走去重检测）
         """
         # 先用 chunker 重新分块（确保一致性）
@@ -654,17 +618,6 @@ class Store:
                 )
 
             db.execute(
-                """INSERT OR REPLACE INTO doc_vectors
-                   (paper_id, vector, dim, weight_config) VALUES (?, ?, ?, ?)""",
-                (
-                    doc_vec.paper_id,
-                    serialize_vector(doc_vec.vector),
-                    doc_vec.dim,
-                    doc_vec.weight_config,
-                ),
-            )
-
-            db.execute(
                 "INSERT OR REPLACE INTO content_dedup(sha256, paper_id) VALUES (?, ?)",
                 (content_hash, paper.paper_id),
             )
@@ -682,13 +635,12 @@ class Store:
                 self.chunks[c.chunk_id] = c
             for cv in chunk_vecs:
                 self.chunk_vectors[cv.chunk_id] = cv
-            self.doc_vectors[doc_vec.paper_id] = doc_vec
             self.content_hashes[content_hash] = paper.paper_id
             if not self.embed_fingerprint:
                 self.embed_fingerprint = current_fp
 
             # 更新 FAISS 索引
-            self._add_to_faiss(paper, chunk_vecs, doc_vec)
+            self._add_to_faiss(chunk_vecs)
 
         except Exception:
             db.rollback()
@@ -702,14 +654,12 @@ class Store:
         self,
         paper: Paper,
         chunk_vecs: list[ChunkVector],
-        doc_vec: DocVector,
         force_reindex: bool = False,
     ) -> list[Chunk]:
         """批量添加论文——只写 SQLite + FAISS，跳过内存 dict 缓存。
 
         与 ``add_paper`` 功能相同，但不同时维护 ``self.papers``、
-        ``self.chunks``、``self.chunk_vectors``、``self.doc_vectors``
-        等运行时 dict。
+        ``self.chunks``、``self.chunk_vectors`` 等运行时 dict。
 
         用于 ``paper-review index`` 批量建索引场景，每 Epoch 结束时
         通过创建新的 Store 实例释放 FAISS 内存，避免 OOM。
@@ -846,17 +796,6 @@ class Store:
                 )
 
             db.execute(
-                """INSERT OR REPLACE INTO doc_vectors
-                   (paper_id, vector, dim, weight_config) VALUES (?, ?, ?, ?)""",
-                (
-                    doc_vec.paper_id,
-                    serialize_vector(doc_vec.vector),
-                    doc_vec.dim,
-                    doc_vec.weight_config,
-                ),
-            )
-
-            db.execute(
                 "INSERT OR REPLACE INTO content_dedup(sha256, paper_id) VALUES (?, ?)",
                 (content_hash, paper.paper_id),
             )
@@ -872,7 +811,7 @@ class Store:
                 self.embed_fingerprint = current_fp
 
             # 更新 FAISS 索引（在 commit 之前，失败时整个回滚）
-            self._add_to_faiss(paper, chunk_vecs, doc_vec)
+            self._add_to_faiss(chunk_vecs)
 
             db.commit()
 
@@ -912,10 +851,9 @@ class Store:
             del self.chunks[cid]
             self.chunk_vectors.pop(cid, None)
         del self.papers[paper_id]
-        self.doc_vectors.pop(paper_id, None)
 
         # 重建 FAISS 索引（FAISS 不支持删除，重建最可靠）
-        if self._faiss_papers is not None:
+        if self._faiss_chunks is not None:
             self._rebuild_faiss()
 
     # --- BM25 检索 ---
@@ -958,14 +896,6 @@ class Store:
             if r is not None and r["score"] is not None
         ]
 
-    def bm25_aggregate_to_papers(self, chunk_results: list[tuple[str, float]]) -> dict[str, float]:
-        """Chunk 级 BM25 → max 聚合 → 论文分"""
-        paper_scores: dict[str, float] = {}
-        for chunk_id, score in chunk_results:
-            paper_id = chunk_id.rsplit("#", 1)[0]
-            paper_scores[paper_id] = max(paper_scores.get(paper_id, 0.0), score)
-        return paper_scores
-
     # --- 全检索管道 ---
 
     def search(
@@ -976,16 +906,17 @@ class Store:
         limit: int = FINAL_TOP_N,
         embed_model=None,
         reranker=None,
+        exclude_content_hash: str | None = None,
     ) -> list[SearchResult]:
-        """文档级混合检索
+        """chunk 级混合检索（委托 retriever.hybrid_search）。
 
         Args:
-            query: 查询文本
-            pool_filter: 限定搜索池（history/pending），post-filter 语义
-            with_rerank: 是否启用 Cross-Encoder 精排
-            limit: 返回结果数量上限
-            embed_model: EmbeddingModelManager 实例，用于查询编码
-            reranker: CrossEncoderReranker 实例
+            query: 查询文本。
+            pool_filter: None 返回 history+pending 两组；"history"/"pending" 单池。
+            with_rerank: 是否启用 Cross-Encoder 精排。
+            limit: 总结果数上限（默认 FINAL_TOP_N），同时作为各池的召回上限。
+            embed_model / reranker: 模型实例。
+            exclude_content_hash: 排除 content_hash 相同的自身旧副本。
         """
         if not self.papers:
             self.log("SEARCH: empty index")
@@ -996,95 +927,24 @@ class Store:
             f"rerank={with_rerank}, limit={limit}"
         )
 
-        # 1. BM25 — 全库搜索（不按 pool 预过滤，post-filter 语义）
-        bm25_results = self.bm25_search(query)
-        bm25_paper_scores = self.bm25_aggregate_to_papers(bm25_results)
+        from paper_review.search.retriever import hybrid_search
 
-        # 2. FAISS 文档级向量检索
-        if embed_model is not None:
-            if (
-                self._faiss_papers is not None
-                and self._faiss_papers.ntotal > 0
-                and getattr(embed_model, "dim", None) not in (None, self._faiss_dim)
-            ):
-                # 模型维度与索引维度不一致（如更换了 embedding 模型后未重建索引）：
-                # 直接崩溃会打断检索，回退哈希向量 + 明确警告（语义与模型缺失降级一致）。
-                logger.warning(
-                    "embedding model dim=%s 与 FAISS 索引 dim=%s 不一致——"
-                    "本次查询退化为哈希向量；建议删除 {data_dir}/index 重建或运行 rebuild_doc_vectors",
-                    embed_model.dim,
-                    self._faiss_dim,
-                )
-                query_vec = deterministic_hash_vector(query, dim=self._faiss_dim)
-            else:
-                query_vec = embed_model.encode([query])[0].tolist()
-        else:
-            # 使用正确的维度（匹配 FAISS / doc_vectors）；无索引时跟随 config.vector_dim
-            dim = (
-                self._faiss_dim
-                if self._faiss_papers is not None
-                else (self.config.vector_dim or VECTOR_DIM)
-            )
-            query_vec = deterministic_hash_vector(query, dim=dim)
-        vec_results = self._vector_search(query_vec)
-
-        # 3. RRF 融合
-        bm25_ranked = sorted(bm25_paper_scores.items(), key=lambda x: x[1], reverse=True)[:RECALL_K]
-        fused = rrf_fuse(bm25_ranked, vec_results)
-        candidate_ids = [pid for pid, _ in fused[:RECALL_K]]
-
-        # 4. (可选) Cross-Encoder 精排
-        if with_rerank and reranker is not None and reranker.is_loaded:
-            candidate_papers = [self.papers[pid] for pid in candidate_ids if pid in self.papers]
-            reranked_papers = reranker.rerank(
-                query,
-                candidate_papers,
-                top_n=limit,
-            )
-            reranked_ids = [p.paper_id for p in reranked_papers]
-            fused = [(pid, 1.0 - i * 0.001) for i, pid in enumerate(reranked_ids)]
-            candidate_ids = reranked_ids
-
-        # 5. Pool 过滤 (post-filter — 全库召回后仅保留指定池)
-        if pool_filter:
-            candidate_ids = [
-                pid
-                for pid in candidate_ids
-                if self.papers.get(pid) and self.papers[pid].pool == pool_filter
-            ]
-
-        # 6. 组装结果
-        fused_dict = dict(fused)
-        results: list[SearchResult] = []
-        for pid in candidate_ids[:limit]:
-            score = fused_dict.get(pid, 0.0)
-            paper = self.papers.get(pid)
-            if not paper:
-                continue
-            # 支持多种 chunk_id 格式
-            paper_chunks = [
-                c
-                for cid, c in self.chunks.items()
-                if cid.startswith(pid + "#") or c.paper_id == pid
-            ]
-            best_chunk = paper_chunks[0] if paper_chunks else None
-
-            results.append(
-                SearchResult(
-                    paper_id=pid,
-                    filename=paper.meta.filename,
-                    pool=paper.pool,
-                    score=round(min(1.0, score), 4),
-                    title_hint=paper.meta.title_hint,
-                    year=paper.meta.year,
-                    author_hint=paper.meta.author_hint,
-                    arxiv_id=paper.meta.arxiv_id,
-                    pages=paper.pages,
-                    match_chunk_snippet=best_chunk.text[:200] if best_chunk else "",
-                    tags=paper.meta.tags,
-                )
-            )
-
+        results = hybrid_search(
+            self,
+            query,
+            embed_model=embed_model,
+            reranker=reranker,
+            pool_filter=pool_filter,
+            exclude_content_hash=exclude_content_hash,
+            with_rerank=with_rerank,
+            history_top_n=limit,
+            pending_top_n=limit,
+        )
+        # limit 语义：总结果数（history+pending 合并后截断）。
+        # 合并后按综合分全局排序，避免 history 块永远排在 pending 前导致后者被截断丢弃。
+        results.sort(key=lambda r: r.score, reverse=True)
+        if limit and len(results) > limit:
+            results = results[:limit]
         return results
 
     def search_chunks(
@@ -1133,31 +993,40 @@ class Store:
 
         return results
 
-    def _vector_search(
+    def _vector_search_chunks(
         self, query_vec: list[float], top_k: int = RECALL_K
     ) -> list[tuple[str, float]]:
-        """
-        向量检索。
+        """Chunk 级向量检索。
 
-        如果 FAISS 索引已初始化且有数据，使用 FAISS（IndexFlatIP，
-        L2 归一化后等价于余弦相似度）；否则回退到内存暴力搜索。
+        查 chunk 级 FAISS（chunks.index）；未初始化时回退到 chunk_vectors 内存暴力。
+        返回 [(chunk_id, cosine_score)]，chunk_id 含 ``#`` 分隔符。
         """
-        if self._faiss_papers is not None and self._faiss_papers.ntotal > 0:
+        if self._faiss_chunks is not None and self._faiss_chunks.ntotal > 0:
             query_np = np.array([query_vec], dtype=np.float32)
-            n = min(top_k, self._faiss_papers.ntotal)
-            scores, indices = self._faiss_papers.search(query_np, n)
+            n = min(top_k, self._faiss_chunks.ntotal)
+            scores, indices = self._faiss_chunks.search(query_np, n)
             results: list[tuple[str, float]] = []
             for score, idx in zip(scores[0], indices[0]):
                 if idx == -1:
                     continue
-                paper_id = self._faiss_paper_id_map.get(int(idx), "")
-                if paper_id:
-                    results.append((paper_id, float(score)))
+                chunk_id = self._faiss_chunk_id_map.get(int(idx), "")
+                if chunk_id:
+                    results.append((chunk_id, float(score)))
             return results
 
-        # 回退：内存暴力搜索
+        # 回退：内存暴力搜索（chunk 级，向量懒加载）
+        self._ensure_chunk_vectors_loaded()
+        if self.chunk_vectors:
+            first_cv = next(iter(self.chunk_vectors.values()))
+            if len(query_vec) != len(first_cv.vector):
+                logger.warning(
+                    "query vector dim=%d 与 chunk 向量 dim=%d 不一致——"
+                    "内存暴力回退将截断到较短维度，相似度无意义；建议删除 index 目录重建",
+                    len(query_vec),
+                    len(first_cv.vector),
+                )
         scored = [
-            (pid, cosine_similarity(query_vec, dv.vector)) for pid, dv in self.doc_vectors.items()
+            (cid, cosine_similarity(query_vec, cv.vector)) for cid, cv in self.chunk_vectors.items()
         ]
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:top_k]
@@ -1173,93 +1042,11 @@ class Store:
             "papers": len(self.papers),
             "pools": pool_stats,
             "chunks": len(self.chunks),
-            "doc_vectors": len(self.doc_vectors),
             "chunk_vectors": len(self.chunk_vectors),
         }
 
-    def rebuild_doc_vectors(self):
-        """
-        使用当前配置的加权策略重新计算所有文档级向量。
-
-        遍历所有论文，从 chunk_vectors 表收集 chunk 向量，
-        用当前 head/body/tail 权重做加权 Mean Pooling，
-        更新 doc_vectors 表 + 内存缓存。
-        """
-        if not self.papers:
-            self.log("REBUILD: empty index, nothing to do")
-            return
-
-        cfg = self.config
-        current_fp = self._current_fingerprint()
-        weight_config_str = cfg.weight_config_str()
-        count = 0
-
-        for paper_id, paper in self.papers.items():
-            paper_chunks = sorted(
-                [
-                    c
-                    for cid, c in self.chunks.items()
-                    if cid.startswith(paper_id) or c.paper_id == paper_id
-                ],
-                key=lambda c: c.seq,
-            )
-            if not paper_chunks:
-                continue
-
-            paper_cvs = [
-                cv
-                for cid, cv in self.chunk_vectors.items()
-                if cv.chunk_id in {c.chunk_id for c in paper_chunks}
-            ]
-            if not paper_cvs:
-                self.log(f"  REBUILD: {paper_id} → no chunk vectors, skipping")
-                continue
-
-            new_vec = mean_pool_chunks(
-                paper_cvs,
-                paper_chunks,
-                head_weight=cfg.head_weight,
-                body_weight=cfg.body_weight,
-                tail_weight=cfg.tail_weight,
-                head_ratio=cfg.head_ratio,
-                tail_ratio=cfg.tail_ratio,
-                dim=cfg.vector_dim,
-            )
-
-            # 更新数据库
-            self.db.execute(
-                """INSERT OR REPLACE INTO doc_vectors
-                   (paper_id, vector, dim, weight_config) VALUES (?, ?, ?, ?)""",
-                (
-                    paper_id,
-                    serialize_vector(new_vec),
-                    cfg.vector_dim,
-                    weight_config_str,
-                ),
-            )
-
-            # 更新内存缓存
-            self.doc_vectors[paper_id] = DocVector(
-                paper_id=paper_id,
-                vector=new_vec,
-                dim=cfg.vector_dim,
-                weight_config=weight_config_str,
-            )
-            count += 1
-
-        # 更新指纹
-        self.db.execute(
-            """INSERT OR REPLACE INTO embed_fingerprint(key, value)
-               VALUES ('embed_model', ?)""",
-            (current_fp,),
-        )
-        self.db.commit()
-        self.embed_fingerprint = current_fp
-
-        self.log(f"REBUILD: recomputed {count} doc vectors with {weight_config_str}")
-
     def close(self):
-        if self._faiss_papers is not None:
+        if self._faiss_chunks is not None:
             self.save_faiss()
         self.db.close()
 
@@ -1282,64 +1069,16 @@ def rrf_fuse(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def cosine_similarity(a: list[float], b: list[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))
+def cosine_similarity(a, b) -> float:
+    """向量点积（调用方保证 L2 归一化）；兼容 list 与 np.ndarray。
 
-
-def mean_pool_chunks(
-    cvs: list[ChunkVector],
-    chunks: list[Chunk],
-    head_weight: float = HEAD_WEIGHT,
-    body_weight: float = BODY_WEIGHT,
-    tail_weight: float = TAIL_WEIGHT,
-    head_ratio: float = HEAD_RATIO,
-    tail_ratio: float = TAIL_RATIO,
-    dim: int = VECTOR_DIM,
-) -> list[float]:
+    长度不等时截断到较短（与旧 zip 实现语义一致）——检索测试用 dim=4 的
+    mock 向量配合默认 512 维 query，依赖此宽容行为。
     """
-    按位置权重做加权 Mean Pooling。
-
-    配置文件可覆盖 head/body/tail 权重值。
-    dim 用于 cvs/chunks 为空时的降级向量维度（正常路径从 cvs[0].vector 推导）。
-    """
-    if not cvs or not chunks:
-        return deterministic_hash_vector("", dim)
-
-    # 按 seq 排序以确保顺序
-    sorted_chunks = sorted(chunks, key=lambda c: c.seq)
-    total = len(sorted_chunks)
-    dim = len(cvs[0].vector)
-
-    # 建立 chunk_id → 权重映射
-    wmap: dict[str, float] = {}
-    for i, c in enumerate(sorted_chunks):
-        progress = i / total if total > 0 else 0.5
-        if progress < head_ratio:
-            wmap[c.chunk_id] = head_weight
-        elif progress > 1.0 - tail_ratio:
-            wmap[c.chunk_id] = tail_weight
-        else:
-            wmap[c.chunk_id] = body_weight
-
-    weighted = [0.0] * dim
-    total_weight = 0.0
-    cv_map = {cv.chunk_id: cv.vector for cv in cvs}
-
-    for c in sorted_chunks:
-        vec = cv_map.get(c.chunk_id)
-        if vec is None:
-            continue
-        w = wmap.get(c.chunk_id, 1.0)
-        for i in range(dim):
-            weighted[i] += vec[i] * w
-        total_weight += w
-
-    if total_weight > 0:
-        weighted = [v / total_weight for v in weighted]
-    norm = math.sqrt(sum(v * v for v in weighted))
-    if norm > 1e-8:
-        weighted = [v / norm for v in weighted]
-    return weighted
+    aa = np.asarray(a, dtype=np.float32)
+    bb = np.asarray(b, dtype=np.float32)
+    n = min(len(aa), len(bb))
+    return float(np.dot(aa[:n], bb[:n]))
 
 
 def open_store(data_dir: str | None = None) -> Store:

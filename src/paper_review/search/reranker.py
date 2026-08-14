@@ -26,7 +26,7 @@ from paper_review.config import Config, load_config
 from paper_review.search.instance_pool import InstancePool
 
 if TYPE_CHECKING:
-    from paper_review.search.store import Paper
+    from paper_review.search.store import Chunk, Paper
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,7 @@ class CrossEncoderReranker:
     ):
         self._config = config or load_config()
         self._model_name = _resolve_model_name(self._config, model_name)
+        self._intra_op_threads = max(1, self._config.onnx_intra_op_threads)
         # 推理实例池：workers=1 时池大小为 1（等价单实例串行）；>1 时为
         # N 个独立实例轮询（tokenizer 非线程安全 → 每实例自带锁）。
         self._reranker: InstancePool | None = None
@@ -120,7 +121,11 @@ class CrossEncoderReranker:
             workers = max(1, self._config.reranker_workers)
             wrappers = [
                 _OnnxRerankerWrapper(
-                    OnnxReranker(model_dir=str(onnx_dir), max_length=RERANK_MAX_SEQ_LEN),
+                    OnnxReranker(
+                        model_dir=str(onnx_dir),
+                        max_length=RERANK_MAX_SEQ_LEN,
+                        intra_op_threads=self._intra_op_threads,
+                    ),
                 )
                 for _ in range(workers)
             ]
@@ -179,6 +184,32 @@ class CrossEncoderReranker:
 
         return [p for p, _ in scored[:top_n]]
 
+    def rerank_chunks(
+        self,
+        query: str,
+        chunks: list[Chunk],
+    ) -> list[tuple[Chunk, float]]:
+        """对候选 chunk 逐个打分，返回 (chunk, score) 按分数降序。
+
+        与 ``rerank`` 的区别：输入是 Chunk 而非整篇 Paper，输出保留真实分数
+        （不丢分、不伪造递减序列）。未加载 ONNX 时返回原序、分数 0.0——调用方
+        自行用 RRF 归一化作为综合分（ADR 0009）。
+        """
+        if not chunks:
+            return []
+
+        if not self.is_loaded:
+            return [(c, 0.0) for c in chunks]
+
+        pairs = [(query, c.text) for c in chunks]
+        reranker = self._reranker
+        assert reranker is not None
+        scores = reranker.predict(pairs)  # np.ndarray (N,)
+
+        scored = [(c, s) for c, s in zip(chunks, scores.tolist())]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
+
 
 # ============================================================================
 # Internal wrapper for the raw ONNX inference engine
@@ -191,11 +222,18 @@ class OnnxReranker:
     Args:
         model_dir: Directory with ``model.onnx``, ``tokenizer.json``, ``config.json``.
         max_length: Max token sequence length per pair（query+doc 合计）。
+        intra_op_threads: ONNX SessionOptions 单算子/算子间线程数（默认 1）。
     """
 
-    def __init__(self, model_dir: str, max_length: int = 512):
+    def __init__(
+        self,
+        model_dir: str,
+        max_length: int = 512,
+        intra_op_threads: int = 1,
+    ):
         self._model_dir = Path(model_dir)
         self._max_length = max_length
+        self._intra_op_threads = max(1, intra_op_threads)
         self._session = None
         self._tokenizer = None
         # server 多线程共享同一实例：tokenizers.Tokenizer 官方声明非线程安全，
@@ -227,8 +265,12 @@ class OnnxReranker:
             )
 
         logger.info("Loading ONNX reranker: %s", onnx_path)
+        sess_options = onnxruntime.SessionOptions()
+        sess_options.intra_op_num_threads = self._intra_op_threads
+        sess_options.inter_op_num_threads = self._intra_op_threads
         self._session = onnxruntime.InferenceSession(
             str(onnx_path),
+            sess_options=sess_options,
             providers=["CPUExecutionProvider"],
         )
 

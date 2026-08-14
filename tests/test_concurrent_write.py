@@ -35,8 +35,8 @@ def _write_paper_to_store(db_path: str, pid: str, fid: str):
         pool=base.pool,
     )
     chunks = chunk_paper(paper)
-    cvs, dv = make_mock_chunk_vecs(chunks)
-    store.add_paper(paper, cvs, dv)
+    cvs = make_mock_chunk_vecs(chunks)
+    store.add_paper(paper, cvs)
     store.close()
 
 

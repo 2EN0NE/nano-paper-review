@@ -17,7 +17,7 @@ from paper_review.search.reranker import (
     OnnxReranker,
     _parse_logits,
 )
-from paper_review.search.store import Paper, PaperMeta
+from paper_review.search.store import Chunk, Paper, PaperMeta
 
 
 def _make_candidate(pid: str, text: str = "default content") -> Paper:
@@ -29,6 +29,10 @@ def _make_candidate(pid: str, text: str = "default content") -> Paper:
         pages=1,
         pool="history",
     )
+
+
+def _make_chunk(cid: str, text: str = "default chunk text") -> Chunk:
+    return Chunk(chunk_id=cid, paper_id=cid.split("#")[0], text=text)
 
 
 # ============================================================================
@@ -208,6 +212,69 @@ class TestCrossEncoderRerankerWithMockOnnx:
         candidates = [_make_candidate(f"p{i}") for i in range(10)]
         result = reranker.rerank("query", candidates, top_n=3)
         assert len(result) == 3
+
+
+# ============================================================================
+# rerank_chunks —— chunk 级精排（Ticket 1）
+# ============================================================================
+
+
+class TestRerankChunks:
+    """rerank_chunks 对单个 chunk 打分并返回真实分数（不丢分、不伪造）。"""
+
+    def test_empty_chunks(self):
+        reranker = CrossEncoderReranker()
+        assert reranker.rerank_chunks("query", []) == []
+
+    def test_passthrough_when_not_loaded(self):
+        """未加载 → 原序返回，分数 0.0。"""
+        reranker = CrossEncoderReranker()
+        chunks = [_make_chunk("p1#0", "a"), _make_chunk("p1#1", "b")]
+        result = reranker.rerank_chunks("query", chunks)
+        assert len(result) == 2
+        assert result[0][0] is chunks[0]
+        assert result[0][1] == 0.0
+        assert result[1][1] == 0.0
+
+    def test_rerank_chunks_sorted_by_score_desc(self):
+        """已加载 → 按分数降序，返回真实分数。"""
+        reranker = CrossEncoderReranker()
+
+        class MockOnnx:
+            is_loaded = True
+
+            def predict(self, pairs):
+                return np.array([float(len(d)) for _, d in pairs], dtype=np.float32)
+
+        reranker._reranker = MockOnnx()  # type: ignore[assignment]
+        chunks = [
+            _make_chunk("p1#0", "ab"),
+            _make_chunk("p1#1", "abcdef"),
+            _make_chunk("p2#0", "abcd"),
+        ]
+        result = reranker.rerank_chunks("query", chunks)
+        assert result[0][0].chunk_id == "p1#1"
+        assert result[0][1] == 6.0
+        assert result[1][0].chunk_id == "p2#0"
+        assert result[1][1] == 4.0
+        assert result[2][0].chunk_id == "p1#0"
+        assert result[2][1] == 2.0
+
+    def test_rerank_chunks_returns_real_scores(self):
+        """分数不丢弃、不伪造（对比旧 rerank 丢分 + 1.0-i*0.001）。"""
+        reranker = CrossEncoderReranker()
+
+        class MockOnnx:
+            is_loaded = True
+
+            def predict(self, pairs):
+                return np.array([0.9, 0.3, 0.7], dtype=np.float32)
+
+        reranker._reranker = MockOnnx()  # type: ignore[assignment]
+        chunks = [_make_chunk(f"p{i}#0", "x") for i in range(3)]
+        result = reranker.rerank_chunks("query", chunks)
+        scores = sorted([s for _, s in result], reverse=True)
+        assert scores == pytest.approx([0.9, 0.7, 0.3])
 
 
 # ============================================================================

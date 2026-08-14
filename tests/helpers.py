@@ -8,7 +8,6 @@ import math
 from paper_review.search.store import (
     Chunk,
     ChunkVector,
-    DocVector,
     Paper,
     PaperMeta,
 )
@@ -45,7 +44,7 @@ def make_sample_paper(fid: str, pool: str = "history") -> Paper:
     )
 
 
-def make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> tuple[list[ChunkVector], DocVector]:
+def make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> list[ChunkVector]:
     """构造模拟向量（确定性 SHA-256 哈希）"""
 
     def _hash_vec(text: str) -> list[float]:
@@ -58,25 +57,10 @@ def make_mock_chunk_vecs(chunks: list[Chunk], dim: int = 4) -> tuple[list[ChunkV
         return [x / (norm + 1e-8) for x in vec]
 
     cvs = []
-    total_weight = 0.0
-    weighted = [0.0] * dim
     for c in chunks:
         v = _hash_vec(c.text)
         cvs.append(ChunkVector(chunk_id=c.chunk_id, vector=v, dim=dim))
-        for i in range(dim):
-            weighted[i] += v[i] * c.position_weight
-        total_weight += c.position_weight
-
-    doc_vec = [v / total_weight for v in weighted] if total_weight > 0 else weighted[:]
-    norm = math.sqrt(sum(x * x for x in doc_vec))
-    doc_vec = [x / (norm + 1e-8) for x in doc_vec]
-
-    dv = DocVector(
-        paper_id=chunks[0].paper_id,
-        vector=doc_vec,
-        dim=dim,
-    )
-    return cvs, dv
+    return cvs
 
 
 def make_fake_content(seed: str) -> str:

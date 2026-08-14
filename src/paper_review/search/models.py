@@ -104,8 +104,15 @@ class EmbeddingModelManager:
 
             # workers 个独立实例（每实例一个 session + tokenizer，内存随实例数翻倍）
             workers = max(1, self._config.embedding_workers)
+            intra_op_threads = max(1, self._config.onnx_intra_op_threads)
             embedders = [
-                _OnnxEmbedderWrapper(OnnxEmbedder(model_dir=onnx_dir)) for _ in range(workers)
+                _OnnxEmbedderWrapper(
+                    OnnxEmbedder(
+                        model_dir=onnx_dir,
+                        intra_op_threads=intra_op_threads,
+                    ),
+                )
+                for _ in range(workers)
             ]
             pool = InstancePool(embedders)
             pool.load()

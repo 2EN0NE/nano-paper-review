@@ -8,7 +8,7 @@
 - **做了且有图片、数据等举证材料**的情况
 - **技术解决方案看的关键指标是否提供**
 
-> ⚠ 容错说明：若前序步骤（01-search）未检索到相似文章（`references` 为空或 `model.rerank_used=false`），**不要臆造参考来源**，相关维度基于论文自身内容 + 公开常识评分，并在 rationale 中注明「无相似论文可比对」。
+> ⚠ 容错说明：若预检索未找到相似文章（「历史参考」与「本批次」均为空），**不要臆造参考来源**，相关维度基于论文自身内容 + 公开常识评分，并在 rationale 中注明「无相似论文可比对」。
 
 每个维度打分必须引用至少 2 个参考来源作为依据。不打分自吹自擂的内容，要基于实际证据。
 
@@ -83,8 +83,9 @@
 ## 上下文信息
 
 - 论文名称: `{subject.name}`
-- 检索到的相似论文: {intermediates.01-search.data.references}
-- 提取的关键词: {intermediates.02-extract-keywords.data.keywords}
+- 历史参考（已审论文，按综合相似分降序）: {intermediates.03-batch-search.data.history}
+- 本批次参考（同批待审论文，已排除内容相同的自身）: {intermediates.03-batch-search.data.pending}
+- 提取的关键词（辅助信号）: {intermediates.04-extract-keywords.data.keywords}
 
 ---
 
