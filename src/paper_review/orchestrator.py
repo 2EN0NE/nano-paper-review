@@ -51,6 +51,13 @@ logger = get_logger("orchestrator")
 _PDF_BYTE_TO_CHAR_RATIO = 0.35
 # 当无法读取 PDF 文件大小时的兜底估算（字符数）
 _FALLBACK_CHARS = 5000
+# 注入评分 prompt 的 Subject 全文字符上限（超过则截断并附加提醒，避免 prompt 过大逼近上下文窗口）
+_FULLTEXT_MAX_CHARS = 30000
+# 全文提取失败/为空时注入评分 prompt 的占位提醒（评分步骤据此明确「无全文可比对」，而非臆造原文引用）
+_FULLTEXT_UNAVAILABLE_NOTE = (
+    "（全文提取失败或内容为空：评分时禁止引用原文具体证据，"
+    "相关维度请基于公开常识与检索参考评分，并在 rationale 中注明「无全文可比对」）"
+)
 
 
 def _estimate_subject_chars(subjects: list[str], output_dir: Path) -> list[int]:
@@ -96,6 +103,53 @@ def _estimate_subject_chars(subjects: list[str], output_dir: Path) -> list[int]:
     return subject_chars
 
 
+def _load_subject_text(subject: str, output_dir: Path) -> tuple[str, str]:
+    """从 manifest 拿 subject 的 pdf_path 并提取全文，返回 (text, pdf_path)。
+
+    - 全文超过 _FULLTEXT_MAX_CHARS 时截断，并在开头附加提醒（评分步骤据此知道
+      看到的不是完整原文，避免臆造后半部分证据）。
+    - 提取失败/空文本/找不到 PDF 时返回占位提醒文本（非空），评分 prompt 据此
+      明确「无全文可比对」，而非让 {subject.text} 静默变空。
+    """
+    manifest_path = output_dir / "subject-manifest.json"
+    if not manifest_path.exists():
+        return _FULLTEXT_UNAVAILABLE_NOTE, ""
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return _FULLTEXT_UNAVAILABLE_NOTE, ""
+    for entry in manifest.get("subjects", []):
+        if entry.get("name") != subject:
+            continue
+        pdf_path = entry.get("pdf_path", "")
+        if not pdf_path or not Path(pdf_path).exists():
+            return _FULLTEXT_UNAVAILABLE_NOTE, ""
+        try:
+            from paper_review.extractor import extract_pdf
+
+            text = extract_pdf(str(pdf_path))
+        except Exception as e:
+            logger.warning("提取 Subject '%s' 全文失败：%s", subject, e)
+            return _FULLTEXT_UNAVAILABLE_NOTE, ""
+        if not text:
+            return _FULLTEXT_UNAVAILABLE_NOTE, ""
+        if len(text) > _FULLTEXT_MAX_CHARS:
+            logger.info(
+                "Subject '%s' 全文 %d 字超过 %d 字上限，截断并附加提醒",
+                subject,
+                len(text),
+                _FULLTEXT_MAX_CHARS,
+            )
+            return (
+                f"⚠ 注意：论文全文共 {len(text)} 字，超过 {_FULLTEXT_MAX_CHARS} 字上限，已截断。"
+                f"以下仅提供前 {_FULLTEXT_MAX_CHARS} 字（后半部分未提供，评分请基于已提供内容）。\n\n"
+                + text[:_FULLTEXT_MAX_CHARS],
+                str(pdf_path),
+            )
+        return text, str(pdf_path)
+    return _FULLTEXT_UNAVAILABLE_NOTE, ""
+
+
 # ============================================================================
 # _retry_step — 共享重试逻辑
 # ============================================================================
@@ -110,6 +164,7 @@ def _retry_step(
     retry_cfg: RetryConfig,
     executor: StepExecutor,
     step_timeout: int = 0,
+    subject_text: str = "",
 ) -> StepResult:
     """执行一个 Step，按 RetryConfig 重试。
 
@@ -131,7 +186,9 @@ def _retry_step(
         )
 
         try:
-            result = executor.execute(step, step_dir, timed_env, prior_results, subject_name)
+            result = executor.execute(
+                step, step_dir, timed_env, prior_results, subject_name, subject_text=subject_text
+            )
             elapsed = time.monotonic() - t0
             result.subject = subject_name
             result.attempt = attempt
@@ -355,8 +412,13 @@ def _run_steps_for_subject(
     subject_results: list[StepResult] = list(seed_results) if seed_results else []
     result_base = base_env.get("PIPELINE_RESULT_DIR", str(output_dir))
 
+    # 提取 Subject 全文（供 .md 评分步骤的 {subject.text} 变量注入）。
+    # 提取一次复用给所有 Step，避免每个 Step 重复 extract_pdf。
+    # subject_path 通过 env 传给 MdStepExecutor（PIPELINE_SUBJECT_PATH），供 {subject.path}。
+    subject_text, subject_path = _load_subject_text(subject, output_dir)
+
     # 加载 Pre Phase 为当前 Subject 写的 per-subject intermediates 作为 seed。
-    # 批量预检索（03-batch-search / 04-extract-keywords）在 Pre Phase 执行，但按
+    # 批量预检索（05-batch-search / 04-extract-features）在 Pre Phase 执行，但按
     # Subject 布局写入 intermediates/{subject}/{step}/output.json。Review Phase 的
     # .md 步骤模板变量 {intermediates.STEP.data.KEY} 依赖 prior_results，必须把
     # 这些 Pre 产物带进来（否则评分 prompt 读不到检索结果）。
@@ -436,6 +498,7 @@ def _run_steps_for_subject(
                 "PIPELINE_STEP_NAME": step.stem,
                 "PIPELINE_INTERMEDIATES": str(Path(result_base) / "intermediates"),
                 "PIPELINE_DUPLICATE_POLICY": phase.duplicate_policy,
+                "PIPELINE_SUBJECT_PATH": subject_path,
             }
 
             result = _retry_step(
@@ -447,6 +510,7 @@ def _run_steps_for_subject(
                 retry_cfg=phase.retry,
                 executor=executor,
                 step_timeout=adjusted_timeout,
+                subject_text=subject_text,
             )
             subject_results.append(result)
 
@@ -1208,6 +1272,100 @@ def _render_leaf_outputs(
 # ============================================================================
 
 
+def _collect_degradation_warnings(task_dir: Path) -> list[str]:
+    """扫描中间产物，收集 warn 级降级项（ADR 0014 哨兵）。
+
+    与 abort 级哨兵（步骤失败）不同，这些是「步骤成功但结果为空」的信号，
+    可能是合法冷启动（如第一篇无 history），也可能是闭环断裂（标签自更新
+    失效）——只标注不中断，写入报告 + 终端双呈现。
+
+    信号：
+      1. history 参考恒空（05-batch-search 的 history_count 全 0）
+      2. 技术特征恒空（04-extract-features 的 feature_count 全 0）
+      3. 标签写回 0 篇（09-archive-reports 的 tags_written == 0）
+      4. 评分标签缺失（06-direct-scoring 的 data.tags 空）
+      5. L3 技术特征覆盖率低（04-extract-features 汇总的 l3_coverage < 50%）
+    """
+    warnings: list[str] = []
+    intermediates = task_dir / "intermediates"
+    if not intermediates.is_dir():
+        return warnings
+
+    # subject 目录：排除 pre/post 两个 batch 汇总目录
+    subject_dirs = [
+        d for d in intermediates.iterdir() if d.is_dir() and d.name not in ("pre", "post")
+    ]
+
+    def _load(path: Path) -> dict:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    # 1. history 恒空
+    checked = False
+    all_empty = True
+    for sd in subject_dirs:
+        out = sd / "05-batch-search" / "output.json"
+        if not out.exists():
+            continue
+        checked = True
+        if (_load(out).get("data", {}).get("history_count") or 0) > 0:
+            all_empty = False
+            break
+    if checked and all_empty:
+        warnings.append("历史参考恒空（05-batch-search 的 history 池无已审论文可比对）")
+
+    # 2. 技术特征恒空（feature_count = LLM 抽取 + 词表兜底并集，L3 数据源）
+    checked = False
+    all_empty = True
+    for sd in subject_dirs:
+        out = sd / "04-extract-features" / "output.json"
+        if not out.exists():
+            continue
+        checked = True
+        if (_load(out).get("data", {}).get("feature_count") or 0) > 0:
+            all_empty = False
+            break
+    if checked and all_empty:
+        warnings.append(
+            "技术特征恒空（04-extract-features 的 LLM 抽取 + 词表兜底均无产出，L3 检索失效）"
+        )
+
+    # 3. tags_written == 0
+    archive_out = intermediates / "post" / "09-archive-reports" / "output.json"
+    if archive_out.exists():
+        if (_load(archive_out).get("data", {}).get("tags_written") or 0) == 0:
+            warnings.append("标签写回 0 篇（09-archive-reports tags_written=0，标签库不会自更新）")
+
+    # 4. data.tags 缺失
+    checked = False
+    all_missing = True
+    for sd in subject_dirs:
+        out = sd / "06-direct-scoring" / "output.json"
+        if not out.exists():
+            continue
+        checked = True
+        if _load(out).get("data", {}).get("tags"):
+            all_missing = False
+            break
+    if checked and all_missing:
+        warnings.append("评分标签缺失（06-direct-scoring 的 data.tags 为空，标签写回数据源不可用）")
+
+    # 5. L3 技术特征覆盖率低（ADR 0015：冷启动期间 L3 稀疏，需显式暴露不静默退化）
+    feat_out = intermediates / "pre" / "04-extract-features" / "output.json"
+    if feat_out.exists():
+        data = _load(feat_out).get("data", {})
+        total = data.get("l3_total") or 0
+        covered = data.get("l3_covered") or 0
+        if total > 0 and covered / total < 0.5:
+            warnings.append(
+                f"L3 技术特征覆盖率低（{covered}/{total} 篇有 features，L3 检索大面积退化）"
+            )
+
+    return warnings
+
+
 def _generate_report(
     report_path: Path,
     task_id: str,
@@ -1216,6 +1374,7 @@ def _generate_report(
     all_step_results: list[StepResult],
     success: bool,
     phase_display: dict[str, str] | None = None,
+    degradation_warnings: list[str] | None = None,
 ) -> str:
     """生成最终报告 markdown 文件，返回 CLI 可输出的结构化结论摘要。"""
     import datetime
@@ -1240,8 +1399,16 @@ def _generate_report(
         f"- **时间**: {now}",
         f"- **状态**: {'✅ 通过' if success else '❌ 有错误'}",
         f"- **步骤统计**: {total} 步（✅ {ok_count} / ⚠️ {skipped_count} / ❌ {error_count}）",
-        "",
     ]
+
+    # ── warn 级降级项（结果为空信号，ADR 0014 哨兵）──
+    if degradation_warnings:
+        lines.append("")
+        lines.append("## ⚠ 降级项（结果为空，可能影响评审质量）")
+        lines.append("")
+        for w in degradation_warnings:
+            lines.append(f"- ⚠ {w}")
+        lines.append("")
 
     # ── 结论部件（按 subject 聚合）──
     subject_summaries: dict[str, dict] = {}  # subject → {status, steps, errors}
@@ -1452,6 +1619,7 @@ def run_pipeline(
     target_step: str | None = None,
     pool_progress: PoolProgress | None = None,
     resume_task_dir: Path | None = None,
+    allow_degraded: bool = False,
 ) -> PipelineResult:
     """执行一条完整的 pipeline。
 
@@ -1466,6 +1634,9 @@ def run_pipeline(
         pool_progress: 可选的 PoolProgress 实例。
         resume_task_dir: 续做（Resume）时复用前序 task 目录——原地续做：
             已完成 Steps（有 output.json）跳过，产物合并进原 task。
+        allow_degraded: 显式降级开关（ADR 0014 哨兵）。默认 False——batch
+            phase（pre/post）有 step 失败时中断管线，避免静默降级；传 True
+            时失败后继续执行后续 phase（但 overall_success 仍为 False）。
 
     Returns:
         PipelineResult
@@ -1720,6 +1891,8 @@ def run_pipeline(
     # ── SIGINT 优雅中断：尽力写 interrupted 状态（Resume 检测依赖） ──
     # 仅主线程有效；kill -9/断电 等硬中断不经过此 handler——状态推断（running 无 done）兜底。
     _restore_sigint: Callable[[], None] | None = None
+    # 进度卡引用（pp 创建后填充）：SIGINT 处理器内仅做轻量赋值标记中断。
+    _pp_ref: list[PipelineProgress | None] = [None]
     if threading.current_thread() is threading.main_thread():
         import signal as _signal
 
@@ -1741,6 +1914,12 @@ def run_pipeline(
                 # 非 async-signal-safe），故仅消费异常不记录。
                 _ = e
             _signal.signal(_signal.SIGINT, _prev_int)
+            # 标记中断（轻量赋值，无 I/O/锁，信号处理器内安全）。
+            # 注意：CPython 的 Python 级信号处理器同样延迟到主线程 eval loop
+            # （C 扩展返回后）才执行，无法在 ONNX/PyMuPDF 阻塞期间抢先停止
+            # spinner——此处仅保证中断抛出后渲染的是“已中断”而非“进行中/完成”态。
+            if _pp_ref[0] is not None:
+                _pp_ref[0].mark_interrupted()
             raise KeyboardInterrupt
 
         _signal.signal(_signal.SIGINT, _sigint_mark_interrupted)
@@ -1801,6 +1980,7 @@ def run_pipeline(
             )
 
     pp = PipelineProgress(phases=phase_infos)
+    _pp_ref[0] = pp
     pp.start()
 
     # ── 阶段遍历 ──
@@ -1923,6 +2103,26 @@ def run_pipeline(
             logger.warning("Unknown mode '%s' for phase '%s' — skipping", phase.mode, phase.name)
             continue
 
+        # 哨兵：batch phase 有 step 失败且未显式降级 → 中断管线（ADR 0014）。
+        # 本次事故根因是「静默降级」——05-batch-search 失败被 on_failure=skip
+        # 吞掉，后续 review 照常跑。此处把默认行为改为中断，除非 allow_degraded。
+        if (
+            not allow_degraded
+            and phase.mode == "batch"
+            and any(r.status == "error" for r in phase_results.get("_batch_", []))
+        ):
+            failed = [r.step_name for r in phase_results.get("_batch_", []) if r.status == "error"]
+            logger.error(
+                "哨兵：phase '%s' 有 step 失败 %s —— 中断管线（传 --allow-degraded 可显式降级继续）",
+                phase.name,
+                failed,
+            )
+            overall_success = False
+            all_phase_results[phase.name] = phase_results
+            for subj_results in phase_results.values():
+                all_step_results.extend(subj_results)
+            break
+
         all_phase_results[phase.name] = phase_results
         for subj_results in phase_results.values():
             all_step_results.extend(subj_results)
@@ -1933,6 +2133,12 @@ def run_pipeline(
     # ── 完成 ──
     pp.finish()
 
+    # warn 级哨兵：扫描中间产物收集结果空信号（报告 + 终端双呈现）
+    degradation_warnings = _collect_degradation_warnings(task_dir)
+    if degradation_warnings:
+        for w in degradation_warnings:
+            logger.warning("降级: %s", w)
+
     _generate_report(
         task_dir / "report.md",
         task_id,
@@ -1941,6 +2147,7 @@ def run_pipeline(
         all_step_results,
         overall_success,
         {p.name: p.display_label for p in config.phases},
+        degradation_warnings,
     )
     conclusion = _build_cli_tree(
         task_id, config.name, config, all_phase_results, pipeline_dir, task_dir
@@ -1967,6 +2174,7 @@ def run_pipeline(
         task_id=task_id,
         task_dir=task_dir,
         conclusion=conclusion,
+        degradation_warnings=degradation_warnings,
     )
 
 
@@ -1978,9 +2186,16 @@ def _make_executor(py_runner: PyStepRunner, md_executor: MdStepExecutor) -> Step
     """
 
     class _Adapter:
-        def execute(self, step, step_dir, env, prior_results, subject_name):
+        def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
             return _execute_step(
-                step, step_dir, env, prior_results, subject_name, py_runner, md_executor
+                step,
+                step_dir,
+                env,
+                prior_results,
+                subject_name,
+                py_runner,
+                md_executor,
+                subject_text=subject_text,
             )
 
     return _Adapter()

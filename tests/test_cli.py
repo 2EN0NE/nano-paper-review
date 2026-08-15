@@ -7,6 +7,7 @@ CLI 单元测试 —— 使用 typer.testing.CliRunner 测试各子命令入口�
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import yaml
@@ -44,18 +45,18 @@ class TestInitCommand:
         pipeline_dir = dd / "pipelines" / "standard"
         expected = {
             "pre-review": [
-                "00-convert.py",
-                "01-auto-index.py",
-                "02-generate-query.py",
-                "03-batch-search.py",
-                "04-extract-keywords.py",
+                "01-convert.py",
+                "02-auto-index.py",
+                "03-generate-query.py",
+                "05-batch-search.py",
+                "04-extract-features.py",
             ],
             "review-pipeline": [
-                "03-direct-scoring.md",
-                "04-indirect-scoring.md",
-                "05-summarize.py",
+                "06-direct-scoring.md",
+                "07-indirect-scoring.md",
+                "08-summarize.py",
             ],
-            "post-review": ["01-archive-reports.py", "02-generate-excel.py"],
+            "post-review": ["09-archive-reports.py", "10-generate-excel.py"],
         }
         for subdir, filenames in expected.items():
             for filename in filenames:
@@ -137,6 +138,89 @@ class TestInitResetCommand:
         assert not orphan.exists(), "孤儿文件应被删除"
         backups = list(dd.glob("pipelines/standard/review-pipeline/01-search.py.bak-*"))
         assert len(backups) == 1, f"孤儿文件应有备份: {backups}"
+
+    def test_reset_migrates_renumbered_steps_01_to_02(self, tmp_path):
+        """升级路径：0.1.0 快照（旧步骤名）→ init --reset 清理旧名、写新名、更新 manifest 与 manifest_step。
+
+        步骤重编号（00-08 → 01-10）是破坏性变更：旧 data_dir 的 manifest 记录旧名，
+        当前模板只有新名 → find_orphan_files 应把旧名识别为孤儿，reset 备份后删除并写入新名。
+        """
+        from paper_review.scaffold import check_scaffold
+
+        dd = tmp_path / "data"
+        runner.invoke(app, ["--data-dir", str(dd), "init"])
+
+        std = dd / "pipelines" / "standard"
+        # 模拟 0.1.0 快照：01-convert.py 重命名为旧名 00-convert.py
+        new_convert = std / "pre-review" / "01-convert.py"
+        old_convert = std / "pre-review" / "00-convert.py"
+        new_convert.rename(old_convert)
+        # pipeline.yaml 的 manifest_step 回退为 0.1.0 的 "00-convert"
+        pipeline_yaml = std / "pipeline.yaml"
+        pipeline_yaml.write_text(
+            pipeline_yaml.read_text(encoding="utf-8").replace(
+                'manifest_step: "01-convert"', 'manifest_step: "00-convert"'
+            ),
+            encoding="utf-8",
+        )
+        # manifest 记录 0.1.0 + 旧名文件清单
+        manifest_path = dd / ".scaffold-manifest"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = "0.1.0"
+        manifest["files"] = [
+            f.replace("pre-review/01-convert.py", "pre-review/00-convert.py")
+            for f in manifest["files"]
+        ]
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+        # 前置：0.1.0 快照被检测为 outdated
+        assert check_scaffold(dd) == "outdated"
+
+        result = runner.invoke(app, ["--data-dir", str(dd), "init", "--reset", "--yes"])
+        assert result.exit_code == 0
+
+        # 旧名孤儿被备份并删除
+        assert not old_convert.exists(), "旧名 00-convert.py 应被删除"
+        assert list(std.glob("pre-review/00-convert.py.bak-*")), "旧名应有备份"
+        # 新名落盘
+        assert new_convert.exists()
+        # pipeline.yaml manifest_step 更新为 0.2.0 的 "01-convert"
+        updated = yaml.safe_load(pipeline_yaml.read_text(encoding="utf-8"))
+        pre_phase = next(p for p in updated["phases"] if p["name"] == "pre")
+        assert pre_phase["manifest_step"] == "01-convert"
+        # manifest 更新为 0.2.0 + 新名清单
+        new_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert new_manifest["version"] == "0.2.0"
+        assert "pipelines/standard/pre-review/01-convert.py" in new_manifest["files"]
+        assert not any("00-convert" in f for f in new_manifest["files"])
+
+    def test_reset_skips_nonexistent_orphan_files(self, tmp_path):
+        """manifest 记录的孤儿文件在磁盘上已不存在（如编号重命名后）→ reset 跳过备份不崩溃。"""
+        dd = tmp_path / "data"
+        runner.invoke(app, ["--data-dir", str(dd), "init"])
+
+        # 模拟：manifest 仍记录旧编号名，但磁盘上旧名已被重命名（不存在）
+        manifest_path = dd / ".scaffold-manifest"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"] = [
+            f.replace("pre-review/01-convert.py", "pre-review/00-convert.py")
+            for f in manifest["files"]
+        ]
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        assert not (dd / "pipelines" / "standard" / "pre-review" / "00-convert.py").exists()
+
+        result = runner.invoke(app, ["--data-dir", str(dd), "init", "--reset", "--yes"])
+        assert result.exit_code == 0
+        assert (dd / "pipelines" / "standard" / "pre-review" / "01-convert.py").exists()
+
+    def test_reset_confirm_defaults_to_yes(self, tmp_path):
+        """--reset 交互确认默认 Y：回车即确认重置。"""
+        dd = tmp_path / "data"
+        runner.invoke(app, ["--data-dir", str(dd), "init"])
+
+        result = runner.invoke(app, ["--data-dir", str(dd), "init", "--reset"], input="\n")
+        assert result.exit_code == 0
+        assert list(dd.glob("config.yaml.bak-*")), "回车默认确认，应产生备份"
 
 
 class TestHelp:

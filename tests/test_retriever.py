@@ -9,7 +9,7 @@ import pytest
 
 from helpers import make_mock_chunk_vecs, make_sample_paper
 from paper_review.search.chunker import chunk_paper
-from paper_review.search.retriever import rrf_fuse
+from paper_review.search.retriever import overlap_score, rrf_fuse
 from paper_review.search.store import (
     SearchResult,
     Store,
@@ -37,6 +37,27 @@ def _setup_store_with_papers(paper_defs: list[tuple[str, str]]) -> Store:
 
 class TestRrfFuse:
     """RRF 融合的正确性验证"""
+
+
+class TestOverlapScore:
+    """L3 技术特征覆盖度（ADR 0015）。"""
+
+    def test_full_coverage(self):
+        assert overlap_score(["A", "B", "C"], ["A", "B"]) == 1.0
+
+    def test_partial_coverage(self):
+        assert overlap_score(["A", "B", "C"], ["A", "D"]) == 0.5
+
+    def test_no_overlap(self):
+        assert overlap_score(["A"], ["B", "C"]) == 0.0
+
+    def test_empty_reference_returns_zero(self):
+        """Reference 无 features（冷启动）→ L3 失效，返回 0。"""
+        assert overlap_score(["A", "B"], []) == 0.0
+
+    def test_dedup_reference(self):
+        """Reference 重复词去重后作分母。"""
+        assert overlap_score(["A"], ["A", "A"]) == 1.0
 
     def test_rrf_fuse_empty_lists(self):
         """两个空列表 → 空结果"""

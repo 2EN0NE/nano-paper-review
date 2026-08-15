@@ -27,6 +27,7 @@ import numpy as np
 
 from paper_review.config import Config, load_config
 from paper_review.search.search_types import (  # noqa: F401 — 向后兼容 re-export
+    BM25_MAX_TOKENS,
     BODY_WEIGHT,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
@@ -138,12 +139,20 @@ class Store:
                 author_hint TEXT DEFAULT '',
                 arxiv_id TEXT DEFAULT '',
                 tags TEXT DEFAULT '[]',
+                features TEXT DEFAULT '[]',
                 pool TEXT DEFAULT 'history',
                 raw_text TEXT DEFAULT '',
                 pages INTEGER DEFAULT 1,
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
+
+        # 迁移：旧版 index.sqlite 的 papers 表无 features 列（ADR 0015 新增）。
+        # CREATE TABLE IF NOT EXISTS 对已存在的表是 no-op，不会补列，
+        # 需幂等 ALTER TABLE，否则 INSERT ... features 会报 "no such column"。
+        paper_cols = {row[1] for row in db.execute("PRAGMA table_info(papers)")}
+        if "features" not in paper_cols:
+            db.execute("ALTER TABLE papers ADD COLUMN features TEXT DEFAULT '[]'")
 
         db.execute("""
             CREATE TABLE IF NOT EXISTS chunks (
@@ -395,6 +404,7 @@ class Store:
                 author_hint=row["author_hint"],
                 arxiv_id=row["arxiv_id"],
                 tags=json.loads(row["tags"]) if row["tags"] else [],
+                features=json.loads(row["features"]) if row["features"] else [],
             )
             self.papers[pid] = Paper(
                 paper_id=pid,
@@ -503,11 +513,12 @@ class Store:
                 # 但跳过向量编码和 FAISS 索引
                 try:
                     db.execute("BEGIN IMMEDIATE")
+                    self._delete_paper_fts(paper.paper_id)
                     db.execute(
                         """INSERT OR REPLACE INTO papers
                            (paper_id, filepath, filename, title_hint, year, author_hint,
-                            arxiv_id, tags, pool, raw_text, pages)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            arxiv_id, tags, features, pool, raw_text, pages)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             paper.paper_id,
                             paper.filepath,
@@ -517,6 +528,7 @@ class Store:
                             paper.meta.author_hint,
                             paper.meta.arxiv_id,
                             json.dumps(paper.meta.tags, ensure_ascii=False),
+                            json.dumps(paper.meta.features, ensure_ascii=False),
                             paper.pool,
                             paper.raw_text,
                             paper.pages,
@@ -562,12 +574,13 @@ class Store:
 
         try:
             db.execute("BEGIN IMMEDIATE")
+            self._delete_paper_fts(paper.paper_id)
 
             db.execute(
                 """INSERT OR REPLACE INTO papers
                    (paper_id, filepath, filename, title_hint, year, author_hint,
-                    arxiv_id, tags, pool, raw_text, pages)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    arxiv_id, tags, features, pool, raw_text, pages)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     paper.paper_id,
                     paper.filepath,
@@ -577,6 +590,7 @@ class Store:
                     paper.meta.author_hint,
                     paper.meta.arxiv_id,
                     json.dumps(paper.meta.tags, ensure_ascii=False),
+                    json.dumps(paper.meta.features, ensure_ascii=False),
                     paper.pool,
                     paper.raw_text,
                     paper.pages,
@@ -648,6 +662,56 @@ class Store:
 
         return chunks
 
+    def update_tags(self, paper_id: str, tags: list[str]) -> bool:
+        """更新论文的技术标签（papers.tags 字段），实现标签库自动积累。
+
+        Review 阶段评分 Agent 输出每篇最重要的技术关键词标签（06-direct-scoring
+        的 data.tags），Post 阶段调用本方法写回索引，替代写死的关键词词表。
+        返回是否找到并更新了 paper。
+        """
+        if not tags:
+            return False
+        db = self.db
+        try:
+            cur = db.execute(
+                "UPDATE papers SET tags = ? WHERE paper_id = ?",
+                (json.dumps(tags, ensure_ascii=False), paper_id),
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        updated = cur.rowcount > 0
+        paper = self.papers.get(paper_id)
+        if paper is not None:
+            paper.meta.tags = list(tags)
+        return updated
+
+    def update_features(self, paper_id: str, features: list[str]) -> bool:
+        """更新论文的技术特征集（papers.features 字段，ADR 0015）。
+
+        Pre Phase 技术特征抽取步骤产出 LLM 抽取 + 词表兜底的并集技术方法关键词，
+        立即写回索引，作为后续检索 L3 精排的 Reference 侧数据源。
+        返回是否找到并更新了 paper。
+        """
+        if not features:
+            return False
+        db = self.db
+        try:
+            cur = db.execute(
+                "UPDATE papers SET features = ? WHERE paper_id = ?",
+                (json.dumps(features, ensure_ascii=False), paper_id),
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        updated = cur.rowcount > 0
+        paper = self.papers.get(paper_id)
+        if paper is not None:
+            paper.meta.features = list(features)
+        return updated
+
     # ---- bulk 批量索引（轻内存） ----
 
     def bulk_add_paper(
@@ -683,11 +747,12 @@ class Store:
             self.log(f"  DEDUP: content matches {existing_pid}, storing metadata only")
             try:
                 db.execute("BEGIN IMMEDIATE")
+                self._delete_paper_fts(paper.paper_id)
                 db.execute(
                     """INSERT OR REPLACE INTO papers
                        (paper_id, filepath, filename, title_hint, year, author_hint,
-                        arxiv_id, tags, pool, raw_text, pages)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        arxiv_id, tags, features, pool, raw_text, pages)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         paper.paper_id,
                         paper.filepath,
@@ -697,6 +762,7 @@ class Store:
                         paper.meta.author_hint,
                         paper.meta.arxiv_id,
                         json.dumps(paper.meta.tags, ensure_ascii=False),
+                        json.dumps(paper.meta.features, ensure_ascii=False),
                         paper.pool,
                         paper.raw_text,
                         paper.pages,
@@ -740,12 +806,13 @@ class Store:
 
         try:
             db.execute("BEGIN IMMEDIATE")
+            self._delete_paper_fts(paper.paper_id)
 
             db.execute(
                 """INSERT OR REPLACE INTO papers
                    (paper_id, filepath, filename, title_hint, year, author_hint,
-                    arxiv_id, tags, pool, raw_text, pages)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    arxiv_id, tags, features, pool, raw_text, pages)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     paper.paper_id,
                     paper.filepath,
@@ -755,6 +822,7 @@ class Store:
                     paper.meta.author_hint,
                     paper.meta.arxiv_id,
                     json.dumps(paper.meta.tags, ensure_ascii=False),
+                    json.dumps(paper.meta.features, ensure_ascii=False),
                     paper.pool,
                     paper.raw_text,
                     paper.pages,
@@ -821,6 +889,29 @@ class Store:
 
         return chunks
 
+    def _delete_paper_fts(self, paper_id: str) -> None:
+        """删除 paper 在 chunks_fts 的旧条目（ADR 0014）。
+
+        chunks_fts 是 FTS5 external content 表（content='chunks'），不参与
+        papers 表的外键 ``ON DELETE CASCADE``。``INSERT OR REPLACE INTO papers``
+        会级联删除 chunks 行，但 chunks_fts 残留孤儿 rowid，导致后续
+        ``bm25_search`` 抛 ``missing row``。故在 REPLACE 之前显式清理。
+
+        FTS5 external content 的 'delete' 命令必须提供所有列的值（含 indexed
+        的 ``text`` 列）；仅传 rowid 或传 NULL 会破坏索引（报
+        ``database disk image is malformed``）。
+        """
+        rows = self.db.execute(
+            "SELECT rowid, chunk_id, paper_id, text FROM chunks WHERE paper_id = ?",
+            (paper_id,),
+        ).fetchall()
+        for rowid, chunk_id, pid, text in rows:
+            self.db.execute(
+                """INSERT INTO chunks_fts(chunks_fts, rowid, chunk_id, paper_id, text)
+                   VALUES ('delete', ?, ?, ?, ?)""",
+                (rowid, chunk_id, pid, normalize_cjk_for_fts(text)),
+            )
+
     def remove_paper(self, paper_id: str):
         """从事务中移除论文（级联删除 chunks/向量/FTS）"""
         if paper_id not in self.papers:
@@ -830,17 +921,10 @@ class Store:
         paper = self.papers[paper_id]
         self.log(f"REMOVE: {paper_id} ({paper.meta.filename})")
 
-        # 手动删除 FTS 条目
+        # 手动删除 FTS 条目（external content 表的 'delete' 必须提供所有列的值，
+        # 仅传 rowid 会破坏索引，见 ADR 0014）
         chunk_ids = [cid for cid in self.chunks if cid.startswith(paper_id)]
-        for cid in chunk_ids:
-            row = self.db.execute(
-                "SELECT rowid FROM chunks_fts WHERE chunk_id = ?", (cid,)
-            ).fetchone()
-            if row:
-                self.db.execute(
-                    "INSERT INTO chunks_fts(chunks_fts, rowid) VALUES ('delete', ?)",
-                    (row[0],),
-                )
+        self._delete_paper_fts(paper_id)
 
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.execute("DELETE FROM papers WHERE paper_id = ?", (paper_id,))
@@ -863,9 +947,16 @@ class Store:
     ) -> list[tuple[str, float]]:
         """FTS5 BM25 检索，返回 [(chunk_id, score), ...]"""
         db = self.db
-        normalized_query = normalize_cjk_for_fts(query)
-        safe_query = normalized_query.replace('"', '""')
-        fts_query = f'"{safe_query}"'
+        # CJK 空格分词后按 token 前缀截断（见 BM25_MAX_TOKENS 说明）：长 query 的
+        # FTS5 默认 AND 语义会过严而几乎无结果（混入一个 reference 不含的实词即全灭），
+        # 标题位于前缀位置，截断后 OR 语义可稳定命中（BM25 是召回腿，recall 优先）。
+        tokens = [t for t in normalize_cjk_for_fts(query).split() if t.strip()][:BM25_MAX_TOKENS]
+        if not tokens:
+            return []
+        # 每个 token 用双引号包成单 token 短语：FTS5 特殊字符（: - ( ) * 等）在短语内
+        # 是字面量，避免裸 token 触发语法错误（如 "review:" → "no such column"、
+        # "foo-bar" → "no such column: bar"、不配对括号 → "syntax error"）。
+        fts_query = " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens)
 
         if pool_filter:
             rows = db.execute(
@@ -907,6 +998,7 @@ class Store:
         embed_model=None,
         reranker=None,
         exclude_content_hash: str | None = None,
+        subject_features: list[str] | None = None,
     ) -> list[SearchResult]:
         """chunk 级混合检索（委托 retriever.hybrid_search）。
 
@@ -939,10 +1031,11 @@ class Store:
             with_rerank=with_rerank,
             history_top_n=limit,
             pending_top_n=limit,
+            subject_features=subject_features,
         )
         # limit 语义：总结果数（history+pending 合并后截断）。
-        # 合并后按综合分全局排序，避免 history 块永远排在 pending 前导致后者被截断丢弃。
-        results.sort(key=lambda r: r.score, reverse=True)
+        # hybrid_search 已按 (overlap, vec 门槛, vec) 全局排序（ADR 0015），此处仅截断。
+        # 不再按 r.score 重排序：combined 在 overlap==0 处有跳变，会破坏全局排序。
         if limit and len(results) > limit:
             results = results[:limit]
         return results

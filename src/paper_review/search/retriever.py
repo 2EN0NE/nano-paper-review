@@ -28,6 +28,7 @@ from paper_review.search.search_types import (
     PENDING_TOP_N,
     RECALL_K,
     RRF_K,
+    VEC_GATE_THRESHOLD,
     VECTOR_DIM,
 )
 from paper_review.search.store import SearchResult, Store, deterministic_hash_vector
@@ -69,13 +70,23 @@ def rrf_fuse(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def _normalize_rrf(rrf_score: float, k: int = RRF_K) -> float:
-    """RRF 分数归一化到 [0, 1]。
+def overlap_score(subject_features: list[str], reference_features: list[str]) -> float:
+    """L3 技术特征覆盖度（ADR 0015）。
 
-    最大可能 RRF = 两条腿都 rank=0 命中 = 2/(k+1)。无精排时以此作为综合分。
+    ``|subject特征 ∩ reference特征| / |reference特征|``
+    方向性：Reference 的技术方法是否落在 Subject 的技术范围内。
+    reference_features 为空时返回 0.0（L3 失效，退 L2-only）。
     """
-    max_rrf = 2.0 / (k + 1)
-    return min(1.0, rrf_score / max_rrf)
+    if not reference_features:
+        return 0.0
+    ref_set = set(reference_features)
+    subj_set = set(subject_features)
+    return len(subj_set & ref_set) / len(ref_set)
+
+
+def _l3_sort_key(c: dict) -> tuple[float, bool, float]:
+    """L3 排序键（ADR 0015）：overlap 主键 + vec 软门槛 + vec tie-break。"""
+    return (c["overlap"], c["vector"] >= VEC_GATE_THRESHOLD, c["vector"])
 
 
 # ============================================================================
@@ -95,6 +106,7 @@ def hybrid_search(
     history_top_n: int = HISTORY_TOP_N,
     pending_top_n: int = PENDING_TOP_N,
     max_rerank_chunks: int = MAX_RERANK_CHUNKS,
+    subject_features: list[str] | None = None,
 ) -> list[SearchResult]:
     """chunk 级混合检索管道
 
@@ -193,21 +205,27 @@ def hybrid_search(
         )
         per_paper_count[paper.paper_id] = per_paper_count.get(paper.paper_id, 0) + 1
 
-    # ---- 6. 精排 chunk ----
+    # ---- 6. 精排 chunk（reranker 降为审计信息，ADR 0015）----
     rerank_map: dict[str, float] = {}
     if with_rerank and reranker is not None and reranker.is_loaded:
         chunks_to_rank = [c["chunk"] for c in candidate_chunks]
         ranked = reranker.rerank_chunks(query, chunks_to_rank)
         rerank_map = {c.chunk_id: s for c, s in ranked}
 
+    # L3 技术特征覆盖度（ADR 0015）：主排序键；rerank 分仅作审计
+    subj_features = subject_features or []
     for cand in candidate_chunks:
-        rerank_score = rerank_map.get(cand["chunk"].chunk_id, 0.0)
-        cand["rerank"] = rerank_score
-        cand["combined"] = rerank_score if rerank_map else _normalize_rrf(cand["rrf"])
+        cand["rerank"] = rerank_map.get(cand["chunk"].chunk_id, 0.0)
+        cand["overlap"] = overlap_score(subj_features, cand["paper"].meta.features)
 
-    # ---- 7. 按 pool 分组 + 截断 ----
+    # ---- 7. 按 pool 分组 + 截断（L3 Overlap 主键 + L2 软门槛 + vec tie-break）----
     def _finalize(cands: list[dict], top_n: int) -> list[dict]:
-        """按论文聚合，取每篇最高 combined 的 chunk 作代表，截断 top_n 篇。"""
+        """按论文聚合，L3 Overlap 主键 + L2 软门槛（vec 过阈值优先，不硬删）+ vec tie-break。
+
+        软门槛（不硬删）的理由：vec 在哈希降级/维度不匹配时无意义，硬删会误杀全部候选
+        （见 test_chunk_retrieval 的 mock 向量场景）；软门槛在 vec 有意义时把领域无关排后，
+        在 vec 无意义时退化为纯 (overlap, vec) 排序，结果不为空。
+        """
         by_paper: dict[str, dict] = {}
         for cand in cands:
             pid = cand["paper"].paper_id
@@ -216,10 +234,16 @@ def hybrid_search(
             by_paper[pid]["cands"].append(cand)
         items: list[dict] = []
         for entry in by_paper.values():
-            entry["cands"].sort(key=lambda c: c["combined"], reverse=True)
-            entry["combined"] = entry["cands"][0]["combined"]
+            # L3 Overlap 主键 + L2 软门槛（vec 过阈值优先）+ vec tie-break
+            entry["cands"].sort(key=_l3_sort_key, reverse=True)
+            top = entry["cands"][0]
+            entry["overlap"] = top["overlap"]
+            entry["vector"] = top["vector"]
+            # combined 语义：L3 有效（overlap>0）时 = overlap；L3 失效（冷启动）时退 L2 vec，
+            # 保证 score 在无 features 时仍有意义（而非恒 0）
+            entry["combined"] = top["overlap"] if top["overlap"] > 0 else top["vector"]
             items.append(entry)
-        items.sort(key=lambda e: e["combined"], reverse=True)
+        items.sort(key=_l3_sort_key, reverse=True)
         return items[:top_n]
 
     history_items = _finalize(
@@ -235,6 +259,9 @@ def hybrid_search(
         selected_items = pending_items
     else:
         selected_items = history_items + pending_items
+        # 全局排序（与 _finalize 相同元组键），避免 history 恒排在 pending 前，
+        # 供 Store.search 的全局 top-N 截断（ADR 0015：L3 主键 + L2 软门槛 + vec tie-break）。
+        selected_items.sort(key=_l3_sort_key, reverse=True)
 
     # ---- 8. 组装 SearchResult ----
     results: list[SearchResult] = []
@@ -259,6 +286,7 @@ def hybrid_search(
                 author_hint=paper.meta.author_hint,
                 arxiv_id=paper.meta.arxiv_id,
                 pages=paper.pages,
+                source_file=paper.filepath,
                 match_chunk_snippet=top["chunk"].text[:200],
                 matched_chunks=[c["chunk"].text for c in top_chunks],
                 tags=paper.meta.tags,

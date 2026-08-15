@@ -32,8 +32,19 @@ HISTORY_TOP_N = 5  # 精排输出：历史参考上限
 PENDING_TOP_N = 3  # 精排输出：本批次上限
 EVIDENCE_CHUNKS_PER_PAPER = 2  # 每篇给 Agent 的命中 chunk 原文数
 
+# L2 向量分门槛（ADR 0015）：低于此阈值的候选不进候选池（挡领域无关噪声）
+VEC_GATE_THRESHOLD = 0.3
+
 # query 生成 / 关键词提取共用的正文首段截断长度（ADR 0008）
 QUERY_FIRST_PARA_CHARS = 500
+
+# BM25 腿的 query token 上限（CJK 空格分词后，每个汉字/英文单词 = 1 token）。
+# query 为「标题 + 正文首段（约 500 字）」，直接喂 FTS5 会失效：
+#   - 双引号短语包裹：要求整段连续精确命中，长 query 恒空（历史 bug）；
+#   - 默认 AND 语义：要求所有 token 命中，query 里混入 reference 不含的实词即全灭。
+# BM25 是召回腿（recall），用 OR 语义保证召回充分；标题位于 query 最前，
+# 截取前 N 个 token 即近似标题，BM25 分数 + top_k 控制数量与排序。
+BM25_MAX_TOKENS = 16
 
 HEAD_WEIGHT = 5.0
 BODY_WEIGHT = 2.0
@@ -59,6 +70,7 @@ class PaperMeta:
     author_hint: str = ""
     arxiv_id: str = ""
     tags: list[str] = field(default_factory=list)
+    features: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -110,6 +122,7 @@ class SearchResult:
     author_hint: str = ""
     arxiv_id: str = ""
     pages: int = 0
+    source_file: str = ""  # 本地 PDF 绝对路径（供 Agent 溯源读原文）
     match_chunk_snippet: str = ""
     matched_chunks: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)

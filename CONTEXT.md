@@ -34,6 +34,14 @@ _Avoid_: 论文向量, doc embedding, paper vector
 以 Chunk 为匹配单位、聚合到论文时保留命中 Chunk 作为对比证据的检索方式。
 _Avoid_: 片段级检索, passage-level search
 
+**Technical Similarity**:
+技术相似。评审检索判断两篇论文“多像”的三层标尺，按粒度递增：Domain Similarity（领域相似，同一领域/来源）、Problem Similarity（问题相似，解决同一问题）、Method Similarity（方法相似，使用同一技术手段）。评审需要 Problem / Method 层，尤其 Method 层。
+_Avoid_: 语义相似, relevance, semantic similarity
+
+**Technical Feature Set**:
+技术特征集。一篇论文“用什么技术方法解决什么问题”的可检索签名，由 LLM 提取技术方法关键词构成。是 Method Similarity（L3）的检索载体；评审抽取技术标签时以其为参考。
+_Avoid_: 技术签名, method keywords, technical signature
+
 **History Pool**:
 已索引的历史论文集合（`pool="history"`），检索相似 Reference 的来源。
 _Avoid_: 历史库, historical corpus, reference corpus
@@ -76,7 +84,23 @@ _Avoid_: Stage
 输出：subject-manifest.json、索引状态、每篇 Subject 的相似文章检索结果（供 Review Phase 评分步骤读取）。
 
 **Review Phase**:
-核心单篇评审阶段。对每个 Subject 顺序执行一组 Step。所有 Step 共享 Subject 的同一份提取全文（原文约 5000 字，无需裁剪）。
+核心单篇评审阶段。对每个 Subject 顺序执行一组 Step。评分步骤（.md Agent 步骤）的 prompt 注入 Subject 的完整提取全文与 PDF 路径，供评分引用原文证据。
+
+**Direct Scoring**:
+直接打分。Review Phase 中评估技术方案价值维度的评分步骤，产出 6 个维度（创新性、质量提升效果、效能提升效果、风险敏感性、难度、业务价值提升效果）各 1-5 分，并抽取论文最重要的 3 个技术标签。
+_Avoid_: 直接分, direct score
+
+**Indirect Scoring**:
+间接打分。Review Phase 中评估论文自身质量维度的评分步骤，产出 6 个维度（行文严谨性、问题识别关键性、公式堆砌度、源码研究深度、业务规模真实性、前人调研充分度）各 1-5 分。要求客观（可验证）：每个维度须引用原文具体证据。
+_Avoid_: 间接分, indirect score
+
+**Correction Matrix**:
+修正矩阵。间接打分各维度按系数折算为直接打分的奖惩修正，得到最终结果分（粗筛用：区分好坏 + 基准线过滤）。
+_Avoid_: 修正表, correction table
+
+**Tag Library**:
+标签库。随评审积累的技术关键词集合：每篇评审参考 Technical Feature Set 抽取最重要的 3 个技术标签并持久化，随看过的文章自增长。既作为论文元数据（papers.tags），也是后续评审中 Reference 的 Technical Feature Set 来源。
+_Avoid_: 标签表, keyword list, tag set
 
 **Post Phase**:
 批量持久化与归档阶段。评审结果分流至两个管道：

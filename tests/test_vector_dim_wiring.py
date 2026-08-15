@@ -26,7 +26,7 @@ from paper_review.search.store import Store, deterministic_hash_vector
 def _store_with_config(vector_dim: int) -> Store:
     """构造 config.vector_dim 指定的 Store（模拟 config 命令写入了 768/1024）。"""
     store = Store(config=Config(vector_dim=vector_dim))
-    store.init_faiss()  # 无参调用 —— 与 cli.py / open_store / 01-auto-index 一致
+    store.init_faiss()  # 无参调用 —— 与 cli.py / open_store / 02-auto-index 一致
     return store
 
 

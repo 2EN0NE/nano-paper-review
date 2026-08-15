@@ -445,10 +445,10 @@ def status(ctx: typer.Context):
         typer.echo(f"  当前: {recorded or '未初始化'}（最新 {SCAFFOLD_VERSION}）")
     elif scaffold_status == "missing":
         typer.echo(f"  当前: 未知（旧快照，无版本记录）→ 最新 {SCAFFOLD_VERSION}")
-        typer.echo("  ⚠ 建议: paper-review init --reset")
+        typer.secho("  ⚠ 建议: paper-review init --reset", fg=typer.colors.YELLOW, bold=True)
     else:
         typer.echo(f"  当前: {recorded} → 最新 {SCAFFOLD_VERSION}")
-        typer.echo("  ⚠ 建议: paper-review init --reset")
+        typer.secho("  ⚠ 建议: paper-review init --reset", fg=typer.colors.YELLOW, bold=True)
 
 
 @app.command()
@@ -534,6 +534,11 @@ def review(
         False,
         "--skip-warnings",
         help="无人值守模式：跳过所有交互式确认和警告（未完成的任务会被标记为 abandoned，不再提示续做）",
+    ),
+    allow_degraded: bool = typer.Option(
+        False,
+        "--allow-degraded",
+        help="显式降级开关：允许 batch 阶段（pre/post）步骤失败后继续执行（默认失败即中断管线）",
     ),
 ):
     """
@@ -660,6 +665,7 @@ def review(
             target_step=step,
             pool_progress=progress,
             resume_task_dir=resume_task_dir,
+            allow_degraded=allow_degraded,
         )
     else:
         # pipeline_path 是 pipeline.yaml 文件
@@ -672,6 +678,7 @@ def review(
             target_step=step,
             pool_progress=progress,
             resume_task_dir=resume_task_dir,
+            allow_degraded=allow_degraded,
         )
 
     typer.echo(f"\nPipeline 完成: {result.subject}")
@@ -685,6 +692,13 @@ def review(
         typer.echo(f"  {icon} {sr.step_name}: {sr.status}")
         if sr.error:
             typer.echo(f"     └─ {sr.error}")
+
+    # warn 级降级项：终端醒目呈现（与 report.md 双通道，ADR 0014）
+    if result.degradation_warnings:
+        typer.echo("")
+        typer.echo("⚠ 降级项（结果为空，可能影响评审质量）:")
+        for w in result.degradation_warnings:
+            typer.echo(f"  ⚠ {w}")
 
     # 单篇论文：输出评审结论
     if result.conclusion:
@@ -771,9 +785,9 @@ def _maybe_warn_empty_index(data_dir: Path, skip_warnings: bool = False) -> None
         typer.echo("\n⚠ 索引数据库尚未建立。")
         typer.echo()
         typer.echo("  影响：评审时将没有历史参考文章用于相似度比对，")
-        typer.echo("        批量预检索（03-batch-search）将返回空结果。")
+        typer.echo("        批量预检索（05-batch-search）将返回空结果。")
         typer.echo()
-        typer.echo("  Pre Phase 的 01-auto-index 步骤将自动建立索引。")
+        typer.echo("  Pre Phase 的 02-auto-index 步骤将自动建立索引。")
         typer.echo("  也可通过 paper-review index 命令提前建立")
         typer.echo("  （详见 paper-review index --help）。")
         if not typer.confirm("\n  继续执行？", default=True):
@@ -803,7 +817,7 @@ def _maybe_warn_empty_index(data_dir: Path, skip_warnings: bool = False) -> None
 
     if count == 0 and not skip_warnings:
         typer.echo("\n⚠ 索引中尚无论文。检索步骤将返回空结果。")
-        typer.echo("  Pre Phase 的 01-auto-index 步骤将自动建立索引。")
+        typer.echo("  Pre Phase 的 02-auto-index 步骤将自动建立索引。")
         typer.echo("  也可通过 paper-review index 命令提前建立")
         typer.echo("  （详见 paper-review index --help）。")
         if not typer.confirm("  继续执行？", default=True):
@@ -855,7 +869,7 @@ def _reset_scaffold(
             typer.echo("  将删除以下孤儿文件（Scaffold Template 已移除，先备份）：")
             for f in to_delete:
                 typer.echo(f"    - {f}")
-        if not yes and not typer.confirm("  确认重置？", default=False):
+        if not yes and not typer.confirm("  确认重置？", default=True):
             typer.echo("  已取消，未做任何改动。")
             raise typer.Exit(0)
 
@@ -865,6 +879,8 @@ def _reset_scaffold(
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     for f in overwrite + to_delete:
+        if not f.exists():
+            continue  # 孤儿文件可能已在磁盘上不存在（如编号重命名后）
         backup = f.with_name(f"{f.name}.bak-{timestamp}")
         backup.write_bytes(f.read_bytes())
         typer.echo(f"  ✓ 备份 {f} → {backup}")
@@ -883,9 +899,10 @@ def _reset_scaffold(
             target.mkdir(parents=True, exist_ok=True)
             (target / f.name).write_text(f.read_text(encoding="utf-8"), encoding="utf-8")
 
-    # 删除孤儿文件（已备份）
+    # 删除孤儿文件（已备份；磁盘上不存在的直接跳过）
     for f in to_delete:
-        f.unlink()
+        if f.exists():
+            f.unlink()
         typer.echo(f"  ✓ 删除孤儿 {f}")
 
     write_manifest(dd, build_scaffold_files(templates_dir))
@@ -903,13 +920,21 @@ def _maybe_prompt_scaffold_update(dd: Path, skip_warnings: bool = False) -> bool
 
     typer.echo()
     if status == "missing":
-        typer.echo("⚠ 检测到旧版脚手架：未记录版本（可能早于 0.1.0）。")
+        typer.secho(
+            "⚠ 检测到旧版脚手架：未记录版本（可能早于 0.1.0）。",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
     else:
-        typer.echo(f"⚠ 脚手架版本已更新：{recorded} → {SCAFFOLD_VERSION}。")
+        typer.secho(
+            f"⚠ 脚手架版本已更新：{recorded} → {SCAFFOLD_VERSION}。",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
     typer.echo(
         "  Scaffold Template 已变化，当前管线步骤可能过时（如已删除/改名的步骤仍会被扫描执行）。"
     )
-    typer.echo("  建议：paper-review init --reset")
+    typer.secho("  建议：paper-review init --reset", fg=typer.colors.YELLOW, bold=True)
 
     if skip_warnings:
         typer.echo("  （无人值守模式）继续使用当前脚手架执行。")
@@ -1077,8 +1102,16 @@ def init(
         scaffold_status = check_scaffold(dd)
         if scaffold_status != "ok":
             typer.echo()
-            typer.echo("  ⚠ 脚手架版本检测：当前脚手架与 Scaffold Template 不一致。")
-            typer.echo("    Scaffold Template 已更新，建议 paper-review init --reset 同步。")
+            typer.secho(
+                "  ⚠ 脚手架版本检测：当前脚手架与 Scaffold Template 不一致。",
+                fg=typer.colors.YELLOW,
+                bold=True,
+            )
+            typer.secho(
+                "    Scaffold Template 已更新，建议 paper-review init --reset 同步。",
+                fg=typer.colors.YELLOW,
+                bold=True,
+            )
     else:
         write_manifest(dd, build_scaffold_files(templates_dir))
         typer.echo(f"  ✓ 脚手架版本 {SCAFFOLD_VERSION}")

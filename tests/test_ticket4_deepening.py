@@ -64,8 +64,8 @@ class TestPhaseConfigModes:
 
     def test_manifest_step_on_batch_phase(self):
         """mode=batch 阶段可声明 manifest_step。"""
-        cfg = PhaseConfig(name="pre", mode="batch", directory="pre/", manifest_step="00-convert")
-        assert cfg.manifest_step == "00-convert"
+        cfg = PhaseConfig(name="pre", mode="batch", directory="pre/", manifest_step="01-convert")
+        assert cfg.manifest_step == "01-convert"
 
     def test_manifest_step_defaults_empty(self):
         """manifest_step 未声明时为空字符串。"""
@@ -293,7 +293,7 @@ class TestRetryStep:
         counter = {"calls": 0}
 
         class FlakyExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 counter["calls"] += 1
                 if counter["calls"] < 3:
                     return StepResult(step_name=step.stem, status="error", error="fail")
@@ -374,7 +374,7 @@ class TestRetryStep:
         """execute 抛异常被捕获并标记为 error。"""
 
         class CrashExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 raise RuntimeError("boom")
 
         step = StepFile(path=Path("01-test.py"), stem="01-test", step_type="py")

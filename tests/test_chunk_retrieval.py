@@ -149,7 +149,7 @@ class TestSelfExclusion:
 
 class TestRerankIntegration:
     def test_search_with_reranker_uses_real_scores(self):
-        """精排分作为综合分，不伪造递减序列。"""
+        """精排分作为审计信息保留真实分数，不伪造递减序列（ADR 0015：rerank 退出排序）。"""
         store = _setup([("信用评估", "history"), ("图神经网络", "history")])
 
         class MockReranker:
@@ -165,6 +165,65 @@ class TestRerankIntegration:
 
         results = store.search("方法", with_rerank=True, reranker=MockReranker())
         assert len(results) > 0
-        # 综合分应等于真实精排分（>0），而非 1.000/0.999 递减
-        assert results[0].combined_score > 0.0
+        # rerank 分保留为审计信息（真实分数，>0），不再是 combined
         assert results[0].rerank_score > 0.0
+        # rerank 分数反映真实 chunk 长度（确定性），非伪造 1.0/0.999 递减
+        rerank_scores = [r.rerank_score for r in results]
+        assert rerank_scores == sorted(rerank_scores, reverse=True)
+
+
+class TestL3LayeredRerank:
+    """L3 分层精排（ADR 0015）：Overlap 主键 + vec tie-break + rerank 降级。"""
+
+    def _setup_with_features(self, paper_defs: list[tuple[str, str, list[str]]]) -> Store:
+        store = Store(":memory:")
+        for fid, pool, feats in paper_defs:
+            paper = make_sample_paper(fid, pool)
+            paper.meta.features = feats
+            chunks = chunk_paper(paper)
+            store.add_paper(paper, make_mock_chunk_vecs(chunks, dim=4))
+        return store
+
+    def test_overlap_orders_by_technical_hit(self):
+        """技术特征命中多的 Reference 排前（Overlap 主键）。"""
+        store = self._setup_with_features(
+            [
+                ("信用评估", "history", ["数据库", "SQL"]),
+                ("图神经网络", "history", ["图神经网络"]),
+            ]
+        )
+        results = store.search("方法", with_rerank=False, subject_features=["数据库", "SQL"])
+        assert len(results) == 2
+        # 信用评估 overlap = 2/2 = 1.0 > 图神经网络 0/1 = 0.0
+        assert results[0].paper_id == "test_信用评估"
+        assert results[0].score == 1.0
+
+    def test_rerank_does_not_override_overlap(self):
+        """rerank 分数不污染排序（rerank 降为审计信息，ADR 0015）。"""
+        store = self._setup_with_features(
+            [
+                ("信用评估", "history", ["数据库"]),
+                ("图神经网络", "history", []),
+            ]
+        )
+
+        class MockReranker:
+            is_loaded = True
+
+            def rerank_chunks(self, query, chunks):
+                # 让图神经网络的 rerank 分数更高（模拟 reranker 饱和无区分度）
+                return [(c, 0.99 if c.paper_id == "test_图神经网络" else 0.5) for c in chunks]
+
+        results = store.search(
+            "方法", with_rerank=True, reranker=MockReranker(), subject_features=["数据库"]
+        )
+        # 信用评估 overlap=1.0 排前，尽管 rerank 分数低（0.5 < 0.99）
+        assert results[0].paper_id == "test_信用评估"
+        # rerank 分仍保留为审计信息
+        assert results[0].rerank_score == 0.5
+
+    def test_cold_start_no_features_returns_results(self):
+        """冷启动（subject 无 features）不误杀，结果不为空（软门槛回归）。"""
+        store = self._setup_with_features([("信用评估", "history", ["数据库"])])
+        results = store.search("信用评估", with_rerank=False, subject_features=None)
+        assert len(results) == 1

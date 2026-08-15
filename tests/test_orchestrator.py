@@ -15,11 +15,15 @@ from unittest.mock import patch
 import pytest
 
 from paper_review.orchestrator import (
+    _FULLTEXT_MAX_CHARS,
+    _FULLTEXT_UNAVAILABLE_NOTE,
     PipelineConfig,
     _build_cli_tree,
+    _collect_degradation_warnings,
     _estimate_subject_chars,
     _execute_batch,
     _generate_report,
+    _load_subject_text,
     _retry_step,
     detect_unfinished_tasks,
     discover_steps,
@@ -66,7 +70,7 @@ class TestPipelineConfigParsing:
                         "mode": "batch",
                         "directory": "pre/",
                         "retry": {"max_attempts": 2, "on_failure": "abort"},
-                        "manifest_step": "00-convert",
+                        "manifest_step": "01-convert",
                     },
                     {
                         "name": "review",
@@ -93,7 +97,7 @@ class TestPipelineConfigParsing:
         review = cfg.phases[1]
         post = cfg.phases[2]
         assert pre.retry.max_attempts == 2
-        assert pre.manifest_step == "00-convert"
+        assert pre.manifest_step == "01-convert"
         assert review.subject_order is not None
         assert review.subject_order.sort_by == "name"
         assert review.subject_order.priority is not None
@@ -472,6 +476,189 @@ with open(os.path.join(step_dir, 'output.json'), 'w') as f:
         assert result.step_results[0].status == "ok"
 
 
+class TestSentinelAbort:
+    """哨兵：batch phase 有 step 失败时默认 abort（ADR 0014 止血策略）。
+
+    本次事故根因是「静默降级」——05-batch-search 失败被 on_failure=skip 吞掉，
+    后续 review 照常跑，用户拿到看似完整的 Excel。哨兵把默认行为改为：
+    batch phase（pre/post）有 step 失败 → 中断管线，除非显式 --allow-degraded。
+    """
+
+    def _make_failing_pipeline(self, tmp_path):
+        output_dir = tmp_path / "output"
+        pre_dir = tmp_path / "pre"
+        pre_dir.mkdir()
+        review_dir = tmp_path / "review"
+        review_dir.mkdir()
+        (pre_dir / "01-fail.py").write_text("raise RuntimeError('boom')")
+        (review_dir / "01-ok.py").write_text(
+            "import json, os; "
+            "d=os.environ['PIPELINE_STEP_DIR']; "
+            "os.makedirs(d, exist_ok=True); "
+            "json.dump({'step':'01-ok','status':'ok','error':None,'data':{}}, "
+            "open(os.path.join(d,'output.json'),'w'))"
+        )
+        pipeline_yaml = {
+            "name": "sentinel",
+            "output_dir": str(output_dir),
+            "phases": [
+                {"name": "pre", "mode": "batch", "directory": str(pre_dir.absolute())},
+                {"name": "review", "mode": "per_subject", "directory": str(review_dir.absolute())},
+            ],
+        }
+        return pipeline_yaml, output_dir, tmp_path / "subject-01.pdf"
+
+    def test_batch_failure_aborts_by_default(self, tmp_path):
+        """pre batch 有 step 失败 → 默认中断，不执行后续 review。"""
+        pipeline_yaml, _output_dir, input_path = self._make_failing_pipeline(tmp_path)
+        result = run_pipeline(pipeline_yaml=pipeline_yaml, input_path=input_path)
+
+        assert result.success is False
+        # review 阶段不应执行（pre 失败 abort）
+        executed = [r.step_name for r in result.step_results]
+        assert "01-fail" in executed
+        assert "01-ok" not in executed
+
+    def test_allow_degraded_continues_after_batch_failure(self, tmp_path):
+        """显式 --allow-degraded → 失败后继续执行后续 review。"""
+        pipeline_yaml, _output_dir, input_path = self._make_failing_pipeline(tmp_path)
+        result = run_pipeline(
+            pipeline_yaml=pipeline_yaml, input_path=input_path, allow_degraded=True
+        )
+
+        # 降级模式下 review 仍执行，但 overall_success 为 False（有失败 step）
+        executed = [r.step_name for r in result.step_results]
+        assert "01-ok" in executed
+        assert result.success is False
+
+
+class TestCollectDegradationWarnings:
+    """warn 级哨兵：结果空信号的收集（ADR 0014）。
+
+    与 abort 级（步骤失败）不同，这些是「步骤成功但结果为空」的信号，
+    可能是合法冷启动，也可能是闭环断裂——只标注不中断。
+    """
+
+    def _write(self, path: Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def _subject(self, task_dir: Path, name: str) -> Path:
+        d = task_dir / "intermediates" / name
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_all_empty_signals_collected(self, tmp_path):
+        """history/keywords/tags 全空 → 收集到对应降级项。"""
+        task_dir = tmp_path / "task"
+        sd = self._subject(task_dir, "subject-01")
+        self._write(
+            sd / "05-batch-search" / "output.json",
+            {
+                "step": "05-batch-search",
+                "status": "ok",
+                "data": {"history_count": 0, "pending_count": 0},
+            },
+        )
+        self._write(
+            sd / "04-extract-features" / "output.json",
+            {
+                "step": "04-extract-features",
+                "status": "ok",
+                "data": {"features": [], "feature_count": 0},
+            },
+        )
+        self._write(
+            sd / "06-direct-scoring" / "output.json",
+            {"step": "06-direct-scoring", "status": "ok", "data": {}},
+        )
+        self._write(
+            task_dir / "intermediates" / "post" / "09-archive-reports" / "output.json",
+            {"step": "09-archive-reports", "status": "ok", "data": {"tags_written": 0}},
+        )
+
+        warnings = _collect_degradation_warnings(task_dir)
+        assert any("history" in w for w in warnings)
+        assert any("技术特征" in w for w in warnings)
+        assert any("标签写回" in w for w in warnings)
+        assert any("标签缺失" in w for w in warnings)
+
+    def test_no_signals_returns_empty(self, tmp_path):
+        """信号非空（有 history/keywords/tags）→ 不产生降级项。"""
+        task_dir = tmp_path / "task"
+        sd = self._subject(task_dir, "subject-01")
+        self._write(
+            sd / "05-batch-search" / "output.json",
+            {
+                "step": "05-batch-search",
+                "status": "ok",
+                "data": {"history_count": 2, "pending_count": 1},
+            },
+        )
+        self._write(
+            sd / "04-extract-features" / "output.json",
+            {
+                "step": "04-extract-features",
+                "status": "ok",
+                "data": {"features": ["数据库"], "feature_count": 1},
+            },
+        )
+        self._write(
+            sd / "06-direct-scoring" / "output.json",
+            {"step": "06-direct-scoring", "status": "ok", "data": {"tags": ["数据库", "流量回放"]}},
+        )
+        self._write(
+            task_dir / "intermediates" / "post" / "09-archive-reports" / "output.json",
+            {"step": "09-archive-reports", "status": "ok", "data": {"tags_written": 1}},
+        )
+
+        assert _collect_degradation_warnings(task_dir) == []
+
+    def test_no_intermediates_returns_empty(self, tmp_path):
+        """intermediates 目录不存在 → 空列表。"""
+        assert _collect_degradation_warnings(tmp_path / "nonexistent") == []
+
+    def test_l3_coverage_low_warns(self, tmp_path):
+        """L3 技术特征覆盖率低 → warn（ADR 0015 不静默退化）。"""
+        task_dir = tmp_path / "task"
+        self._write(
+            task_dir / "intermediates" / "pre" / "04-extract-features" / "output.json",
+            {
+                "step": "04-extract-features",
+                "status": "ok",
+                "data": {
+                    "subject_count": 1,
+                    "features_written": 1,
+                    "l3_coverage": 0.1,
+                    "l3_covered": 1,
+                    "l3_total": 10,
+                },
+            },
+        )
+        warnings = _collect_degradation_warnings(task_dir)
+        assert any("覆盖率" in w for w in warnings)
+
+    def test_l3_coverage_ok_no_warn(self, tmp_path):
+        """L3 覆盖率充足 → 不 warn。"""
+        task_dir = tmp_path / "task"
+        self._write(
+            task_dir / "intermediates" / "pre" / "04-extract-features" / "output.json",
+            {
+                "step": "04-extract-features",
+                "status": "ok",
+                "data": {
+                    "subject_count": 1,
+                    "features_written": 1,
+                    "l3_coverage": 0.9,
+                    "l3_covered": 9,
+                    "l3_total": 10,
+                },
+            },
+        )
+        warnings = _collect_degradation_warnings(task_dir)
+        assert not any("覆盖率" in w for w in warnings)
+
+
 # ============================================================================
 # Resume — 未完成任务检测
 # ============================================================================
@@ -589,7 +776,7 @@ class TestResumeDetection:
         calls: list[str] = []
 
         class RecordingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 calls.append(step.stem)
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -637,7 +824,7 @@ class TestResumeDetection:
         calls: list[str] = []
 
         class RecordingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 calls.append(step.stem)
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -666,9 +853,9 @@ class TestResumeDetection:
     def test_review_reads_pre_per_subject_intermediates(self, tmp_path):
         """Review Phase 的 .md 模板变量能读到 Pre 阶段按 Subject 写的 intermediates。
 
-        批量预检索（03-batch-search）在 Pre Phase 执行，但按 Subject 布局写入
-        intermediates/{subject}/03-batch-search/output.json。Review Phase 的评分
-        .md 步骤通过 {intermediates.03-batch-search.data.*} 读取，依赖 orchestrator
+        批量预检索（05-batch-search）在 Pre Phase 执行，但按 Subject 布局写入
+        intermediates/{subject}/05-batch-search/output.json。Review Phase 的评分
+        .md 步骤通过 {intermediates.05-batch-search.data.*} 读取，依赖 orchestrator
         把这些 Pre 产物作为 prior_results 种子注入。
         """
         from paper_review.orchestrator import _run_steps_for_subject
@@ -676,17 +863,17 @@ class TestResumeDetection:
         captured_prior: list[list[StepResult]] = []
 
         class RecordingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 captured_prior.append(list(prior_results))
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
         result_base = tmp_path / "out"
-        batch_dir = result_base / "intermediates" / "s1" / "03-batch-search"
+        batch_dir = result_base / "intermediates" / "s1" / "05-batch-search"
         batch_dir.mkdir(parents=True)
         (batch_dir / "output.json").write_text(
             json.dumps(
                 {
-                    "step": "03-batch-search",
+                    "step": "05-batch-search",
                     "status": "ok",
                     "data": {"history": [{"title": "参考论文A"}], "pending": []},
                 }
@@ -694,7 +881,7 @@ class TestResumeDetection:
         )
 
         steps = [
-            StepFile(path=Path("03-direct-scoring.md"), stem="03-direct-scoring", step_type="md"),
+            StepFile(path=Path("06-direct-scoring.md"), stem="06-direct-scoring", step_type="md"),
         ]
         _run_steps_for_subject(
             subject="s1",
@@ -710,9 +897,9 @@ class TestResumeDetection:
             executor=RecordingExecutor(),
         )
 
-        # 第一个 review step 的 prior_results 应包含 Pre 的 03-batch-search 产物
+        # 第一个 review step 的 prior_results 应包含 Pre 的 05-batch-search 产物
         assert len(captured_prior) == 1
-        seeded = [r for r in captured_prior[0] if r.step_name == "03-batch-search"]
+        seeded = [r for r in captured_prior[0] if r.step_name == "05-batch-search"]
         assert len(seeded) == 1
         assert seeded[0].data == {"history": [{"title": "参考论文A"}], "pending": []}
 
@@ -1066,7 +1253,7 @@ class TestResumeDetection:
         calls: list[str] = []
 
         class RecordingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 calls.append(step.stem)
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -1475,7 +1662,7 @@ class TestRetryAbort:
         }
 
         class LoggingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 call_log.append(step.stem)
                 return results_map[step.stem]
 
@@ -1511,7 +1698,7 @@ class TestRetryAbort:
         call_count = [0]
 
         class FlakyThenOkExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 call_count[0] += 1
                 if call_count[0] < 3:
                     return StepResult(
@@ -1729,7 +1916,7 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
         class SlowExecutor:
             """每步 0.6s：单 subject 总耗时 1.2s，保证在 t≈1s 轮询时仍处于 RUNNING。"""
 
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 _time.sleep(0.6)
                 with step_lock:
@@ -1786,7 +1973,7 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
             """3 步共 2.4s > 单 subject 预算 1s：t≈2s 轮询必判超时（worker 仍在跑）；
             2.4s 完成（排空窗口内）→ 走排空恢复路径。"""
 
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 _time.sleep(0.8)
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -1846,7 +2033,7 @@ with open(os.path.join(step_dir, "output.json"), "w") as f:
         class StuckExecutor:
             """模拟卡死的 .py 步骤：阻塞直到测试释放（进程内无限执行）。"""
 
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 release.wait(timeout=60)
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -1894,7 +2081,7 @@ class TestStepGranularity:
         events: list[tuple[str, str]] = []
 
         class RecordingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 events.append((step.stem, subject))
                 return StepResult(step_name=step.stem, status="ok", subject=subject)
@@ -1941,7 +2128,7 @@ class TestStepGranularity:
         from paper_review.pipeline_models import PoolConfig
 
         class RecordingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 return StepResult(
                     step_name=step.stem, status="ok", subject=subject, data={"step": step.stem}
@@ -1984,7 +2171,7 @@ class TestStepGranularity:
         calls: list[tuple[str, str]] = []
 
         class FlakyExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 calls.append((step.stem, subject))
                 if step.stem == "01-a" and subject == "s2":
@@ -2039,7 +2226,7 @@ class TestStepGranularity:
         calls: list[tuple[str, str]] = []
 
         class MixedExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 calls.append((step.stem, subject))
                 if step.stem == "01-a" and subject == "s2":
@@ -2086,7 +2273,7 @@ class TestStepGranularity:
         from paper_review.pipeline_models import PoolConfig, PoolProgress
 
         class FlakyExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 if step.stem == "01-a" and subject == "s2":
                     return StepResult(
@@ -2130,7 +2317,7 @@ class TestStepGranularity:
         from paper_review.pipeline_models import PoolConfig
 
         class SlowExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 _time.sleep(0.4)
                 return StepResult(step_name=step.stem, status="ok", subject=subject)
@@ -2185,7 +2372,7 @@ class TestStepGranularity:
         class SlowExecutor:
             """每个 step 慢 0.3s——串行 8 个 subject 总耗时 > 超时预算。"""
 
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 _time.sleep(0.3)
                 with step_lock:
@@ -2234,7 +2421,7 @@ class TestStepGranularity:
         class SlowExecutor:
             """每步 0.4s：2 worker 下 6 个 subject 分 3 波，排队者晚于预算才开始。"""
 
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 subject = env.get("PIPELINE_SUBJECT", subject_name)
                 _time.sleep(0.4)
                 with step_lock:
@@ -2281,7 +2468,9 @@ class TestStepGranularity:
 
         def _run(step_duration: float):
             class SlowExecutor:
-                def execute(self, step, step_dir, env, prior_results, subject_name):
+                def execute(
+                    self, step, step_dir, env, prior_results, subject_name, subject_text=""
+                ):
                     _time.sleep(step_duration)
                     return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -2323,7 +2512,7 @@ class TestStepGranularity:
         class SlowExecutor:
             """2.5s > 单步预算 1s，但 < 排空窗口 30s：t≈2s 判超时后完成 → 应被收割为 ok。"""
 
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 _time.sleep(2.5)
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -2356,7 +2545,7 @@ class TestStepGranularity:
         captured: dict[str, list[str]] = {}
 
         class RecordingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 captured[step.stem] = [r.step_name for r in prior_results]
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -2392,7 +2581,7 @@ class TestStepGranularity:
         captured: dict[str, int] = {}
 
         class CapturingExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 captured[step.stem] = int(env.get("PIPELINE_STEP_TIMEOUT", "-1"))
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -2420,7 +2609,7 @@ class TestStepGranularity:
         from paper_review.pipeline_models import PoolProgress
 
         class OkExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
         pool_progress = PoolProgress()
@@ -2477,7 +2666,7 @@ class TestStepGranularity:
         class StuckExecutor:
             """模拟卡死的 .py 步骤：阻塞直到测试释放。"""
 
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 release.wait(timeout=60)
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
@@ -2606,7 +2795,7 @@ class TestDynamicProfile:
         class RateLimitedExecutor:
             """所有 step 返回 429 错误（通过 StepExecutor seam 注入）。"""
 
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 return StepResult(
                     step_name=step.stem,
                     status="error",
@@ -2667,7 +2856,7 @@ class TestDynamicProfile:
         )
 
         class OkExecutor:
-            def execute(self, step, step_dir, env, prior_results, subject_name):
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
                 return StepResult(step_name=step.stem, status="ok", subject=subject_name)
 
         steps = [StepFile(path=Path("01-test.py"), stem="01-test", step_type="py")]
@@ -2755,12 +2944,12 @@ class TestCliTree:
 
         config, pipe_dir = self._make_config(tmp_path)
         all_results = {
-            "pre": {"_batch_": [StepResult(step_name="00-convert", status="ok")]},
+            "pre": {"_batch_": [StepResult(step_name="01-convert", status="ok")]},
             "review": {},
             "post": {"_batch_": [StepResult(step_name="02-excel", status="ok")]},
         }
         # 添加 step 文件供 discover_steps 发现
-        (pipe_dir / "pre-review" / "00-convert.py").write_text("")
+        (pipe_dir / "pre-review" / "01-convert.py").write_text("")
         (pipe_dir / "post-review" / "02-excel.py").write_text("")
 
         tree = _build_cli_tree("id", "test", config, all_results, pipe_dir, Path("/tmp/t"))
@@ -2802,7 +2991,7 @@ class TestCliTree:
         from paper_review.pipeline_models import StepResult
 
         config, pipe_dir = self._make_config(tmp_path)
-        (pipe_dir / "pre-review" / "00-convert.py").write_text("")
+        (pipe_dir / "pre-review" / "01-convert.py").write_text("")
         (pipe_dir / "post-review" / "02-excel.py").write_text("")
 
         all_results = {
@@ -2949,6 +3138,108 @@ class TestEstimateSubjectChars:
         output_dir.mkdir()
         chars_list = _estimate_subject_chars([], output_dir)
         assert chars_list == []
+
+
+# ============================================================================
+# _load_subject_text — manifest → pdf_path → extract_pdf 全文提取
+# ============================================================================
+
+
+class TestLoadSubjectText:
+    """_load_subject_text() 从 manifest 读 PDF 路径并提取全文（评分 prompt 注入）。
+
+    失败/空文本返回占位提醒 _FULLTEXT_UNAVAILABLE_NOTE（非空），评分 prompt 据此
+    明确「无全文可比对」而非静默空串；超长全文截断到 _FULLTEXT_MAX_CHARS 并附加提醒。
+    """
+
+    def _write_manifest(self, output_dir: Path, subject: str, pdf_path: Path) -> None:
+        (output_dir / "subject-manifest.json").write_text(
+            json.dumps({"subjects": [{"name": subject, "pdf_path": str(pdf_path)}]}),
+            encoding="utf-8",
+        )
+
+    def test_extracts_text_from_manifest_pdf(self, tmp_path, monkeypatch):
+        """正常路径：manifest 有 subject、PDF 存在、extract_pdf 成功 → 返回全文 + 路径。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4 placeholder")
+        self._write_manifest(output_dir, "s1", pdf)
+        monkeypatch.setattr("paper_review.extractor.extract_pdf", lambda _p: "全文内容")
+
+        text, path = _load_subject_text("s1", output_dir)
+        assert text == "全文内容"
+        assert path == str(pdf)
+
+    def test_no_manifest_returns_unavailable_note(self, tmp_path):
+        """manifest 不存在 → 占位提醒（非空），不静默返回空串。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        text, path = _load_subject_text("s1", output_dir)
+        assert text == _FULLTEXT_UNAVAILABLE_NOTE
+        assert path == ""
+
+    def test_pdf_missing_returns_unavailable_note(self, tmp_path):
+        """manifest 有 subject 但 PDF 不存在 → 占位提醒。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        self._write_manifest(output_dir, "s1", tmp_path / "missing.pdf")
+        text, path = _load_subject_text("s1", output_dir)
+        assert text == _FULLTEXT_UNAVAILABLE_NOTE
+        assert path == ""
+
+    def test_extract_exception_returns_unavailable_note(self, tmp_path, monkeypatch):
+        """extract_pdf 抛异常 → 占位提醒（非空），不静默返回空串。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4 placeholder")
+        self._write_manifest(output_dir, "s1", pdf)
+
+        def _boom(_p: str) -> str:
+            raise RuntimeError("extract failed")
+
+        monkeypatch.setattr("paper_review.extractor.extract_pdf", _boom)
+        text, path = _load_subject_text("s1", output_dir)
+        assert text == _FULLTEXT_UNAVAILABLE_NOTE
+        assert path == ""
+
+    def test_empty_text_returns_unavailable_note(self, tmp_path, monkeypatch):
+        """extract_pdf 返回空串 → 占位提醒（非空），不静默返回空串。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4 placeholder")
+        self._write_manifest(output_dir, "s1", pdf)
+        monkeypatch.setattr("paper_review.extractor.extract_pdf", lambda _p: "")
+        text, path = _load_subject_text("s1", output_dir)
+        assert text == _FULLTEXT_UNAVAILABLE_NOTE
+        assert path == ""
+
+    def test_subject_not_in_manifest_returns_unavailable_note(self, tmp_path):
+        """manifest 存在但不含该 subject → 占位提醒。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        self._write_manifest(output_dir, "other", tmp_path / "other.pdf")
+        text, path = _load_subject_text("s1", output_dir)
+        assert text == _FULLTEXT_UNAVAILABLE_NOTE
+        assert path == ""
+
+    def test_truncates_long_text_with_note(self, tmp_path, monkeypatch):
+        """超长全文截断到 _FULLTEXT_MAX_CHARS，并在开头附加提醒。"""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        pdf = tmp_path / "paper.pdf"
+        pdf.write_bytes(b"%PDF-1.4 placeholder")
+        self._write_manifest(output_dir, "s1", pdf)
+        full_text = "字" * (_FULLTEXT_MAX_CHARS + 500)
+        monkeypatch.setattr("paper_review.extractor.extract_pdf", lambda _p: full_text)
+
+        text, path = _load_subject_text("s1", output_dir)
+        assert "超过" in text and "截断" in text  # 提醒存在
+        assert text.endswith("字" * _FULLTEXT_MAX_CHARS)  # 正文被截到上限
+        assert len(text) > _FULLTEXT_MAX_CHARS  # 提醒前缀使总长超过上限
+        assert path == str(pdf)
 
 
 # ============================================================================
