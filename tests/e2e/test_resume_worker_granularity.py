@@ -102,7 +102,7 @@ def _setup_pipeline(
         "  - name: pre\n"
         "    mode: batch\n"
         "    directory: pre-review/\n"
-        "    manifest_step: 00-convert\n"
+        "    manifest_step: 01-convert\n"
         "    duplicate_policy: skip\n"
         "    retry:\n"
         "      max_attempts: 1\n"
@@ -124,21 +124,21 @@ def _setup_pipeline(
         "      on_failure: skip\n"
     )
 
-    # pre-review/00-convert.py —— 直接拷贝真实模板
+    # pre-review/01-convert.py —— 直接拷贝真实模板
     src_convert = (
         Path(__file__).resolve().parent.parent.parent
         / "src"
         / "paper_review"
         / "templates"
         / "pre-review"
-        / "00-convert.py"
+        / "01-convert.py"
     )
     pre_dir = pipelines_dir / "pre-review"
     pre_dir.mkdir(parents=True, exist_ok=True)
     if src_convert.exists():
-        shutil.copy(src_convert, pre_dir / "00-convert.py")
+        shutil.copy(src_convert, pre_dir / "01-convert.py")
     else:  # pragma: no cover
-        (pre_dir / "00-convert.py").write_text(
+        (pre_dir / "01-convert.py").write_text(
             "import json, os, sys\n"
             "from pathlib import Path\n"
             "inp = Path(os.environ['PIPELINE_INPUT_PATH'])\n"
@@ -146,7 +146,7 @@ def _setup_pipeline(
             "subs = [{'name': f.stem, 'pdf_path': str(f), 'original_path': str(f)} for f in files]\n"
             "step_dir = Path(os.environ['PIPELINE_STEP_DIR'])\n"
             "step_dir.mkdir(parents=True, exist_ok=True)\n"
-            "out = {'step': '00-convert', 'status': 'ok', 'error': None, 'data': {'subjects': subs}}\n"
+            "out = {'step': '01-convert', 'status': 'ok', 'error': None, 'data': {'subjects': subs}}\n"
             "(step_dir / 'output.json').write_text(json.dumps(out, ensure_ascii=False))\n"
             "Path(os.environ['PIPELINE_OUTPUT_DIR']) / 'subject-manifest.json'\n"
             "import pathlib; pathlib.Path(os.environ['PIPELINE_OUTPUT_DIR']).mkdir(parents=True, exist_ok=True)\n"
