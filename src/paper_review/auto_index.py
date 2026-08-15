@@ -1,7 +1,7 @@
 """
 Auto-index 辅助函数 —— Sentinel 管理、PDF 复制冲突处理、Index 配置解析。
 
-由 01-auto-index.py Pre Phase 步骤导入使用。
+由 02-auto-index.py Pre Phase 步骤导入使用。
 """
 
 from __future__ import annotations

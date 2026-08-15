@@ -135,6 +135,7 @@ class PipelineProgress:
         self._spinner_idx = 0
         self._started = False
         self._finished = False
+        self._aborted = False
         self._lock = threading.Lock()
         self._tty = sys.stderr.isatty()
         # PAPER_REVIEW_FORCE_TTY=1 强制 ANSI 渲染（用于 TTY 检测误判的环境）
@@ -243,6 +244,15 @@ class PipelineProgress:
             st.running = len(st.running_subjects)
             self._render()
 
+    def mark_interrupted(self):
+        """标记中断（SIGINT 处理器内调用，仅轻量赋值，无 I/O/锁）。
+
+        CPython 的 Python 级信号处理器延迟到主线程 eval loop（C 扩展返回后）
+        才执行，无法在 ONNX/PyMuPDF 阻塞期间抢先停止 spinner——此处仅确保
+        中断抛出后渲染的是“已中断”而非“进行中/完成”态。
+        """
+        self._aborted = True
+
     def finish(self):
         """Final render and restore logging."""
         self._finished = True
@@ -340,7 +350,7 @@ class PipelineProgress:
         """进度卡激活期间将 sys.stdout 重定向到 devnull。
 
         .py 步骤经 runpy.run_path() 在主进程内执行，其 print() 直接写
-        sys.stdout（00-convert/01-auto-index/05-summarize/02-generate-excel
+        sys.stdout（01-convert/02-auto-index/08-summarize/10-generate-excel
         等模板步骤都有大量输出）。TTY 模式下这些输出与 stderr 进度卡
         混在同一终端，会把进度盒往下推，导致 ANSI 上移量（固定行数）
         与实际盒子位置错位——盒子顶部残留旧帧（残影）。
@@ -369,11 +379,15 @@ class PipelineProgress:
 
     def _spin(self):
         """Background spinner refresh (every 100ms)."""
-        while not self._finished:
+        while not self._finished and not self._aborted:
             with self._lock:
                 self._spinner_idx = (self._spinner_idx + 1) % len(_SPINNER)
                 self._render()
             time.sleep(0.1)
+        # 中断退出（非正常完成）：渲染一次“已中断”终态，此后不再有 spinner 刷新
+        if self._aborted and not self._finished:
+            with self._lock:
+                self._render()
 
     def _total_done(self) -> int:
         return sum(st.done for st in self._phases)
@@ -464,13 +478,13 @@ class PipelineProgress:
             lines.append(safe(self._phase_line(st, extra), _BOX_WIDTH))
 
         # Summary line
-        if self._finished:
-            ts = self._start_time_str()
-            elapsed = self._elapsed_str()
+        ts = self._start_time_str()
+        elapsed = self._elapsed_str()
+        if self._aborted:
+            summary = f"  已中断 ✗ {self._total_done()}/{self._total_steps()} ({self._pct()}%)    {ts}  已耗时 {elapsed}"
+        elif self._finished:
             summary = f"  总进度 ✓ {self._total_done()}/{self._total_steps()} ({self._pct()}%)    {ts}  总耗时 {elapsed}"
         else:
-            ts = self._start_time_str()
-            elapsed = self._elapsed_str()
             summary = f"  总进度 {spinner} {self._total_done()}/{self._total_steps()} ({self._pct()}%)    {ts}  已耗时 {elapsed}"
 
         # 动态池信息（workers / 超时倍数）追加到总结行

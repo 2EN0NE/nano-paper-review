@@ -241,3 +241,9 @@ logs/
 
 # 开发 scratch 工作笔记
 .scratch/
+
+# 美团技术博客 PDF 下载合集（逐年，每篇一个 PDF）
+meituan-blog-pdf/
+
+# 美团技术博客 PDF 下载工具的 node 依赖
+scripts/download_meituan_tech_pdf/node_modules/

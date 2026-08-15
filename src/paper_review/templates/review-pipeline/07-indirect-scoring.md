@@ -69,8 +69,10 @@
 ## 上下文信息
 
 - 论文名称: `{subject.name}`
-- 历史参考（已审论文，用于交叉验证前人调研和问题定位）: {intermediates.03-batch-search.data.history}
-- 本批次参考（同批待审论文）: {intermediates.03-batch-search.data.pending}
+- 论文全文: {subject.text}
+- 论文 PDF 路径（核对原文证据时可读取）: {subject.path}
+- 历史参考（已审论文，用于交叉验证前人调研和问题定位）: {intermediates.05-batch-search.data.history}
+- 本批次参考（同批待审论文）: {intermediates.05-batch-search.data.pending}
 
 > ⚠ 容错说明：若上面两组参考列表均为空（`[]`），说明索引库中没有找到可比对的历史论文（可能未建索引、或 reranker 不可用导致无结果）。此时**不要臆造任何参考来源**，相关维度应基于论文自身内容评分，并在 rationale 中注明「无相似论文可比对」。
 
@@ -78,11 +80,13 @@
 
 ## 输出格式
 
-请严格按照以下 JSON 格式输出（rationale 字段用自然语言写明打分理由）：
+请严格按以下 JSON 格式输出，**只输出这一个 JSON 对象，禁止输出 raw_output、Markdown 表格或任何其他包装**：
+
+- 每个维度的 `rationale` 必须**引用原文具体证据**（具体句子、章节号、数字/指标、图表），不得空泛（如“论证充分”）；证据取自上方「论文全文」。
 
 ```json
 {
-  "step": "04-indirect-scoring",
+  "step": "07-indirect-scoring",
   "status": "ok",
   "error": null,
   "data": {

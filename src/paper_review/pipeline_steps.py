@@ -47,6 +47,7 @@ class StepExecutor(Protocol):
         env: dict,
         prior_results: list[StepResult],
         subject_name: str,
+        subject_text: str = "",
     ) -> StepResult: ...
 
 
@@ -68,6 +69,7 @@ class PyStepRunner:
         env: dict,
         prior_results: list[StepResult] | None = None,
         subject_name: str = "",
+        subject_text: str = "",
     ) -> StepResult:
         logger.info("  [.py] %s — starting", step.stem)
 
@@ -152,6 +154,7 @@ class PromptBuilder:
         subject_name: str = "",
         subject_text: str = "",
         subject_meta: str = "{}",
+        subject_path: str = "",
         intermediates_dir: str = "",
         output_dir: str = "",
         step_dir: str = "",
@@ -176,6 +179,7 @@ class PromptBuilder:
             subject_name=subject_name,
             subject_text=subject_text,
             subject_meta=subject_meta,
+            subject_path=subject_path,
             step_dir=step_dir,
             intermediates_dir=intermediates_dir,
             output_dir=output_dir,
@@ -544,6 +548,7 @@ class MdStepExecutor:
             subject_name=subject_name,
             subject_text=subject_text,
             subject_meta=subject_meta,
+            subject_path=env.get("PIPELINE_SUBJECT_PATH", ""),
             intermediates_dir=env.get("PIPELINE_INTERMEDIATES", ""),
             output_dir=env.get("PIPELINE_OUTPUT_DIR", ""),
             step_dir=str(step_dir),
@@ -582,6 +587,7 @@ class InMemoryExecutor:
         env: dict,
         prior_results: list[StepResult] | None = None,
         subject_name: str = "",
+        subject_text: str = "",
     ) -> StepResult:
         return self.results.get(
             step.stem,
@@ -602,8 +608,11 @@ def _execute_step(
     subject_name: str,
     py_runner: PyStepRunner,
     md_executor: MdStepExecutor,
+    subject_text: str = "",
 ) -> StepResult:
     """根据步骤类型分派到 PyStepRunner 或 MdStepExecutor。"""
     if step.step_type == "py":
         return py_runner.execute(step, step_dir, env, prior_results, subject_name)
-    return md_executor.execute(step, step_dir, env, prior_results, subject_name)
+    return md_executor.execute(
+        step, step_dir, env, prior_results, subject_name, subject_text=subject_text
+    )

@@ -266,7 +266,7 @@ class TestProgressCardTuiNoGhosting:
 
         # 步骤 stdout（模板 print 前缀）不得出现在盒内 —— 被进度卡静音
         for line in box:
-            for marker in ("00-convert", "Auto-index", "05-summarize", "generate-excel"):
+            for marker in ("01-convert", "Auto-index", "08-summarize", "generate-excel"):
                 assert marker not in line, f"步骤输出混入进度盒: {line!r}\n{term.screen()}"
 
     def test_cli_summary_visible_below_box(self, tmp_path: Path):

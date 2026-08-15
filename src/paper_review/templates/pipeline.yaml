@@ -29,7 +29,7 @@ phases:
     directory: pre-review/ # 步骤脚本目录（相对于此 yaml 所在目录）
     display_name: 预处理 # 进度卡/报告显示名（空 → name 首字母大写）
     # manifest_step: 产 subject-manifest.json 的 step 名称（不含扩展名）
-    manifest_step: "00-convert"
+    manifest_step: "01-convert"
     # duplicate_policy: 同名 Subject 去重策略
     #   skip   — 以先出现的为准，后出现的跳过（默认）
     #   rename — 自动加后缀（如 论文A-1）

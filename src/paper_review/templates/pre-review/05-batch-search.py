@@ -1,13 +1,14 @@
 """
-03-batch-search.py — 批量预检索相似 Reference（Chunk-level Retrieval）
+05-batch-search.py — 批量预检索相似 Reference（Chunk-level Retrieval）
 
 对所有 Subject 一次性批量检索：模型（embedding + reranker）只加载一次，
 逐个 Subject 调 hybrid_search，结果按 history / pending 两组分别写入
-per-subject intermediates（intermediates/{subject}/03-batch-search/output.json），
+per-subject intermediates（intermediates/{subject}/05-batch-search/output.json），
 供 Review Phase 评分步骤通过模板变量读取（ADR 0007 / 0011）。
 
-每篇 Reference 携带：综合相似分 + 四个原始分 + 完整命中原文（不截断，
-ADR 0009）；并按 content_hash 排除与 Subject 内容相同的自身旧副本。
+每篇 Reference 携带：综合分（ADR 0015：L3 技术特征覆盖度，冷启动退化为 L2 向量分）
++ 四个原始分 + 完整命中原文（不截断，ADR 0009）；并按 content_hash 排除与
+Subject 内容相同的自身旧副本。
 """
 
 from __future__ import annotations
@@ -24,10 +25,12 @@ logger = logging.getLogger(__name__)
 def _serialize_result(r) -> dict:
     """把 SearchResult 序列化为给评审 Agent 呈现的 Reference dict。
 
-    三段呈现（ADR 0009）：综合分主线 + 四个原始分审计 + 完整命中原文。
+    三段呈现（ADR 0009）：综合分主线（combined_score：L3 技术特征覆盖度，
+    冷启动时退化为 L2 向量分）+ 四个原始分审计 + 完整命中原文。
     """
     return {
         "paper_id": r.paper_id,
+        "source_file": r.source_file,
         "title": r.title_hint,
         "author": r.author_hint,
         "year": r.year,
@@ -73,7 +76,7 @@ def _load_models(cfg):
 
 
 def _write_json(path: Path, payload: dict) -> None:
-    """写 JSON（对齐 01-auto-index 的容错模式）。"""
+    """写 JSON（对齐 02-auto-index 的容错模式）。"""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -88,7 +91,7 @@ def main():
     intermediates_dir = os.environ.get("PIPELINE_INTERMEDIATES", ".")
     data_dir = os.environ.get("PIPELINE_DATA_DIR", "")
 
-    # ── 读 manifest（00-convert 产出）──
+    # ── 读 manifest（01-convert 产出）──
     manifest_path = Path(output_dir) / "subject-manifest.json"
     subjects: list[dict] = []
     if manifest_path.exists():
@@ -98,9 +101,9 @@ def main():
         except (json.JSONDecodeError, OSError):
             print(f"  ⚠ 无法读取 manifest: {manifest_path}")
 
-    # ── 读 query 映射（02-generate-query 产出）──
+    # ── 读 query 映射（03-generate-query 产出）──
     queries: dict[str, str] = {}
-    query_path = Path(intermediates_dir) / "pre" / "02-generate-query" / "output.json"
+    query_path = Path(intermediates_dir) / "pre" / "03-generate-query" / "output.json"
     if query_path.exists():
         try:
             queries = (
@@ -110,6 +113,22 @@ def main():
             )
         except (json.JSONDecodeError, OSError):
             print(f"  ⚠ 无法读取 query 映射: {query_path}")
+
+    # ── 读 subject 技术特征映射（04-extract-features 产出，ADR 0015 L3 精排）──
+    subject_features: dict[str, list[str]] = {}
+    for subj in subjects:
+        feat_path = Path(intermediates_dir) / subj["name"] / "04-extract-features" / "output.json"
+        if feat_path.exists():
+            try:
+                feats = (
+                    json.loads(feat_path.read_text(encoding="utf-8"))
+                    .get("data", {})
+                    .get("features", [])
+                )
+                if isinstance(feats, list):
+                    subject_features[subj["name"]] = [str(x) for x in feats if str(x)]
+            except (json.JSONDecodeError, OSError):
+                pass
 
     # ── 打开 Store + 加载模型一次 ──
     from paper_review.config import load_config
@@ -128,7 +147,7 @@ def main():
     if os.path.exists(db_path):
         store = Store(db_path=db_path, config=cfg)
         store.load_for_search()
-        # 显式加载 FAISS 索引：01-auto-index 已写入 chunks.index。无 faiss 或
+        # 显式加载 FAISS 索引：02-auto-index 已写入 chunks.index。无 faiss 或
         # 索引文件缺失时优雅降级到内存暴力搜索（仍可用，只是大库性能差）。
         try:
             store.load_faiss()
@@ -163,6 +182,7 @@ def main():
                 exclude_content_hash=exclude_hash,
                 history_top_n=HISTORY_TOP_N,
                 pending_top_n=PENDING_TOP_N,
+                subject_features=subject_features.get(name),
             )
 
             history = [_serialize_result(r) for r in results if r.pool == "history"]
@@ -179,9 +199,9 @@ def main():
 
             # per-subject intermediates（Review Phase 模板变量读取）
             _write_json(
-                Path(intermediates_dir) / name / "03-batch-search" / "output.json",
+                Path(intermediates_dir) / name / "05-batch-search" / "output.json",
                 {
-                    "step": "03-batch-search",
+                    "step": "05-batch-search",
                     "status": "ok",
                     "error": None,
                     "data": subj_data,
@@ -190,9 +210,9 @@ def main():
 
         store.close()
 
-    # ── 汇总输出（intermediates/pre/03-batch-search/output.json）──
+    # ── 汇总输出（intermediates/pre/05-batch-search/output.json）──
     output = {
-        "step": "03-batch-search",
+        "step": "05-batch-search",
         "status": "ok",
         "error": None,
         "data": {
@@ -203,7 +223,7 @@ def main():
     _write_json(Path(step_dir) / "output.json", output)
 
     print(
-        f"03-batch-search: {len(per_subject_results)} subject(s) searched "
+        f"05-batch-search: {len(per_subject_results)} subject(s) searched "
         f"(embed={embed_used}, rerank={rerank_used})"
     )
 

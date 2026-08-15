@@ -1,7 +1,7 @@
 """
-01-auto-index.py — 自动建立 Reference Index
+02-auto-index.py — 自动建立 Reference Index
 
-在 00-convert.py 产出 subject-manifest.json 之后执行：
+在 01-convert.py 产出 subject-manifest.json 之后执行：
 (a) 首次运行时对 Reference Directory 全部 PDF 做一次性批量索引
 (b) 每次运行索引当前 Subjects（带 SHA-256 去重 + PDF 复制到 Reference Directory）
 """
@@ -25,7 +25,7 @@ def main():
     auto_index = os.environ.get("PIPELINE_INDEX_AUTO_INDEX", "1") == "1"
     copy_subjects = os.environ.get("PIPELINE_INDEX_COPY_SUBJECTS", "1") == "1"
 
-    # ── 前置依赖：00-convert 的 manifest ──
+    # ── 前置依赖：01-convert 的 manifest ──
     manifest_path = Path(output_dir) / "subject-manifest.json"
     manifest: dict = {}
     subjects: list[dict] = []
@@ -35,6 +35,9 @@ def main():
             subjects = manifest.get("subjects", [])
         except (json.JSONDecodeError, OSError):
             print(f"  ⚠ 无法读取 manifest: {manifest_path}")
+
+    # ── subject name → paper_id 映射（供 Post 阶段标签写回） ──
+    subject_paper_ids: dict[str, str] = {}
 
     # ── 计数 ──
     history_indexed = 0
@@ -153,6 +156,7 @@ def main():
 
                 meta = extract_meta(store_path.name)
                 paper_id = hashlib.sha256(str(store_path).encode()).hexdigest()[:12]
+                subject_paper_ids[stem] = paper_id
                 pages = count_pages(str(store_path))
 
                 paper = Paper(
@@ -191,7 +195,7 @@ def main():
     # 写 output.json
     # ═══════════════════════════════════════════════════════════
     output = {
-        "step": "01-auto-index",
+        "step": "02-auto-index",
         "status": "ok",
         "error": None,
         "data": {
@@ -202,6 +206,7 @@ def main():
             "conflict_renamed": conflict_renamed,
             "store_dir": str(store_dir),
             "reference_dir": str(reference_dir),
+            "subject_paper_ids": subject_paper_ids,
         },
     }
 
@@ -213,7 +218,7 @@ def main():
         print(f"  ✗ 写入 output.json 失败: {e}")
 
     print(
-        f"01-auto-index: history={history_indexed}, subjects={subjects_indexed}, "
+        f"02-auto-index: history={history_indexed}, subjects={subjects_indexed}, "
         f"dedup={dedup_skipped}, copied={copied}, renamed={conflict_renamed}"
     )
 

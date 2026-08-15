@@ -279,6 +279,62 @@ class TestProgressBuildLines:
 
 
 # ============================================================================
+# SIGINT 中断态渲染（mark_interrupted / _aborted）
+# ============================================================================
+
+
+class TestProgressAbortedState:
+    """mark_interrupted() / _aborted —— SIGINT 中断后的进度卡终态渲染。"""
+
+    def test_mark_interrupted_sets_aborted(self):
+        """mark_interrupted() 仅置 _aborted 标记，不触碰其它状态。"""
+        pp = PipelineProgress(pre_steps=1)
+        assert pp._aborted is False
+        pp.mark_interrupted()
+        assert pp._aborted is True
+        assert pp._finished is False
+
+    def test_build_lines_aborted_shows_interrupted_summary(self):
+        """中断态 summary 显示「已中断 ✗」，不显示「总进度 ✓」或 spinner。"""
+        pp = PipelineProgress(
+            pre_steps=1, review_subjects=1, review_steps_per_subject=1, post_steps=1
+        )
+        pp._start_time = 0.0
+        pp.mark_interrupted()
+        lines = _build_lines(pp)
+        summary = lines[4]
+        assert "已中断" in summary, f"Summary should show interrupted: {repr(summary)}"
+        assert "✗" in summary
+        assert "总进度" not in summary, "中断态不应显示进行中 summary"
+        assert "✓" not in summary, "中断态不应显示完成标记"
+
+    def test_aborted_overrides_finished_summary(self):
+        """同时 _aborted 与 _finished 时，中断态优先（中断更准确）。"""
+        pp = PipelineProgress(
+            pre_steps=1, review_subjects=1, review_steps_per_subject=1, post_steps=1
+        )
+        pp._start_time = 0.0
+        pp._finished = True
+        pp.mark_interrupted()
+        lines = _build_lines(pp)
+        summary = lines[4]
+        assert "已中断" in summary
+        assert "总进度 ✓" not in summary
+
+    def test_aborted_lines_within_box_width(self):
+        """中断态渲染的每一行仍在 box 宽度内（残影回归基线）。"""
+        pp = PipelineProgress(
+            pre_steps=5, review_subjects=10, review_steps_per_subject=10, post_steps=3
+        )
+        pp._start_time = 0.0
+        pp.review_subject_running("paper-A")
+        pp.update_dynamic_workers(active=8, current=8, timeout_multiplier=2.0)
+        pp.mark_interrupted()
+        lines = _build_lines(pp)
+        _assert_within_width(lines, _BOX_TOTAL)
+
+
+# ============================================================================
 # Layer 1b: ANSI 渲染行为（保留原有测试 + 增强）
 # ============================================================================
 
@@ -788,6 +844,29 @@ class TestProgressSpinnerLifecycle:
         pp._finished = True
         pp._spinner_thread.join(timeout=1.0)
         assert not pp._spinner_thread.is_alive(), "Spinner should stop after _finished=True"
+
+    def test_spin_stops_when_aborted(self):
+        """mark_interrupted() 置 _aborted 后 spinner 线程应在 1s 内停止。
+
+        _spin() 循环条件为 while not self._finished and not self._aborted。
+        中断退出时还会渲染一次「已中断」终态（_aborted and not _finished）。
+        """
+        import time
+
+        pp = PipelineProgress(pre_steps=1)
+        pp._tty = True
+        pp._start_time = time.time()
+        pp._started = True
+
+        pp._spinner_thread = threading.Thread(target=pp._spin, daemon=True)
+        pp._spinner_thread.start()
+
+        time.sleep(0.25)
+        assert pp._spinner_thread.is_alive(), "Spinner should be alive while not aborted"
+
+        pp.mark_interrupted()
+        pp._spinner_thread.join(timeout=1.0)
+        assert not pp._spinner_thread.is_alive(), "Spinner should stop after mark_interrupted()"
 
     def test_spinner_increments_index_each_tick(self):
         """每 100ms spinner_idx 递增（spin 周期生效）。"""

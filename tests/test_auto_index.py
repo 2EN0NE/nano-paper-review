@@ -1,5 +1,5 @@
 """
-01-auto-index 单元测试 — 哨兵检查、冲突文件重命名、index 配置解析。
+02-auto-index 单元测试 — 哨兵检查、冲突文件重命名、index 配置解析。
 
 测试 seam: 纯函数，无需 mock（遵守 SPEC.md 红线）。
 """

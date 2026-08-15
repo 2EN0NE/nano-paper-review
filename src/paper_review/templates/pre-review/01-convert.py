@@ -1,5 +1,5 @@
 """
-00-convert.py — 格式归一化：doc/docx → PDF + 产 Subject Manifest
+01-convert.py — 格式归一化：doc/docx → PDF + 产 Subject Manifest
 
 将输入目录中的 doc/docx 文件转换为 PDF，产 manifest 供下游步骤消费。
 仅 PDF 输入时：扫描目录写 manifest，不做转换。
@@ -290,7 +290,7 @@ def main():
 
     # ── 写 manifest ──
     manifest = {
-        "source": "00-convert",
+        "source": "01-convert",
         "total_input": len(files_to_process),
         "converted": len(results),
         "skipped": len(skipped),
@@ -304,7 +304,7 @@ def main():
 
     # ── 写本步骤的 output.json ──
     output = {
-        "step": "00-convert",
+        "step": "01-convert",
         "status": "ok",
         "error": None,
         "data": {
@@ -319,7 +319,7 @@ def main():
     with open(os.path.join(step_dir, "output.json"), "w") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print(f"00-convert: {len(results)} converted, {len(skipped)} skipped")
+    print(f"01-convert: {len(results)} converted, {len(skipped)} skipped")
     for s in skipped:
         print(f"  SKIP {s['name']}: {s['reason']}")
 

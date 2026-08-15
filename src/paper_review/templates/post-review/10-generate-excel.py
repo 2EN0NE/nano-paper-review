@@ -1,7 +1,7 @@
 """
-02-generate-excel.py — 生成 Excel 评审汇总表
+10-generate-excel.py — 生成 Excel 评审汇总表
 
-从每个 Subject 的 05-summarize 读取结构化评分，生成带 2 级合并表头的 Excel。
+从每个 Subject 的 08-summarize 读取结构化评分，生成带 2 级合并表头的 Excel。
 单篇论文也生成 Excel（一行数据），方便统一归档。
 
 Excel 列结构（两级表头，第 1 列为论文名称固定列）：
@@ -85,22 +85,22 @@ if _HAS_OPENPYXL:
 
 
 def _find_all_subjects(intermediates_dir: Path) -> list[str]:
-    """扫描 intermediates 目录，找到所有有 05-summarize 产出的 Subject。"""
+    """扫描 intermediates 目录，找到所有有 08-summarize 产出的 Subject。"""
     subjects: list[str] = []
     if not intermediates_dir.exists():
         return subjects
     for subj_dir in sorted(intermediates_dir.iterdir()):
         if not subj_dir.is_dir():
             continue
-        summ_path = subj_dir / "05-summarize" / "output.json"
+        summ_path = subj_dir / "08-summarize" / "output.json"
         if summ_path.exists():
             subjects.append(subj_dir.name)
     return subjects
 
 
 def _load_summarize(subject_name: str, intermediates_dir: Path) -> dict | None:
-    """加载某个 Subject 的 05-summarize output.json，返回 data 字段。"""
-    path = intermediates_dir / subject_name / "05-summarize" / "output.json"
+    """加载某个 Subject 的 08-summarize output.json，返回 data 字段。"""
+    path = intermediates_dir / subject_name / "08-summarize" / "output.json"
     if not path.exists():
         return None
     with open(path) as f:
@@ -131,9 +131,9 @@ def main():
     intermediates_dir = os.environ.get("PIPELINE_INTERMEDIATES", "")
 
     if not _HAS_OPENPYXL:
-        print("02-generate-excel: openpyxl not installed — skipping Excel generation")
+        print("10-generate-excel: openpyxl not installed — skipping Excel generation")
         output = {
-            "step": "02-generate-excel",
+            "step": "10-generate-excel",
             "status": "skipped",
             "error": "openpyxl not installed, Excel generation skipped",
             "data": {},
@@ -149,9 +149,9 @@ def main():
     subjects = _find_all_subjects(intermediates_path)
 
     if len(subjects) == 0:
-        print("02-generate-excel: no subjects — skipping Excel generation")
+        print("10-generate-excel: no subjects — skipping Excel generation")
         output = {
-            "step": "02-generate-excel",
+            "step": "10-generate-excel",
             "status": "skipped",
             "error": "No subjects found, Excel not generated",
             "data": {"subject_count": 0},
@@ -260,12 +260,12 @@ def main():
 
     wb.save(str(excel_path))
 
-    print(f"02-generate-excel: saved to {excel_path}")
+    print(f"10-generate-excel: saved to {excel_path}")
     print(f"  {len(subjects)} subjects, {total_cols} columns")
 
     # ── 写 output.json ──
     output = {
-        "step": "02-generate-excel",
+        "step": "10-generate-excel",
         "status": "ok",
         "error": None,
         "data": {

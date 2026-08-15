@@ -1,20 +1,36 @@
 """
-02-generate-query.py — 为每个 Subject 生成检索 query（标题 + 正文首段）
+03-generate-query.py — 为每个 Subject 生成检索 query（标题 + 正文首段）
 
 读 subject-manifest，对每个 Subject 提取 title_hint + 正文首段（约 500 字），
 拼成 query。同一个 query 同时喂给 BM25 与向量两条腿（ADR 0008）。
 
-query 写入 intermediates/pre/02-generate-query/output.json，供
-03-batch-search.py 批量检索时读取。
+query 写入 intermediates/pre/03-generate-query/output.json，供
+05-batch-search.py 批量检索时读取。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 from paper_review.search.search_types import QUERY_FIRST_PARA_CHARS
+
+# 网页打印 PDF 的页眉/页脚噪声（观察真实样本）：下载时间戳、页脚 URL、页码、阅读量
+_QUERY_NOISE_PATTERNS = [
+    re.compile(r"\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}"),  # 2026/7/25 20:40
+    re.compile(r"https?://\S+"),  # 页脚 URL
+    re.compile(r"^\s*\d+\s*/\s*\d+\s*$", re.MULTILINE),  # 独立页码 1/26
+    re.compile(r"^\s*\d+(?:\.\d+)?\s*[kKwW]\s*$", re.MULTILINE),  # 阅读量 2.7k
+]
+
+
+def _clean_query_text(text: str) -> str:
+    """剥离网页打印 PDF 的页眉/页脚噪声（时间戳、URL、页码、阅读量）。"""
+    for pat in _QUERY_NOISE_PATTERNS:
+        text = pat.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _build_query(name: str, pdf_path: Path) -> str:
@@ -30,7 +46,7 @@ def _build_query(name: str, pdf_path: Path) -> str:
     title_hint = (meta.title_hint or "").strip()
     # 正文首段截断长度：bge 语义 embedding 对标题+首段效果最好，
     # 过长会稀释标题语义、过短则信息不足（ADR 0008，常量单一来源）。
-    first_para = raw_text[:QUERY_FIRST_PARA_CHARS].strip()
+    first_para = _clean_query_text(raw_text[:QUERY_FIRST_PARA_CHARS])
 
     parts: list[str] = []
     if title_hint:
@@ -63,7 +79,7 @@ def main():
         queries[name] = _build_query(name, pdf_path)
 
     output = {
-        "step": "02-generate-query",
+        "step": "03-generate-query",
         "status": "ok",
         "error": None,
         "data": {
@@ -79,7 +95,7 @@ def main():
     except OSError as e:
         print(f"  ✗ 写入 output.json 失败: {e}")
 
-    print(f"02-generate-query: {len(queries)} query(s) generated")
+    print(f"03-generate-query: {len(queries)} query(s) generated")
 
 
 if __name__ == "__main__":

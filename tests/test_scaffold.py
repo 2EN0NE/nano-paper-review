@@ -39,11 +39,11 @@ class TestBuildScaffoldFiles:
     def test_maps_phase_files(self, tmp_path):
         td = _make_templates(
             tmp_path,
-            ["pre-review/00-convert.py", "review-pipeline/03-direct-scoring.md"],
+            ["pre-review/01-convert.py", "review-pipeline/06-direct-scoring.md"],
         )
         files = build_scaffold_files(td)
-        assert "pipelines/standard/pre-review/00-convert.py" in files
-        assert "pipelines/standard/review-pipeline/03-direct-scoring.md" in files
+        assert "pipelines/standard/pre-review/01-convert.py" in files
+        assert "pipelines/standard/review-pipeline/06-direct-scoring.md" in files
 
     def test_ignores_dotfiles(self, tmp_path):
         td = _make_templates(tmp_path, ["pre-review/.gitkeep"])
@@ -118,14 +118,14 @@ class TestFindOrphanFiles:
         assert find_orphan_files(data_dir, td) == []
 
     def test_no_manifest_scans_phase_dir(self, tmp_path):
-        td = _make_templates(tmp_path, ["review-pipeline/03-direct-scoring.md"])
+        td = _make_templates(tmp_path, ["review-pipeline/06-direct-scoring.md"])
         data_dir = tmp_path / "data"
         # 旧快照（无 manifest）：review-pipeline 里有模板已删除的 01-search.py
-        # 和模板仍保留的 03-direct-scoring.md → 只有 01 是孤儿
+        # 和模板仍保留的 06-direct-scoring.md → 只有 01 是孤儿
         orphan = data_dir / "pipelines" / "standard" / "review-pipeline" / "01-search.py"
         orphan.parent.mkdir(parents=True, exist_ok=True)
         orphan.write_text("old", encoding="utf-8")
-        kept = data_dir / "pipelines" / "standard" / "review-pipeline" / "03-direct-scoring.md"
+        kept = data_dir / "pipelines" / "standard" / "review-pipeline" / "06-direct-scoring.md"
         kept.write_text("new", encoding="utf-8")
         orphans = find_orphan_files(data_dir, td)
         assert orphans == [orphan]

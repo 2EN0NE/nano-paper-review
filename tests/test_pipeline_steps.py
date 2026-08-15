@@ -193,7 +193,7 @@ class TestAgentRunnerTimeout:
         try:
             result = runner.run(
                 prompt="test prompt",
-                step_stem="03-direct-scoring",
+                step_stem="06-direct-scoring",
                 step_dir=tmp_path / "step",
                 env={"PIPELINE_PI_BINARY": str(script)},
                 timeout=3,
@@ -216,7 +216,7 @@ class TestAgentRunnerTimeout:
         try:
             result = runner.run(
                 prompt="test prompt",
-                step_stem="04-indirect-scoring",
+                step_stem="07-indirect-scoring",
                 step_dir=tmp_path / "step",
                 env={"PIPELINE_PI_BINARY": str(script)},
                 timeout=3,
@@ -241,7 +241,7 @@ class TestAgentRunnerTimeout:
         try:
             result = runner.run(
                 prompt="test prompt",
-                step_stem="03-direct-scoring",
+                step_stem="06-direct-scoring",
                 step_dir=tmp_path / "step",
                 env={"PIPELINE_PI_BINARY": str(script)},
                 timeout=3,
@@ -507,6 +507,32 @@ class TestPromptBuilder:
         assert "01-search" in prompt
         # 用户内容在最后
         assert prompt.strip().endswith("# scoring step")
+
+    def test_injects_subject_text_and_path(self, tmp_path):
+        """回归：{subject.text} / {subject.path} 被注入评分 prompt（此前未传导致评分无全文）。"""
+        md = tmp_path / "06-direct-scoring.md"
+        md.write_text(
+            "论文全文: {subject.text}\n论文路径: {subject.path}\n",
+            encoding="utf-8",
+        )
+        step = StepFile(path=md, stem="06-direct-scoring", step_type="md")
+        prompt = PromptBuilder().build(
+            step=step,
+            prior_results=[],
+            subject_name="测试论文",
+            subject_text="这是论文的全文内容",
+            subject_path="/tmp/测试论文.pdf",
+        )
+        assert "这是论文的全文内容" in prompt
+        assert "/tmp/测试论文.pdf" in prompt
+
+    def test_subject_text_empty_when_not_provided(self, tmp_path):
+        """未提供 subject_text 时，{subject.text} 替换为空串，不残留占位符。"""
+        md = tmp_path / "06-direct-scoring.md"
+        md.write_text("全文: {subject.text}", encoding="utf-8")
+        step = StepFile(path=md, stem="06-direct-scoring", step_type="md")
+        prompt = PromptBuilder().build(step=step, prior_results=[])
+        assert "{subject.text}" not in prompt
 
 
 # ============================================================================

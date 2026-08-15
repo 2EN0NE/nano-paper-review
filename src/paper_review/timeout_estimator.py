@@ -2,7 +2,7 @@
 超时估算器 —— 基于论文数量和文本规模的动态超时控制。
 
 估算策略：
-- .py 步骤：固定 180s（本地计算，但 03-batch-search 含 embedding/reranker 真推理：
+- .py 步骤：固定 180s（本地计算，但 05-batch-search 含 embedding/reranker 真推理：
   50 候选逐条精排在 2C/4G 机器上需 10-40s，大库加载索引另计）
 - .md 步骤：基于 subject 文本长度 + subject 数量估算
   base_timeout = 60 + (total_chars / 1000) * 15
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # 常量
 _MIN_TIMEOUT = 60  # 最小单步超时（秒）
 _MAX_TIMEOUT = 900  # 最大单步超时（秒），对应 15 分钟
-# .py 步骤固定超时：03-batch-search 加载 embedding + reranker 真推理（50 候选逐条
+# .py 步骤固定超时：05-batch-search 加载 embedding + reranker 真推理（50 候选逐条
 # 精排 + 大库索引加载），2C/4G 机器实测可能超过原 60s 基准，故提升至 180s
 _PY_STEP_TIMEOUT = 180
 _CHARS_PER_SEC_FACTOR = 45  # 每千字符额外超时秒数（提高以覆盖 API 延迟波动）

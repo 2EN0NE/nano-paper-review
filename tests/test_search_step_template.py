@@ -1,7 +1,7 @@
-"""03-batch-search.py 管线模板测试 —— 验证批量预检索的优雅降级。
+"""05-batch-search.py 管线模板测试 —— 验证批量预检索的优雅降级。
 
 背景：检索步骤从 Review Phase 的 01-search.py 前移为 Pre Phase 的
-03-batch-search.py（批量预检索 + 模型加载一次）。本测试在无真实模型、
+05-batch-search.py（批量预检索 + 模型加载一次）。本测试在无真实模型、
 无 faiss 的环境中运行模板，验证：
   1. 无索引时优雅降级（不崩溃，产出空结果）
   2. 有索引但无模型/无 faiss 时仍能检索（哈希向量 + 内存暴力搜索降级）
@@ -23,12 +23,12 @@ from paper_review.search.store import Store
 
 TEMPLATE = (
     Path(__file__).resolve().parent.parent
-    / "src/paper_review/templates/pre-review/03-batch-search.py"
+    / "src/paper_review/templates/pre-review/05-batch-search.py"
 )
 
 
 def _run_template(env: dict) -> Path:
-    """用给定 env 运行 03-batch-search.py 模板（runpy 进程内），返回 step_dir。"""
+    """用给定 env 运行 05-batch-search.py 模板（runpy 进程内），返回 step_dir。"""
     step_dir = Path(env["PIPELINE_STEP_DIR"])
     step_dir.mkdir(parents=True, exist_ok=True)
     old_env = {k: os.environ.get(k) for k in env}
@@ -79,13 +79,13 @@ def _make_manifest(output_dir: Path, subject_name: str, pdf_path: Path) -> None:
 
 
 def _make_query(intermediates_dir: Path, subject_name: str, query: str) -> None:
-    """模拟 02-generate-query 的产物。"""
-    qdir = intermediates_dir / "pre" / "02-generate-query"
+    """模拟 03-generate-query 的产物。"""
+    qdir = intermediates_dir / "pre" / "03-generate-query"
     qdir.mkdir(parents=True, exist_ok=True)
     (qdir / "output.json").write_text(
         json.dumps(
             {
-                "step": "02-generate-query",
+                "step": "03-generate-query",
                 "status": "ok",
                 "data": {"queries": {subject_name: query}},
             }
@@ -111,7 +111,7 @@ def test_batch_search_without_index(tmp_path):
         }
     )
     data = json.loads(out.read_text())
-    assert data["step"] == "03-batch-search"
+    assert data["step"] == "05-batch-search"
     assert data["status"] == "ok"
     assert data["data"]["subject_count"] == 0
 
@@ -152,7 +152,7 @@ def test_batch_search_with_index_no_models(tmp_path):
     assert data["data"]["subject_count"] == 1
 
     # per-subject intermediates 按 history/pending 分组写入
-    per_subject = intermediates_dir / "subject" / "03-batch-search" / "output.json"
+    per_subject = intermediates_dir / "subject" / "05-batch-search" / "output.json"
     assert per_subject.exists()
     subj_data = json.loads(per_subject.read_text())
     assert subj_data["data"]["history_count"] >= 1

@@ -1,5 +1,5 @@
 """
-05-summarize.py — 间接标准修正直接标准，输出最终汇总评分
+08-summarize.py — 间接标准修正直接标准，输出最终汇总评分
 
 修正矩阵注释：
   间接标准各维度偏离中性值（3）时，按系数修正直接标准各维度：
@@ -212,8 +212,8 @@ def main():
     subject_name = os.environ.get("PIPELINE_SUBJECT", "")
 
     base = Path(intermediates_dir) / subject_name
-    direct_path = base / "03-direct-scoring" / "output.json"
-    indirect_path = base / "04-indirect-scoring" / "output.json"
+    direct_path = base / "06-direct-scoring" / "output.json"
+    indirect_path = base / "07-indirect-scoring" / "output.json"
 
     original_direct: dict[str, float] = {}
     indirect_scores: dict[str, float] = {}
@@ -248,13 +248,13 @@ def main():
         "indirect_scores": {dim: indirect_scores.get(dim, 3) for dim in INDIRECT_DIMS},
         "original_direct_scores": {dim: original_direct.get(dim, 3) for dim in DIRECT_DIMS},
     }
-    output = {"step": "05-summarize", "status": "ok", "error": None, "data": data}
+    output = {"step": "08-summarize", "status": "ok", "error": None, "data": data}
 
     os.makedirs(step_dir, exist_ok=True)
     with open(os.path.join(step_dir, "output.json"), "w") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
-    print("05-summarize: correction applied")
+    print("08-summarize: correction applied")
     for dim in DIRECT_DIMS:
         corr = corrections[dim]
         orig = original_direct.get(dim, 3)

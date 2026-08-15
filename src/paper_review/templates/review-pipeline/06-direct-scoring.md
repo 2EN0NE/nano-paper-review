@@ -83,22 +83,28 @@
 ## 上下文信息
 
 - 论文名称: `{subject.name}`
-- 历史参考（已审论文，按综合相似分降序）: {intermediates.03-batch-search.data.history}
-- 本批次参考（同批待审论文，已排除内容相同的自身）: {intermediates.03-batch-search.data.pending}
-- 提取的关键词（辅助信号）: {intermediates.04-extract-keywords.data.keywords}
+- 论文全文: {subject.text}
+- 论文 PDF 路径（核对原文证据时可读取）: {subject.path}
+- 历史参考（已审论文，按综合相似分降序）: {intermediates.05-batch-search.data.history}
+- 本批次参考（同批待审论文，已排除内容相同的自身）: {intermediates.05-batch-search.data.pending}
+- 提取的关键词（辅助信号）: {intermediates.04-extract-features.data.keywords}
 
 ---
 
 ## 输出格式
 
-请严格按照以下 JSON 格式输出（rationale 字段用自然语言写明打分理由及引用的依据来源）：
+请严格按以下 JSON 格式输出，**只输出这一个 JSON 对象，禁止输出 raw_output、Markdown 表格或任何其他包装**：
+
+- 每个维度的 `rationale` 必须**引用原文具体证据**（具体句子、章节号、数字/指标、图表），不得空泛（如“论证充分”）；证据取自上方「论文全文」。
+- `tags` 是论文的 **3 个最重要的技术关键词标签**（用于技术标签库积累），如 ["数据库容量评估", "流量回放", "SQL 时序控制"]。
 
 ```json
 {
-  "step": "03-direct-scoring",
+  "step": "06-direct-scoring",
   "status": "ok",
   "error": null,
   "data": {
+    "tags": ["标签1", "标签2", "标签3"],
     "创新性": {
       "score": 3,
       "rationale": "与参考论文A的2PC方案相比（相似文章对比），本文提出的XX协议减少了...。第3.2节图3提供了协议流程对比（论文举证材料），逻辑自洽。但缺少与更近期的方案B的对比（公开技术标准中的遗漏），综合判定为3分。"

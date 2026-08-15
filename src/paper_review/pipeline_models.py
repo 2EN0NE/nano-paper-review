@@ -438,6 +438,7 @@ class PipelineResult:
         default_factory=lambda: Path("")
     )  # run_pipeline 恒赋值；空值仅 dataclass 默认占位
     conclusion: str = ""
+    degradation_warnings: list[str] = field(default_factory=list)
 
 
 # ============================================================================
