@@ -130,6 +130,20 @@ def main():
             except (json.JSONDecodeError, OSError):
                 pass
 
+    # T4: Resume 断点续做——跳过已有 per-subject 产物的篇（不重复检索）
+    from paper_review.progress import load_existing_step_products, report_batch_progress
+
+    resume_skip = os.environ.get("PIPELINE_RESUME_SKIP_EXISTING") == "1"
+    existing_products: dict[str, dict] = {}
+    existing: set[str] = set()
+    if resume_skip:
+        existing_products = load_existing_step_products(
+            subjects, intermediates_dir, "05-batch-search"
+        )
+        existing = set(existing_products)
+        if existing:
+            print(f"05-batch-search: 续做复用 {len(existing)} 篇已检索产物")
+
     # ── 打开 Store + 加载模型一次 ──
     from paper_review.config import load_config
     from paper_review.search.retriever import hybrid_search
@@ -143,6 +157,7 @@ def main():
     per_subject_results: dict[str, dict] = {}
     embed_used = False
     rerank_used = False
+    reused = 0
 
     if os.path.exists(db_path):
         store = Store(db_path=db_path, config=cfg)
@@ -160,8 +175,15 @@ def main():
 
         from paper_review.extractor import extract_pdf
 
-        for subj in subjects:
+        total = len(subjects)
+        for i, subj in enumerate(subjects, 1):
             name = subj["name"]
+            if name in existing:
+                reused += 1
+                report_batch_progress(i, total, name, reused=reused)
+                # 恢复该篇检索结果到汇总（subject_count 语义保持总篇数，下游可读）
+                per_subject_results[name] = existing_products[name].get("data") or {}
+                continue
             query = queries.get(name) or name.replace("-", " ").replace("_", " ")
             pdf_path = Path(subj["pdf_path"])
 
@@ -207,6 +229,7 @@ def main():
                     "data": subj_data,
                 },
             )
+            report_batch_progress(i, total, name, reused=reused)
 
         store.close()
 
@@ -217,6 +240,7 @@ def main():
         "error": None,
         "data": {
             "subject_count": len(per_subject_results),
+            "reused_count": reused,
             "model": {"embedding_used": embed_used, "rerank_used": rerank_used},
         },
     }

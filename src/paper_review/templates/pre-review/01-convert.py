@@ -45,7 +45,7 @@ def _extract_pdf_text(pdf_path: Path) -> str:
         doc = fitz.open(str(pdf_path))
         text = ""
         for page in doc:
-            text += page.get_text()
+            text += str(page.get_text())  # fitz stubs 类型宽泛，实际恒返回 str
             if len(text) > 500:
                 break
         doc.close()
@@ -184,7 +184,14 @@ def main():
         )
 
     # ── 处理每个文件 ──
-    for f in files_to_process:
+    # T6: 断点续做——已有转换产物（pdf/{stem}.pdf）直接复用，避免 pandoc 重转
+    resume_skip = os.environ.get("PIPELINE_RESUME_SKIP_EXISTING") == "1"
+    from paper_review.progress import report_batch_progress
+
+    reused_convert = 0
+    total = len(files_to_process)
+    for i, f in enumerate(files_to_process, 1):
+        report_batch_progress(i, total, f.stem, reused=reused_convert)
         suffix = f.suffix.lower()
         stem = f.stem
 
@@ -203,7 +210,11 @@ def main():
             # docx → PDF
             pdf_base_dir.mkdir(parents=True, exist_ok=True)
             pdf_path = pdf_base_dir / (stem + ".pdf")
-            success, error = _convert_docx_to_pdf(f, pdf_path)
+            if resume_skip and pdf_path.exists() and _extract_pdf_text(pdf_path):
+                success, error = True, ""  # 复用已有转换产物（校验可解析，防半截产物）
+                reused_convert += 1
+            else:
+                success, error = _convert_docx_to_pdf(f, pdf_path)
             if success and pdf_path.exists():
                 results.append(
                     {
@@ -299,8 +310,14 @@ def main():
     }
 
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    try:
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        # manifest 是下游全部步骤的依赖——写失败必须上抛（步骤 error → 重试），
+        # 不得标记 ok（否则 resume 步骤级判定会永久固化缺失产物）。
+        print(f"  ✗ 写入 manifest 失败: {e}")
+        raise
 
     # ── 写本步骤的 output.json ──
     output = {
@@ -310,14 +327,23 @@ def main():
         "data": {
             "converted_count": len(results),
             "skipped_count": len(skipped),
+            "reused_count": reused_convert,
             "manifest_path": str(manifest_path),
             "manifest": manifest,
         },
     }
 
-    os.makedirs(step_dir, exist_ok=True)
-    with open(os.path.join(step_dir, "output.json"), "w") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+    try:
+        os.makedirs(step_dir, exist_ok=True)
+    except OSError as e:
+        print(f"  ✗ 创建目录失败: {e}")
+        raise
+    try:
+        with open(os.path.join(step_dir, "output.json"), "w") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"  ✗ 写入 output.json 失败: {e}")
+        raise
 
     print(f"01-convert: {len(results)} converted, {len(skipped)} skipped")
     for s in skipped:

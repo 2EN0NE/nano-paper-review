@@ -80,6 +80,28 @@ pre-review/
 
 Pre 的中间产物目录：`{output_dir}/intermediates/pre/{step_name}/`
 
+#### batch 步骤内部子进度（进度卡）
+
+Pre 步骤常含逐篇循环（格式转换、建索引、逐篇调 LLM、批量检索），耗时长且对进度卡不可见。
+实现：orchestrator 在 batch 步骤执行期间注入 `PIPELINE_BATCH_PROGRESS_FILE`（指向
+`{task_dir}/progress/{phase}-batch-step.json`）；步骤脚本在逐篇循环内调用
+`paper_review.progress.report_batch_progress(done, total, current, reused=0)` 上报（原子写
+JSON，env 未注入时 no-op）；进度卡 spinner 线程每 tick 轮询该文件，batch 行显示子进度
+（如 `预处理 ⠋ 2/5 · 04-extract-features 3/7 · paper-D`）。步骤结束 orchestrator 删除
+进度文件 → spinner 自动清空子进度。自定义步骤不调用则自动退化（零破坏）。
+
+#### Resume 断点续做（步骤级 + 步骤内增量）
+
+- **步骤级**：续做时逐 step 检查 `intermediates/pre/{step}/output.json`（status 为
+  ok/skipped 才算完成）——已完成步骤跳过（skipped），未完成步骤重跑（不再整个 Pre 重跑）。
+- **步骤内增量**：未完成步骤收到 `PIPELINE_RESUME_SKIP_EXISTING=1`；模板步骤经
+  `paper_review.progress.load_existing_step_products(subjects, intermediates_dir, step)`
+  读已有 per-subject 产物（`intermediates/{subject}/{step}/output.json`，status ok/skipped）
+  跳过该篇（不重复调 LLM/检索/embedding），汇总 output.json 记录 `reused_count`，进度
+  上报携带 `reused` 显示“N 复用”。
+- 门控与 review 阶段一致：仅当 input 路径与 subjects 列表与前序一致才允许复用产物
+  （否则全量重跑，避免跨批次混批）。
+
 ### Review Phase (per_subject)
 
 ```

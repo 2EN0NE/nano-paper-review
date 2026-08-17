@@ -1165,11 +1165,14 @@ class TestResumeDetection:
         assert (r3.task_dir / "intermediates" / "b" / "01-test" / "output.json").exists()
 
     def test_resume_pre_incomplete_is_rerun(self, tmp_path):
-        """续做：前序 Pre 未完成（最后一步产物缺失）时不得跳过 Pre。
+        """续做：前序 Pre 未完成（最后一步产物缺失）时，未完成的步骤必须重跑。
 
         回归：曾只比对 manifest subjects——manifest.subjects 是 Pre 运行前写入的，
         续做时 discover 对相同输入目录返回同一列表，等式恒真，导致"中断发生在
         Pre 阶段"时未完成的 Pre 被静默跳过，review 基于缺失产物运行。
+
+        T3 步骤级续做：已完成步骤（00-pre 产物 ok）跳过复用，未完成步骤（01-test
+        产物被删）重跑——比旧的"整个 Pre 重跑"更精细，且未完成部分绝不静默跳过。
         """
         output_dir = tmp_path / "output"
         steps_dir = tmp_path / "steps"
@@ -1245,9 +1248,17 @@ class TestResumeDetection:
         assert pre_last_out.exists()
         pre_last_out.unlink()
 
-        # 3) 续做相同输入 → Pre 必须重跑（run_count 2），而非被跳过
+        # 3) 续做相同输入 → 未完成的 01-test 必须重跑（不得静默跳过整个 Pre）
         r2 = run_pipeline(_pipeline_yaml(), pdf_dir, resume_task_dir=r1.task_dir)
-        assert _run_count() == 2, f"Pre 未完成时应重跑 Pre: {_run_count()}"
+        # T3 步骤级：00-pre 产物 ok → 跳过复用（run_count 不增）；01-test 产物被删 → 重跑
+        assert _run_count() == 1, f"00-pre 已完成应跳过复用: {_run_count()}"
+        # 01-test 重跑产物已生成
+        assert (r2.task_dir / "intermediates" / "pre" / "01-test" / "output.json").exists()
+        # 01-test 的 StepResult 状态为 ok（重跑成功），00-pre 为 skipped（复用）
+        pre_results = r2.step_results
+        by_name = {r.step_name: r.status for r in pre_results if r.subject == "_batch_"}
+        assert by_name.get("00-pre") == "skipped", f"00-pre 应 skipped: {by_name}"
+        assert by_name.get("01-test") == "ok", f"01-test 应重跑为 ok: {by_name}"
         assert r2.success
         # review 步骤产物齐全（a 的 output.json 重新生成）
         assert (r2.task_dir / "intermediates" / "a" / "01-test" / "output.json").exists()
@@ -1707,6 +1718,150 @@ class TestResumeDetection:
         assert r2.task_id == r1.task_id
         assert _run_count("paper") == 1, f"续做应跳过 review 步骤: {_run_count('paper')}"
         assert _run_count("other") == 1
+
+
+# ============================================================================
+# T3 — Pre 步骤级续做（已完成步骤跳过复用，未完成步骤重跑）
+# ============================================================================
+
+
+class TestResumePreStepLevel:
+    """Resume 时 Pre 阶段按步骤粒度续做（T3）。
+
+    中断在 Pre 中间步骤时，已完成步骤（产物 ok）跳过复用，未完成步骤重跑，
+    并向未完成步骤注入 PIPELINE_RESUME_SKIP_EXISTING=1（供步骤脚本内部断点续做）。
+    """
+
+    def _pipeline_yaml(self, output_dir: Path, steps_dir: Path) -> dict:
+        return {
+            "name": "resume-pre-step",
+            "output_dir": str(output_dir),
+            "phases": [
+                {
+                    "name": "pre",
+                    "mode": "batch",
+                    "directory": str(steps_dir.absolute()),
+                },
+                {
+                    "name": "review",
+                    "mode": "per_subject",
+                    "directory": str(steps_dir.absolute()),
+                },
+            ],
+        }
+
+    def _write_step(self, steps_dir: Path, stem: str, *, record_env: str | None = None) -> None:
+        """写一个 batch 步骤脚本：写 output.json；record_env 时把 env 值记入产物。"""
+        body = (
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "d = Path(os.environ['PIPELINE_STEP_DIR'])\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            f"out = {{'step': {stem!r}, 'status': 'ok', 'data': {{}}}}\n"
+        )
+        if record_env:
+            body += f"out['data'][{record_env!r}] = os.environ.get({record_env!r}, '')\n"
+        body += "(d / 'output.json').write_text(json.dumps(out))\n"
+        (steps_dir / f"{stem}.py").write_text(body)
+
+    def test_resume_pre_mid_step_skip_earlier_steps(self, tmp_path):
+        """中断在 Pre 中间步骤：已完成步骤跳过（skipped），未完成步骤重跑（ok）。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        for stem in ("00-pre", "01-mid", "02-last"):
+            self._write_step(steps_dir, stem)
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy")
+
+        r1 = run_pipeline(self._pipeline_yaml(output_dir, steps_dir), pdf_dir)
+        assert r1.success
+
+        # 模拟中断在 02-last：删除 02 产物（00/01 保留）
+        (r1.task_dir / "intermediates" / "pre" / "02-last" / "output.json").unlink()
+
+        r2 = run_pipeline(
+            self._pipeline_yaml(output_dir, steps_dir), pdf_dir, resume_task_dir=r1.task_dir
+        )
+        assert r2.success
+        by_name = {r.step_name: r.status for r in r2.step_results if r.subject == "_batch_"}
+        assert by_name == {"00-pre": "skipped", "01-mid": "skipped", "02-last": "ok"}, by_name
+        # 02-last 产物重跑已生成
+        assert (r2.task_dir / "intermediates" / "pre" / "02-last" / "output.json").exists()
+
+    def test_resume_pre_injects_skip_existing_env(self, tmp_path):
+        """未完成的 Pre 步骤收到 PIPELINE_RESUME_SKIP_EXISTING=1（供步骤脚本断点续做）。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        # 01-mid 记录收到的 SKIP_EXISTING 值
+        self._write_step(steps_dir, "00-pre")
+        self._write_step(steps_dir, "01-mid", record_env="PIPELINE_RESUME_SKIP_EXISTING")
+        self._write_step(steps_dir, "02-last", record_env="PIPELINE_RESUME_SKIP_EXISTING")
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy")
+
+        r1 = run_pipeline(self._pipeline_yaml(output_dir, steps_dir), pdf_dir)
+        assert r1.success
+        # 首次运行：record_env 的步骤收到 0
+        for stem in ("01-mid", "02-last"):
+            out = json.loads(
+                (r1.task_dir / "intermediates" / "pre" / stem / "output.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert out["data"].get("PIPELINE_RESUME_SKIP_EXISTING") == "0", stem
+
+        # 删除 01-mid / 02-last 产物（模拟中断在 01-mid）→ resume 时它们应收到 1
+        (r1.task_dir / "intermediates" / "pre" / "01-mid" / "output.json").unlink()
+        (r1.task_dir / "intermediates" / "pre" / "02-last" / "output.json").unlink()
+
+        r2 = run_pipeline(
+            self._pipeline_yaml(output_dir, steps_dir), pdf_dir, resume_task_dir=r1.task_dir
+        )
+        assert r2.success
+        for stem in ("01-mid", "02-last"):
+            out = json.loads(
+                (r2.task_dir / "intermediates" / "pre" / stem / "output.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert out["data"].get("PIPELINE_RESUME_SKIP_EXISTING") == "1", stem
+
+    def test_resume_pre_skip_existing_not_injected_on_mismatch(self, tmp_path):
+        """input 不一致时（禁止复用产物）不注入 SKIP_EXISTING，Pre 全量重跑。"""
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        self._write_step(steps_dir, "00-pre", record_env="PIPELINE_RESUME_SKIP_EXISTING")
+        self._write_step(steps_dir, "01-mid", record_env="PIPELINE_RESUME_SKIP_EXISTING")
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy")
+
+        r1 = run_pipeline(self._pipeline_yaml(output_dir, steps_dir), pdf_dir)
+        assert r1.success
+
+        # 不同目录同名 subject：input 不一致 → 全量重跑且不注入标志
+        pdf_dir2 = tmp_path / "pdfs2"
+        pdf_dir2.mkdir()
+        (pdf_dir2 / "a.pdf").write_text("dummy v2")
+        r2 = run_pipeline(
+            self._pipeline_yaml(output_dir, steps_dir), pdf_dir2, resume_task_dir=r1.task_dir
+        )
+        assert r2.success
+        for stem in ("00-pre", "01-mid"):
+            out = json.loads(
+                (r2.task_dir / "intermediates" / "pre" / stem / "output.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert out["data"].get("PIPELINE_RESUME_SKIP_EXISTING") == "0", stem
 
 
 # ============================================================================

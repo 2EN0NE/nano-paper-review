@@ -265,6 +265,7 @@ def main():
             print(f"  ⚠ 无法读取 manifest: {manifest_path}")
 
     from paper_review.extractor import extract_pdf
+    from paper_review.progress import load_existing_step_products, report_batch_progress
     from paper_review.search.store import Store
 
     # 匹配词表：自更新标签库优先，冷启动回退种子词表
@@ -292,8 +293,23 @@ def main():
 
     subject_count = 0
     features_written = 0
-    for subj in subjects:
+    # T4: Resume 断点续做——跳过已有 per-subject 产物的篇（不重复调 LLM）
+    resume_skip = os.environ.get("PIPELINE_RESUME_SKIP_EXISTING") == "1"
+    existing: set[str] = set()
+    if resume_skip:
+        existing = set(
+            load_existing_step_products(subjects, intermediates_dir, "04-extract-features")
+        )
+        if existing:
+            print(f"04-extract-features: 续做复用 {len(existing)} 篇已提取产物")
+    reused = 0
+    total = len(subjects)
+    for i, subj in enumerate(subjects, 1):
         name = subj["name"]
+        if name in existing:
+            reused += 1
+            report_batch_progress(i, total, name, reused=reused)
+            continue
         pdf_path = Path(subj["pdf_path"])
 
         try:
@@ -339,6 +355,7 @@ def main():
             },
         )
         subject_count += 1
+        report_batch_progress(i, total, name, reused=reused)
 
     # 统计 L3 覆盖率（索引中 features 非空的 paper 比例，ADR 0015 哨兵信号）
     l3_total = 0
@@ -358,7 +375,8 @@ def main():
         "status": "ok",
         "error": None,
         "data": {
-            "subject_count": subject_count,
+            "subject_count": total,  # 总篇数（含复用的 skipped 篇，与 05 语义一致）
+            "reused_count": reused,
             "features_written": features_written,
             "l3_coverage": l3_coverage,
             "l3_covered": l3_covered,

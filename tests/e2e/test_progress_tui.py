@@ -204,6 +204,86 @@ def _new_review_env(tmp_path: Path) -> tuple[Path, Path, dict]:
     return pdf, data_dir, env
 
 
+def _setup_batch_progress_pipeline(data_dir: Path) -> None:
+    """搭建含"逐篇上报进度"batch 步骤的管线（T1/T2 屏幕级验证）。
+
+    pre-review/01-progress.py：逐篇循环调用 report_batch_progress（每篇 sleep 模拟
+    耗时），验证进度文件→进度卡子进度显示链路在真实 TTY 下工作且无残影。
+    """
+    pipeline_dir = data_dir / "pipelines" / "progress-test"
+    pipeline_dir.mkdir(parents=True, exist_ok=True)
+    (pipeline_dir / "pipeline.yaml").write_text(
+        """\
+name: "progress-test"
+version: "2.0"
+phases:
+  - name: pre
+    mode: batch
+    directory: pre-review/
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+  - name: review
+    mode: per_subject
+    directory: review-pipeline/
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+    subject_order:
+      sort_by: name
+      direction: asc
+    pool:
+      workers: 1
+      timeout: 120
+      ordered: true
+  - name: post
+    mode: batch
+    directory: post-review/
+    duplicate_policy: skip
+    retry:
+      max_attempts: 1
+      on_failure: skip
+"""
+    )
+
+    pre_dir = pipeline_dir / "pre-review"
+    pre_dir.mkdir()
+    (pre_dir / "01-progress.py").write_text(
+        "import json, os, time\n"
+        "from pathlib import Path\n"
+        "from paper_review.progress import report_batch_progress\n"
+        "d = Path(os.environ['PIPELINE_STEP_DIR'])\n"
+        "d.mkdir(parents=True, exist_ok=True)\n"
+        "for i in (1, 2, 3):\n"
+        "    report_batch_progress(i, 3, f'paper-{i}')\n"
+        "    time.sleep(0.3)\n"
+        "(d / 'output.json').write_text("
+        "json.dumps({'step': '01-progress', 'status': 'ok', 'data': {}}))\n"
+    )
+
+    review_dir = pipeline_dir / "review-pipeline"
+    review_dir.mkdir()
+    (review_dir / "01-simple.py").write_text(
+        "import json, os\n"
+        "d = os.environ['PIPELINE_STEP_DIR']\n"
+        "os.makedirs(d, exist_ok=True)\n"
+        "json.dump({'step': '01-simple', 'status': 'ok', 'data': {}},"
+        "open(os.path.join(d, 'output.json'), 'w'))\n"
+    )
+
+    post_dir = pipeline_dir / "post-review"
+    post_dir.mkdir()
+    (post_dir / "01-archive.py").write_text(
+        "import json, os\n"
+        "d = os.environ['PIPELINE_STEP_DIR']\n"
+        "os.makedirs(d, exist_ok=True)\n"
+        "json.dump({'step': '01-archive', 'status': 'ok', 'data': {}},"
+        "open(os.path.join(d, 'output.json'), 'w'))\n"
+    )
+
+
 def _review_argv(data_dir: Path, pdf: Path) -> list[str]:
     return [
         _paper_review_bin(),
@@ -282,3 +362,48 @@ class TestProgressCardTuiNoGhosting:
         assert ("Pipeline 完成" in below) or ("Task ID" in below), (
             f"stdout 未恢复：盒下方无 CLI 汇总输出\n----- 屏幕 -----\n{term.screen()}"
         )
+
+
+class TestProgressCardBatchSubProgress:
+    """T1/T2: batch 步骤子进度在真实 TTY 下渲染且无残影（屏幕级）。"""
+
+    def test_batch_sub_progress_rendered_without_ghosting(self, tmp_path: Path):
+        """自定义 batch 步骤循环上报子进度：字节流含子进度，最终屏幕盒子完整无残留。
+
+        断言目标始终是最终屏幕：运行中渲染的子进度（`01-progress 3/3`）只存在于
+        字节流；步骤结束进度文件被删 → spinner 清空子进度，最终屏幕盒内无残留。
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "index").mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+        _setup_batch_progress_pipeline(data_dir)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        pdf = input_dir / "test-paper.pdf"
+        _make_pdf(pdf, "batch sub progress tui paper")
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+        env["TERM"] = "xterm-256color"
+
+        raw = _run_cli_in_pty(_review_argv(data_dir, pdf), env)
+        text = raw.decode("utf-8", "replace")
+
+        # 运行中渲染过子进度（逐篇上报链路生效）
+        assert "01-progress" in text, f"子进度未渲染: {text[:600]}"
+        assert "3/3" in text, f"子进度未到达最终值: {text[:600]}"
+
+        # 最终屏幕：盒子完整无残影
+        term = _replay(raw)
+        lines = term.screen().split("\n")
+        tops, bottoms = _box_indexes(lines)
+        assert len(tops) == 1, f"残影：顶边框多行\n{term.screen()}"
+        assert len(bottoms) == 1, f"残影：底边框多行\n{term.screen()}"
+        assert bottoms[0] - tops[0] == _BOX_HEIGHT - 1, f"盒子高度异常\n{term.screen()}"
+        # 步骤结束进度文件被删 → 子进度清空，最终屏幕盒内无残留
+        box = lines[tops[0] : tops[0] + _BOX_HEIGHT]
+        for line in box:
+            assert "01-progress" not in line, f"子进度残留盒内: {line!r}\n{term.screen()}"

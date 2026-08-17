@@ -270,16 +270,44 @@ def _execute_batch(
     executor: StepExecutor,
     pp: PipelineProgress | None = None,
     step_timeout: int = 0,
+    skip_steps: set[str] | None = None,
+    resume_skip_existing: bool = False,
 ) -> dict[str, list[StepResult]]:
     """批量模式：所有 Step 对 sentinel subject _batch_ 执行一次。
 
     用于 Pre / Post 阶段（mode=batch）。
+
+    skip_steps: Resume 时产物已验证存在的步骤名集合——跳过（复用产物，不重跑）。
+    resume_skip_existing: 注入 PIPELINE_RESUME_SKIP_EXISTING=1，步骤脚本内部跳过
+        已有 per-subject 产物的 Subject（Pre 大步骤内部断点续做，T3/T4）。
     """
     results: list[StepResult] = []
     result_base = base_env.get("PIPELINE_RESULT_DIR", str(output_dir))
 
+    # T1: batch 步骤内部子进度文件——orchestrator 注入路径，spinner 轮询显示。
+    # 步骤脚本经 report_batch_progress() 写入；步骤执行前后清空/删除文件。
+    progress_file: Path | None = None
+    if pp is not None:
+        progress_file = Path(result_base) / "progress" / f"{phase.name}-batch-step.json"
+        try:
+            progress_file.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            progress_file = None
+        if progress_file is not None:
+            pp.set_batch_progress_file(phase.name, str(progress_file))
+
+    skip_steps = skip_steps or set()
     for step in steps:
         step_dir = Path(result_base) / "intermediates" / phase.name / step.stem
+
+        # T3: Resume 时跳过已验证完成的步骤（产物存在且 status ok/skipped）
+        if step.stem in skip_steps:
+            logger.info("  [_batch_] ⏭ step '%s' skipped (resume: pre product exists)", step.stem)
+            results.append(StepResult(step_name=step.stem, status="skipped", subject="_batch_"))
+            if pp:
+                pp.phase_step_done(phase.name)
+            continue
+
         env = _apply_agent_overrides(
             {
                 **base_env,
@@ -288,9 +316,14 @@ def _execute_batch(
                 "PIPELINE_STEP_NAME": step.stem,
                 "PIPELINE_INTERMEDIATES": str(Path(result_base) / "intermediates"),
                 "PIPELINE_DUPLICATE_POLICY": phase.duplicate_policy,
+                # T3: Pre 大步骤内部断点续做标志（步骤脚本跳过已有 per-subject 产物）
+                "PIPELINE_RESUME_SKIP_EXISTING": "1" if resume_skip_existing else "0",
             },
             phase.agent,
         )
+        if progress_file is not None:
+            env["PIPELINE_BATCH_PROGRESS_FILE"] = str(progress_file)
+            _safe_unlink(progress_file)  # 清空上一步残留
 
         result = _retry_step(
             step=step,
@@ -304,6 +337,11 @@ def _execute_batch(
         )
         results.append(result)
 
+        if progress_file is not None:
+            _safe_unlink(progress_file)  # 步骤结束删除 → spinner 清空子进度
+        if pp:
+            pp.clear_batch_detail(phase.name)  # 同步清除，保证最终渲染不残留
+
         # Progress — batch phase step done
         if pp:
             pp.phase_step_done(phase.name)
@@ -313,6 +351,14 @@ def _execute_batch(
             break
 
     return {"_batch_": results}
+
+
+def _safe_unlink(path: Path) -> None:
+    """尽力删除文件（缺失/权限失败静默）。"""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("failed to unlink %s", path)
 
 
 # ============================================================================
@@ -1877,6 +1923,11 @@ def run_pipeline(
     # 换输入目录后续做时禁止跳过——同名 subject（如不同目录下的 paper.pdf）
     # 的旧产物会被静默复用，跨批次混批。pipeline 名不参与（续做使用当前配置）。
     resume_skip_completed = False
+    # T3: Resume 时 Pre 步骤级完成判定——产物存在且 status ok/skipped 的步骤名集合。
+    # 部分完成的 Pre 不再全量重跑：已完成步骤跳过，未完成步骤带 SKIP_EXISTING 续做。
+    pre_phase: PhaseConfig | None = None
+    pre_steps: list[StepFile] = []
+    pre_step_skip: set[str] = set()
     if resume_mode:
         prev_manifest = read_task_manifest(task_dir)
         # Pre 阶段 = 首个 per_subject 阶段之前的 batch 阶段。曾取 active_phases 中
@@ -1890,22 +1941,22 @@ def run_pipeline(
             if per_subject_idx is not None
             else None
         )
-        pre_complete = False
         if pre_phase is not None:
             pre_steps = discover_steps(pipeline_dir / pre_phase.directory)
-            if pre_steps:
-                last_pre_out = (
-                    task_dir / "intermediates" / pre_phase.name / pre_steps[-1].stem / "output.json"
-                )
-                # 与 review 步骤跳过同一原则：产物存在且 status 为 ok/skipped 才算 Pre 完成。
+            for sf in pre_steps:
+                step_out = task_dir / "intermediates" / pre_phase.name / sf.stem / "output.json"
+                # 与 review 步骤跳过同一原则：产物存在且 status 为 ok/skipped 才算完成。
                 # 曾只判存在——status=error 的失败产物（如 index 构建失败）被静默跳过，
                 # 续做时失败状态被永久固化（与 ADR 0005“失败产物续做时重跑”原则矛盾）。
-                if last_pre_out.exists():
+                if step_out.exists():
                     try:
-                        out = json.loads(last_pre_out.read_text(encoding="utf-8"))
-                        pre_complete = out.get("status", "ok") in ("ok", "skipped")
+                        out = json.loads(step_out.read_text(encoding="utf-8"))
+                        if out.get("status", "ok") in ("ok", "skipped"):
+                            pre_step_skip.add(sf.stem)
                     except (json.JSONDecodeError, OSError):
-                        pre_complete = False  # 产物损坏 → 视作未完成，重跑 Pre
+                        logger.debug(
+                            "pre step product unreadable: %s (treated as incomplete)", step_out
+                        )
         prev_input = prev_manifest.get("input")
         input_matches = not prev_input or str(Path(prev_input).absolute()) == str(
             input_path.absolute()
@@ -1919,6 +1970,8 @@ def run_pipeline(
             )
         subjects_match = sorted(prev_manifest.get("subjects", [])) == sorted(subjects)
         resume_skip_completed = resume_mode and input_matches and subjects_match
+        # 整个 Pre 完成 = 所有步骤产物均 ok（逐步骤判定，非旧“判最后一步”）
+        pre_complete = bool(pre_steps) and len(pre_step_skip) == len(pre_steps)
         skip_pre_phase = pre_complete and input_matches and subjects_match
         if resume_mode and not resume_skip_completed:
             logger.warning(
@@ -1928,6 +1981,13 @@ def run_pipeline(
         if skip_pre_phase:
             logger.info(
                 "Resume: Pre phase will be skipped (products verified + subjects/input match)"
+            )
+        elif pre_step_skip and input_matches and subjects_match:
+            logger.info(
+                "Resume: Pre step-level resume — %d/%d step(s) already done: %s",
+                len(pre_step_skip),
+                len(pre_steps),
+                ", ".join(sorted(pre_step_skip)) or "none",
             )
 
     # ── Task manifest：标记运行开始（未完成任务的检测基础） ──
@@ -2096,6 +2156,11 @@ def run_pipeline(
                 len(steps),
                 phase_timeout,
             )
+            # T3: 仅 Pre 阶段参与步骤级跳过/断点续做（post 全量执行）；
+            # 门控同 resume_skip_completed（input + subjects 一致才允许复用产物）
+            is_pre_resume = (
+                resume_skip_completed and pre_phase is not None and phase.name == pre_phase.name
+            )
             phase_results = _execute_batch(
                 phase=phase,
                 steps=steps,
@@ -2104,6 +2169,8 @@ def run_pipeline(
                 executor=_make_executor(py_runner, md_executor),
                 pp=pp,
                 step_timeout=phase_timeout,
+                skip_steps=pre_step_skip if is_pre_resume else None,
+                resume_skip_existing=is_pre_resume,
             )
             # manifest_step 验证
             if phase.manifest_step:

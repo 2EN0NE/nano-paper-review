@@ -15,10 +15,33 @@ import shutil
 from pathlib import Path
 
 
+def _write_per_subject_output(
+    intermediates_dir: str, stem: str, paper_id: str, store_path: Path
+) -> None:
+    """写 per-subject 中间产物（T5：resume 断点续做 + paper_id 映射恢复）。"""
+    path = Path(intermediates_dir) / stem / "02-auto-index" / "output.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "step": "02-auto-index",
+                    "status": "ok",
+                    "error": None,
+                    "data": {"paper_id": paper_id, "store_path": str(store_path)},
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except OSError as e:
+        print(f"  ✗ 写入 {path} 失败: {e}")
+
+
 def main():
     step_dir = os.environ.get("PIPELINE_STEP_DIR", ".")
     output_dir = os.environ.get("PIPELINE_OUTPUT_DIR", ".")
-
+    intermediates_dir = os.environ.get("PIPELINE_INTERMEDIATES", ".")
     # ── Index 配置（来自 orchestrator 注入的 env） ──
     store_dir = Path(os.environ.get("PIPELINE_INDEX_STORE_DIR", "./index"))
     reference_dir = Path(os.environ.get("PIPELINE_INDEX_REFERENCE_DIR", "./origin/pdf"))
@@ -39,6 +62,23 @@ def main():
     # ── subject name → paper_id 映射（供 Post 阶段标签写回） ──
     subject_paper_ids: dict[str, str] = {}
 
+    # ── T5: Resume 断点续做——已有 per-subject 产物（含 paper_id）的篇跳过 ──
+    from paper_review.progress import load_existing_step_products
+
+    resume_skip = os.environ.get("PIPELINE_RESUME_SKIP_EXISTING") == "1"
+    existing: set[str] = set()
+    if resume_skip:
+        existing_products = load_existing_step_products(
+            subjects, intermediates_dir, "02-auto-index"
+        )
+        existing = set(existing_products)
+        # 恢复 paper_id 映射（04-extract-features 依赖）
+        for name, data in existing_products.items():
+            pid = (data.get("data") or {}).get("paper_id")
+            if pid:
+                subject_paper_ids[name] = str(pid)
+        if existing:
+            print(f"02-auto-index: 续做复用 {len(existing)} 篇已索引产物")
     # ── 计数 ──
     history_indexed = 0
     subjects_indexed = 0
@@ -48,6 +88,7 @@ def main():
 
     # ── 初始化 Store 和模型 ──
     from paper_review.extractor import count_pages, extract_meta, extract_pdf
+    from paper_review.progress import report_batch_progress
     from paper_review.search.indexer import build_index
     from paper_review.search.models import EmbeddingModelManager
     from paper_review.search.store import Paper, PaperMeta, Store
@@ -73,7 +114,8 @@ def main():
         pdf_files = sorted(reference_dir.glob("*.pdf"))
         print(f"Auto-index: scanning {len(pdf_files)} PDF(s) in {reference_dir} ...")
 
-        for pdf_file in pdf_files:
+        for i, pdf_file in enumerate(pdf_files, 1):
+            report_batch_progress(i, len(pdf_files), pdf_file.name)
             try:
                 raw_text = extract_pdf(str(pdf_file))
                 if not raw_text.strip():
@@ -124,9 +166,16 @@ def main():
         print(f"Auto-index: indexing {len(subjects)} subject(s) ...")
         from paper_review.auto_index import resolve_copy_path
 
-        for subj in subjects:
+        reused = 0
+        total = len(subjects)
+        for i, subj in enumerate(subjects, 1):
             pdf_path = Path(subj["pdf_path"])
             stem = subj["name"]
+
+            if stem in existing:
+                reused += 1
+                report_batch_progress(i, total, stem, reused=reused)
+                continue
 
             try:
                 if copy_subjects and pdf_path.exists():
@@ -182,10 +231,14 @@ def main():
                     print(f"  ✓ {stem}")
                     subjects_indexed += 1
 
+                # T5: per-subject 产物（含 paper_id）——resume 断点续做 + 映射恢复
+                _write_per_subject_output(intermediates_dir, stem, paper_id, store_path)
+
                 del raw_text, paper, chunks, chunk_vecs
 
             except Exception as e:
                 print(f"  ✗ {stem}: {e}")
+            report_batch_progress(i, total, stem, reused=reused)
 
         store.save_faiss()
 
@@ -201,6 +254,7 @@ def main():
         "data": {
             "history_indexed": history_indexed,
             "subjects_indexed": subjects_indexed,
+            "reused_count": len(existing) if resume_skip else 0,
             "dedup_skipped": dedup_skipped,
             "copied": copied,
             "conflict_renamed": conflict_renamed,
@@ -210,7 +264,10 @@ def main():
         },
     }
 
-    os.makedirs(step_dir, exist_ok=True)
+    try:
+        os.makedirs(step_dir, exist_ok=True)
+    except OSError as e:
+        print(f"  ✗ 创建目录失败: {e}")
     try:
         with open(os.path.join(step_dir, "output.json"), "w") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)

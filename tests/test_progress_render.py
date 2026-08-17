@@ -18,6 +18,7 @@ PipelineProgress 渲染测试 — 验证 ANSI box 输出结构。
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import threading
@@ -27,6 +28,8 @@ from paper_review.progress import (
     PhaseProgressInfo,
     PipelineProgress,
     _display_width,
+    _read_batch_progress_detail,
+    report_batch_progress,
 )
 
 # ── 模块级常量 ──
@@ -1320,3 +1323,175 @@ class TestChineseDisplayName:
         assert "workers=" not in review_line
         assert "workers=5/5" in summary_line
         assert "×1.5" in summary_line
+
+
+# ============================================================================
+# Layer 1k: batch 阶段子进度（Pre 步骤内部逐篇进度 + 上报 helper）
+# ============================================================================
+
+
+class TestBatchSubProgress:
+    """batch 阶段（Pre）子进度：进度文件轮询 → batch 行子进度显示。
+
+    T1 交付：进度卡 batch 行可显示步骤内部逐篇进度
+    （`04-extract-features 3/7 · paper-D`）；步骤脚本经 report_batch_progress()
+    上报；orchestrator 注入进度文件路径，spinner 轮询刷新。
+    """
+
+    def _pp(self) -> PipelineProgress:
+        return PipelineProgress(
+            [
+                PhaseProgressInfo(name="pre", display="预处理", kind="batch", total=5),
+                PhaseProgressInfo(
+                    name="review",
+                    display="Review",
+                    kind="per_subject",
+                    total=35,
+                    subjects=7,
+                    steps_per=5,
+                ),
+            ]
+        )
+
+    # ── report_batch_progress helper ──
+
+    def test_report_noop_without_env(self, monkeypatch):
+        """env 未注入（自定义步骤/直接运行脚本）时 no-op 不抛异常。"""
+        monkeypatch.delenv("PIPELINE_BATCH_PROGRESS_FILE", raising=False)
+        monkeypatch.delenv("PIPELINE_STEP_NAME", raising=False)
+        report_batch_progress(1, 7, "paper-A", reused=1)
+
+    def test_report_writes_atomic_json(self, tmp_path, monkeypatch):
+        """env 注入时原子写 JSON（tmp + rename），字段完整。"""
+        path = tmp_path / "prog.json"
+        monkeypatch.setenv("PIPELINE_BATCH_PROGRESS_FILE", str(path))
+        monkeypatch.setenv("PIPELINE_STEP_NAME", "04-extract-features")
+        report_batch_progress(3, 7, "paper-D", reused=1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data == {
+            "step": "04-extract-features",
+            "done": 3,
+            "total": 7,
+            "current": "paper-D",
+            "reused": 1,
+        }
+        # tmp 文件已被 os.replace 消费，无残留
+        assert not (tmp_path / "prog.json.tmp").exists()
+
+    def test_report_oserror_is_silent(self, tmp_path, monkeypatch):
+        """写入失败（目录不存在等）静默吞掉，不抛异常。"""
+        monkeypatch.setenv("PIPELINE_BATCH_PROGRESS_FILE", str(tmp_path / "no" / "dir" / "p.json"))
+        report_batch_progress(1, 2, "x")
+
+    # ── _read_batch_progress_detail（文件 → 显示文本）──
+
+    def test_detail_renders_step_done_total_current(self, tmp_path):
+        path = tmp_path / "p.json"
+        path.write_text(
+            json.dumps(
+                {"step": "04-extract-features", "done": 3, "total": 7, "current": "paper-D"}
+            ),
+            encoding="utf-8",
+        )
+        assert _read_batch_progress_detail(str(path)) == "04-extract-features 3/7 · paper-D"
+
+    def test_detail_renders_reused(self, tmp_path):
+        path = tmp_path / "p.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "step": "04-extract-features",
+                    "done": 5,
+                    "total": 7,
+                    "current": "paper-F",
+                    "reused": 2,
+                }
+            ),
+            encoding="utf-8",
+        )
+        detail = _read_batch_progress_detail(str(path))
+        assert "5/7" in detail
+        assert "paper-F" in detail
+        assert "2 复用" in detail
+        assert "·" in detail
+
+    def test_detail_missing_file_empty(self, tmp_path):
+        assert _read_batch_progress_detail(str(tmp_path / "nope.json")) == ""
+
+    def test_detail_corrupt_file_empty(self, tmp_path):
+        path = tmp_path / "p.json"
+        path.write_text("{broken", encoding="utf-8")
+        assert _read_batch_progress_detail(str(path)) == ""
+
+    # ── 进度卡集成：文件轮询 → batch 行子进度 ──
+
+    def test_batch_line_shows_detail_after_refresh(self, tmp_path):
+        pp = self._pp()
+        pp._started = True
+        pp._start_time = 0.0
+        pp.phase_step_done("pre")  # 1/5
+        path = tmp_path / "prog.json"
+        pp.set_batch_progress_file("pre", str(path))
+        lines = _build_lines(pp)
+        assert "04-extract-features" not in lines[1]  # 尚无文件 → 无 detail
+
+        path.write_text(
+            json.dumps(
+                {"step": "04-extract-features", "done": 3, "total": 7, "current": "paper-D"}
+            ),
+            encoding="utf-8",
+        )
+        with pp._lock:
+            pp._refresh_batch_detail_locked()
+        lines = _build_lines(pp)
+        assert "1/5" in lines[1]
+        assert "04-extract-features 3/7 · paper-D" in lines[1]
+
+    def test_batch_line_detail_cleared_when_file_deleted(self, tmp_path):
+        pp = self._pp()
+        pp._started = True
+        pp._start_time = 0.0
+        path = tmp_path / "prog.json"
+        pp.set_batch_progress_file("pre", str(path))
+        path.write_text(
+            json.dumps({"step": "04", "done": 1, "total": 2, "current": "a"}),
+            encoding="utf-8",
+        )
+        with pp._lock:
+            pp._refresh_batch_detail_locked()
+        assert "04" in _build_lines(pp)[1]
+
+        path.unlink()  # orchestrator 步骤结束清理
+        with pp._lock:
+            pp._refresh_batch_detail_locked()
+        assert "04" not in _build_lines(pp)[1]
+
+    def test_set_batch_progress_file_none_clears(self):
+        pp = self._pp()
+        pp._started = True
+        pp._start_time = 0.0
+        pp.set_batch_progress_file("pre", None)
+        assert pp._by_name["pre"].batch_detail == ""
+
+    def test_detail_within_box_width(self, tmp_path):
+        """长 detail 仍被 _safe_line 截断，不超宽（残影安全）。"""
+        pp = self._pp()
+        pp._started = True
+        pp._start_time = 0.0
+        path = tmp_path / "prog.json"
+        pp.set_batch_progress_file("pre", str(path))
+        path.write_text(
+            json.dumps(
+                {
+                    "step": "04-extract-features",
+                    "done": 3,
+                    "total": 7,
+                    "current": "很长的论文名字-" * 10,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pp._lock:
+            pp._refresh_batch_detail_locked()
+        lines = _build_lines(pp)
+        _assert_within_width(lines, _BOX_TOTAL)

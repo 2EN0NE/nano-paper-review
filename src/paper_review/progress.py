@@ -23,6 +23,7 @@ Layout:
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
@@ -31,6 +32,8 @@ import threading
 import time
 import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _BAR_WIDTH = 20
@@ -73,6 +76,9 @@ class _PhaseState:
     done_subjects: int = 0
     running_subjects: set[str] = field(default_factory=set)
     subject_step_done: dict[str, int] = field(default_factory=dict)
+    # batch 专用（Pre/Post 步骤内部子进度，T1）
+    batch_detail: str = ""  # 步骤内部子进度显示文本（如 "04-extract-features 3/7 · paper-D"）
+    batch_progress_file: str | None = None  # 步骤进度文件路径（spinner 轮询读取）
 
 
 class PipelineProgress:
@@ -244,6 +250,45 @@ class PipelineProgress:
             st.running = len(st.running_subjects)
             self._render()
 
+    def set_batch_progress_file(self, name: str, path: str | None):
+        """设置 batch phase 的步骤进度文件路径（orchestrator 在步骤执行期间注入）。
+
+        spinner 每 tick 轮询该文件刷新 batch 行子进度（Pre 步骤内部逐篇进度）；
+        传 None 清除路径与已显示的子进度。进度文件不存在/损坏时自动回退为空。
+        """
+        st = self._by_name[name]
+        with self._lock:
+            st.batch_progress_file = path
+            if path is None:
+                st.batch_detail = ""
+            self._render()
+
+    def clear_batch_detail(self, name: str):
+        """清除 batch 步骤子进度显示（orchestrator 步骤结束后同步调用）。
+
+        spinner 轮询文件删除后也会清空，但最终渲染（finish）前可能没有 tick——
+        步骤结束同步清除保证最终屏幕不残留上一步的子进度。
+        """
+        st = self._by_name[name]
+        with self._lock:
+            if st.batch_detail:
+                st.batch_detail = ""
+                self._render()
+
+    def _refresh_batch_detail_locked(self):
+        """轮询 batch 步骤进度文件，刷新 batch 行子进度（调用方需持锁）。
+
+        T1：Pre/Post 模板步骤经 report_batch_progress() 写进度文件，spinner 线程
+        每次 tick 读取并更新显示——文件缺失/损坏（含步骤结束被 orchestrator 删除）
+        时清空子进度，避免残留上一步的过期信息。
+        """
+        for st in self._phases:
+            if st.info.kind != "batch" or not st.batch_progress_file:
+                continue
+            detail = _read_batch_progress_detail(st.batch_progress_file)
+            if detail != st.batch_detail:
+                st.batch_detail = detail
+
     def mark_interrupted(self):
         """标记中断（SIGINT 处理器内调用，仅轻量赋值，无 I/O/锁）。
 
@@ -381,6 +426,7 @@ class PipelineProgress:
         """Background spinner refresh (every 100ms)."""
         while not self._finished and not self._aborted:
             with self._lock:
+                self._refresh_batch_detail_locked()  # T1: 轮询 batch 步骤子进度
                 self._spinner_idx = (self._spinner_idx + 1) % len(_SPINNER)
                 self._render()
             time.sleep(0.1)
@@ -475,6 +521,9 @@ class PipelineProgress:
                     extra = f"{st.done_subjects}/{st.info.subjects} done, {st.running} running"
                 elif st.info.total > 0 and st.done >= st.info.total:
                     extra = f"{st.info.subjects}/{st.info.subjects} done"
+            elif st.batch_detail:
+                # T1: batch 步骤内部子进度（Pre 步骤逐篇处理进度）
+                extra = st.batch_detail
             lines.append(safe(self._phase_line(st, extra), _BOX_WIDTH))
 
         # Summary line
@@ -519,3 +568,116 @@ class PipelineProgress:
                 w += cw
             return result
         return text + " " * (width - dw)
+
+
+# ============================================================================
+# batch 步骤内部子进度上报（T1）
+#
+# 协议：orchestrator 在 batch 步骤（Pre/Post）执行期间注入
+# PIPELINE_BATCH_PROGRESS_FILE（指向进度 JSON 文件）；步骤脚本在逐篇循环内调用
+# report_batch_progress() 上报；进度卡 spinner 线程轮询该文件刷新 batch 行显示。
+# 文件内容：{"step", "done", "total", "current", "reused"}。
+# ============================================================================
+
+
+def report_batch_progress(done: int, total: int, current: str = "", reused: int = 0) -> None:
+    """上报 batch 步骤内部逐篇进度（Pre 模板步骤逐篇循环内调用）。
+
+    进度卡 spinner 轮询该文件更新 Pre 行子进度显示
+    （如 `04-extract-features 3/7 · paper-D`）；`reused` 为续做时复用的篇数。
+
+    环境变量 PIPELINE_BATCH_PROGRESS_FILE 由 orchestrator 在 batch 步骤执行期间
+    注入；未注入（自定义步骤 / 直接运行脚本）时 no-op——零开销零破坏。
+    原子写（tmp + rename）：避免 spinner 轮询读到半截 JSON。
+    任何 I/O 异常静默吞掉（进度上报失败不影响步骤本身）。
+    """
+    path = os.environ.get("PIPELINE_BATCH_PROGRESS_FILE")
+    if not path:
+        return
+    payload = {
+        "step": os.environ.get("PIPELINE_STEP_NAME", ""),
+        "done": _safe_int(done),
+        "total": _safe_int(total),
+        "current": str(current),
+        "reused": _safe_int(reused),
+    }
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            logger.debug("failed to clean batch progress tmp file %s", tmp)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """宽容转 int：None/非数字/损坏值回退默认（进度上报不因脏输入崩溃）。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_batch_progress_detail(path: str) -> str:
+    """读 batch 步骤进度文件 → 子进度显示文本；缺失/损坏返回空串。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    try:
+        done = int(payload.get("done", 0))
+        total = int(payload.get("total", 0))
+    except (TypeError, ValueError):
+        done = total = 0
+    step = str(payload.get("step", ""))
+    current = str(payload.get("current", ""))
+    reused = _safe_int(payload.get("reused", 0))
+    parts: list[str] = []
+    if step:
+        parts.append(step)
+    if total > 0:
+        parts.append(f"{done}/{total}")
+    if current:
+        parts.append(current)
+    if reused > 0:
+        parts.append(f"{reused} 复用")
+    if not parts:
+        return ""
+    # step 与计数紧凑拼接，其余以 · 分隔（与需求示例 `04-extract-features 3/7 · paper-D` 对齐）
+    head = parts[0] + (f" {parts[1]}" if len(parts) > 1 else "")
+    tail = parts[2:]
+    return " · ".join([head, *tail]) if tail else head
+
+
+def load_existing_step_products(
+    subjects: list[dict], intermediates_dir: str, step_name: str
+) -> dict[str, dict]:
+    """读已有 ok/skipped 状态的 per-subject 产物（Resume 断点续做用，T4/T5/T6）。
+
+    Pre 模板步骤逐篇循环开头调用：已有产物的 Subject 跳过不重跑（不重复调
+    LLM/检索/embedding）。产物缺失或损坏 → 不计入（该篇重跑）。
+    返回 {subject_name: output_json_dict}——调用方可从 data 恢复额外映射（如
+    paper_id）。
+    """
+    products: dict[str, dict] = {}
+    for subj in subjects:
+        name = subj.get("name", "")
+        if not name:
+            continue
+        out = Path(intermediates_dir) / name / step_name / "output.json"
+        if not out.exists():
+            continue
+        try:
+            data = json.loads(out.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue  # 损坏产物 → 视作未处理，该篇重跑
+        if data.get("status", "ok") in ("ok", "skipped"):
+            products[name] = data
+    return products

@@ -62,6 +62,7 @@ def _build_query(name: str, pdf_path: Path) -> str:
 def main():
     step_dir = os.environ.get("PIPELINE_STEP_DIR", ".")
     output_dir = os.environ.get("PIPELINE_OUTPUT_DIR", ".")
+    intermediates_dir = os.environ.get("PIPELINE_INTERMEDIATES", ".")
 
     manifest_path = Path(output_dir) / "subject-manifest.json"
     subjects: list[dict] = []
@@ -72,11 +73,55 @@ def main():
         except (json.JSONDecodeError, OSError):
             print(f"  ⚠ 无法读取 manifest: {manifest_path}")
 
+    from paper_review.progress import load_existing_step_products, report_batch_progress
+
+    # T6: Resume 断点续做——已有 per-subject 产物的篇跳过（query 从产物恢复）
+    resume_skip = os.environ.get("PIPELINE_RESUME_SKIP_EXISTING") == "1"
     queries: dict[str, str] = {}
-    for subj in subjects:
+    existing: set[str] = set()
+    if resume_skip:
+        existing_products = load_existing_step_products(
+            subjects, intermediates_dir, "03-generate-query"
+        )
+        # 产物 ok 但 query 缺失 → 该篇不视为已存在（重跑），避免 05 静默回退伪 query
+        for name, data in existing_products.items():
+            q = (data.get("data") or {}).get("query")
+            if q:
+                queries[name] = str(q)
+                existing.add(name)
+        if existing:
+            print(f"03-generate-query: 续做复用 {len(existing)} 篇已生成 query")
+
+    reused = 0
+    total = len(subjects)
+    for i, subj in enumerate(subjects, 1):
         name = subj["name"]
+        if name in existing:
+            reused += 1
+            report_batch_progress(i, total, name, reused=reused)
+            continue
         pdf_path = Path(subj["pdf_path"])
-        queries[name] = _build_query(name, pdf_path)
+        query = _build_query(name, pdf_path)
+        queries[name] = query
+        # per-subject 产物（T6：resume 断点续做）
+        try:
+            per_path = Path(intermediates_dir) / name / "03-generate-query" / "output.json"
+            per_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(per_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "step": "03-generate-query",
+                        "status": "ok",
+                        "error": None,
+                        "data": {"query": query},
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except OSError as e:
+            print(f"  ✗ 写入 {name} 产物失败: {e}")
+        report_batch_progress(i, total, name, reused=reused)
 
     output = {
         "step": "03-generate-query",
@@ -85,6 +130,7 @@ def main():
         "data": {
             "queries": queries,
             "query_count": len(queries),
+            "reused_count": reused,
         },
     }
 
