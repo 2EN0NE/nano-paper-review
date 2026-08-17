@@ -99,20 +99,33 @@ def merge_feature_sets(llm_features: list[str], keyword_features: list[str]) -> 
     return list(dict.fromkeys([*llm_features, *keyword_features]))
 
 
-def _build_feature_prompt(text: str) -> str:
+def _build_feature_prompt(text: str, tag_library: list[str] | None = None) -> str:
     """构建 LLM 抽取技术方法关键词的 prompt（要求只输出 JSON 数组）。
 
-    粒度约束（ADR 0015）：只抽具体技术方法，不抽宽泛领域词；粒度控制
-    前置到抽取端而非打分端加权。
+    粒度约束（ADR 0015）：消歧与规范化前置到抽取端——LLM 结合文章上下文
+    消歧（CMS → 并发标记清除）、统一中文全称（GC → 垃圾回收），并优先对齐
+    参考词表（标签库）。检索端只做简单匹配，不做跨语言/歧义消解。
     """
+    lib_block = ""
+    if tag_library:
+        # 截断前 100 词防 prompt 爆炸（标签库随评审积累增长）
+        lib_block = (
+            "\n参考规范词表（这些词已规范化，优先从中选择；词表没有的按上述规则规范化）：\n"
+            + "、".join(tag_library[:100])
+            + "\n"
+        )
     return (
         "你是一名技术论文分析助手。请从下面的论文首段中抽取「技术方法」关键词。\n\n"
         "要求：\n"
-        "1. 只抽取具体的技术方法/技术手段（如：向量化执行、MPP、列式存储、倒排索引），\n"
-        "   不要抽取宽泛的领域词（如：数据库、分布式、机器学习）。\n"
+        "1. 结合文章上下文理解术语含义，消歧后输出规范化的技术名词：\n"
+        "   - 有歧义的缩写必须根据上下文判断并展开为全称"
+        "（如 GC 语境的「CMS」→「并发标记清除」）。\n"
+        "   - 无歧义的官方名称保留原名（如「ZGC」「G1」「ParNew」）。\n"
+        "   - 同一概念统一用中文全称（如「垃圾回收」而非「GC」「Garbage Collection」）。\n"
         "2. 抽取 3~8 个，按重要性降序。\n"
-        "3. 只输出一个 JSON 数组，不要任何其他文字。\n\n"
-        f"论文首段：\n{text}\n\n"
+        "3. 只输出一个 JSON 数组，不要任何说明、注释或 Markdown 代码块标记。\n"
+        f"{lib_block}"
+        f"\n论文首段：\n{text}\n\n"
         "输出（JSON 数组）："
     )
 
@@ -171,7 +184,12 @@ def _load_subject_paper_ids(intermediates_dir: str) -> dict[str, str]:
     return {}
 
 
-def _llm_extract_features(text: str, pi_binary: str = "pi", timeout: int = 300) -> list[str]:
+def _llm_extract_features(
+    text: str,
+    pi_binary: str = "pi",
+    timeout: int = 300,
+    tag_library: list[str] | None = None,
+) -> list[str]:
     """调 pi（LLM）从文本抽取技术方法关键词（LLM 主线，ADR 0015）。
 
     失败（超时/非零退出/无法解析）返回空列表，由词表兜底。
@@ -179,7 +197,7 @@ def _llm_extract_features(text: str, pi_binary: str = "pi", timeout: int = 300) 
     import subprocess
     import tempfile
 
-    prompt = _build_feature_prompt(text)
+    prompt = _build_feature_prompt(text, tag_library=tag_library)
     try:
         fd, prompt_file = tempfile.mkstemp(suffix=".md", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -187,12 +205,39 @@ def _llm_extract_features(text: str, pi_binary: str = "pi", timeout: int = 300) 
     except OSError:
         return []
     try:
+        # Agent 配置（type/provider/model）——留空不传 flag（继承 Agent 默认），
+        # 显式配置无效（402/模型不存在）时回退为不传。复用 agent.py 与 AgentRunner
+        # 同一实现，防两处漂移。
+        from paper_review.agent import (
+            AgentConfig,
+            build_command,
+            build_command_without_model,
+            is_model_config_error,
+        )
+
+        agent_cfg = AgentConfig.from_env(os.environ)
+        pi_cmd = build_command(agent_cfg, pi_binary, prompt_file)
         proc = subprocess.run(  # noqa: S603 — pi_binary is user-configurable (same as AgentRunner)
-            [pi_binary, "--no-session", "-p", f"@{prompt_file}"],
+            pi_cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+        if (
+            proc.returncode != 0
+            and agent_cfg.has_explicit_model()
+            and is_model_config_error(proc.stderr or "")
+        ):
+            print(
+                f"  ⚠ 显式 provider/model 配置无效（exit {proc.returncode}）——回退为 Agent 默认重试"
+            )
+            pi_cmd = build_command_without_model(agent_cfg, pi_binary, prompt_file)
+            proc = subprocess.run(  # noqa: S603
+                pi_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
         if proc.returncode != 0:
             return []
         return _parse_feature_json(proc.stdout or "")
@@ -261,7 +306,9 @@ def main():
         # 词表兜底（确定性，保证已知词永不丢）
         keyword_features = extract_keywords(text_with_name, tag_library)
         # LLM 主线（发现新词 + 已知词）
-        llm_features = _llm_extract_features(text_with_name, pi_binary=pi_binary)
+        llm_features = _llm_extract_features(
+            text_with_name, pi_binary=pi_binary, tag_library=tag_library
+        )
         # 并集汇总
         features = merge_feature_sets(llm_features, keyword_features)
 

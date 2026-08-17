@@ -137,6 +137,9 @@ Orchestrator 通过环境变量注入：
 | `PIPELINE_PHASE` | pre / review / post |
 | `PIPELINE_SUBJECT` | 当前 Subject（Review Phase 专属） |
 | `PIPELINE_INTERMEDIATES` | intermediates 根目录绝对路径 |
+| `PIPELINE_AGENT_TYPE` | Agent 类型（`agent.type`，当前仅 `pi`） |
+| `PIPELINE_AGENT_PROVIDER` | 调 Agent 的 provider（`agent.provider`；空 = 不传 flag，继承 Agent 默认） |
+| `PIPELINE_AGENT_MODEL` | 调 Agent 的 model（`agent.model`；空 = 不传 flag，继承 Agent 默认） |
 
 ### .md Agent 步骤
 
@@ -168,6 +171,30 @@ Agent Prefix Prompt 模板：
 
 {user_md_content}
 ```
+
+### Agent 启动配置（type / provider / model）
+
+嵌套 Agent（当前仅 pi）的 provider/model 由 pipeline.yaml 的 `agent` 段控制，分两级：
+
+```yaml
+agent:                    # 全局默认（所有 phase 继承）
+  type: pi                # 当前唯一支持（opencode 预留未实现）
+  # provider: ""          # 空 = 不传 flag，继承 Agent 默认（pi 跟随 PI_PROVIDER/PI_MODEL 会话）
+  # model: ""             # 空 = 不传 flag，继承 Agent 默认
+
+phases:
+  - name: pre
+    # agent:              # phase 级覆盖（覆盖全局 provider/model）
+    #   model: ""         # 例如用 non-reasoning 模型做结构化抽取
+```
+
+- **全局 `agent`**：所有 step 内调 Agent 的默认 type/provider/model。
+- **phase 级 `agent`**：覆盖该 phase 的 provider/model（空字段保留全局值；type 仅全局生效）。
+- **留空兜底**：provider/model 留空时不传 CLI flag，Agent 继承自身默认（pi 继承 `PI_PROVIDER/PI_MODEL` 会话）。
+- **报错回退**：显式配置的 provider/model 若非零退出报错，运行时会回退为不传（Agent 默认）并记录 warning。
+
+典型用法：结构化抽取（`04-extract-features`）用 non-reasoning 模型（稳定不易“走神”），
+开放文本评审（`.md` 评分步骤）用 reasoning 模型（深度推理）——两者通过全局/phase 级 `agent.model` 区分。
 
 ## 模板变量系统
 

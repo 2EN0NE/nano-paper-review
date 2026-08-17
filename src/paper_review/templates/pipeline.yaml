@@ -19,6 +19,14 @@
 name: "标准论文评审管线"
 version: "2.0"
 
+# ── 全局 Agent（Agent 步骤）启动配置 ─────────────────────────────────
+# 所有 .md 步骤和 .py 步骤内调 Agent 的类型与默认 provider/model。
+# type: pi 为当前唯一支持（opencode 预留未实现）。
+# provider/model 留空 = 不传 flag，继承 Agent 默认（pi 跟随 PI_PROVIDER/PI_MODEL 会话）。
+# 显式配置的 provider/model 若报错，运行时会回退为不传（Agent 默认）并告警。
+agent:
+  type: pi
+
 phases:
   # ── Pre Phase（批量执行）────────────────────────────────────────────────
   # mode=batch: 所有待审 Subject 依次执行每个 Step（不并行）。
@@ -38,6 +46,10 @@ phases:
     retry:
       max_attempts: 2 # Step 失败时的重试次数
       on_failure: skip # 重试仍失败时的策略: skip（跳过）或 abort（终止管线）
+    # 可选：phase 级覆盖 model——特征抽取（04-extract-features）是结构化输出，
+    # 用 non-reasoning 模型更稳定（reasoning 模型易“走神”）。留空 = 继承全局/会话默认。
+    # agent:
+    #   model: ""  # 替换为你的 non-reasoning 模型名
 
   # ── Review Phase（逐篇执行）──────────────────────────────────────────────
   # mode=per_subject: 每篇论文独立走完所有 Step，互不干扰。

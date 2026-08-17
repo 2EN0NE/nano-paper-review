@@ -5,21 +5,26 @@
 单篇论文也生成 Excel（一行数据），方便统一归档。
 
 Excel 列结构（两级表头，第 1 列为论文名称固定列）：
-         ┌──────────────────────────────────────────────────────────────────────────────────────┐
-  Col 1  │                   最终结果                  │    间接维度打分     │   原直接维度打分    │
-  ────── ├──┬──┬──┬──┼──┬──┼──────────┼──┬──┬──┬──┬──┼──┬──┼──┬──┬──┬──┬──┤
-  论文名称│创│质│效│风│难│业│行│关│公│源│业│前│创│质│效│风│难│业│
-         │新│量│能│险│度│务│文│键│式│码│务│人│新│量│能│险│度│务│
-         │性│提│提│敏│  │价│严│性│堆│深│规│调│性│提│提│敏│  │价│
-         │  │升│升│感│  │值│谨│  │砌│度│模│研│  │升│升│感│  │值│
-         │  │效│效│性│  │提│性│  │度│  │真│充│  │效│效│性│  │提│
-         │  │果│果│  │  │升│  │  │  │  │实│分│  │果│果│  │  │升│
-         │  │  │  │  │  │效│  │  │  │  │性│度│  │  │  │  │  │效│
-         │  │  │  │  │  │果│  │  │  │  │  │  │  │  │  │  │  │果│
-         └──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+         ┌────────┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
+         │        │      最终结果      │  间接维度打分   │ 原直接维度打分  │
+         ├────────┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┼──┤
+         │论文名称│创│质│效│风│难│业│总│行│问│公│源│业│前│创│质│效│风│难│业│
+         │        │新│量│能│险│度│务│分│文│题│式│码│务│人│新│量│能│险│度│务│
+         │        │性│提│提│敏│  │价│  │严│关│堆│深│规│调│性│提│提│敏│  │价│
+         │        │  │升│升│感│  │值│  │谨│键│砌│度│模│研│  │升│升│感│  │值│
+         │        │  │效│效│性│  │提│  │性│性│度│  │真│充│  │效│效│性│  │提│
+         │        │  │果│果│  │  │升│  │  │  │  │  │实│分│  │果│果│  │  │升│
+         │        │  │  │  │  │  │效│  │  │  │  │  │性│度│  │  │  │  │  │效│
+         │        │  │  │  │  │  │果│  │  │  │  │  │  │  │  │  │  │  │  │果│
+         └────────┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
+
+总分列：位于「最终结果」组末尾（业务价值提升效果之后），为 Excel 加权求和公式：
+        =创新性*4+质量提升效果*3+效能提升效果*3+风险敏感性*3+难度*3+业务价值提升效果*2
 
 依赖：openpyxl（pip install openpyxl）
 """
+
+# pyright: reportPossiblyUnboundVariable=false, reportOptionalMemberAccess=false
 
 from __future__ import annotations
 
@@ -59,11 +64,25 @@ INDIRECT_DIMS = [
     "前人调研充分度",
 ]
 
+# 总分权重：总分 = 创新*4 + 质量*3 + 效能*3 + 风险*3 + 难度*3 + 业务*2
+TOTAL_WEIGHTS = {
+    "创新性": 4,
+    "质量提升效果": 3,
+    "效能提升效果": 3,
+    "风险敏感性": 3,
+    "难度": 3,
+    "业务价值提升效果": 2,
+}
+
+# 「最终结果」组末尾追加「总分」列（Excel 加权求和公式列）
+FINAL_GROUP_DIMS = DIRECT_DIMS + ["总分"]
+
 # 表头组配置
 HEADER_GROUPS = [
-    ("最终结果", DIRECT_DIMS),
+    ("最终结果", FINAL_GROUP_DIMS),
     ("间接维度打分", INDIRECT_DIMS),
     ("原直接维度打分", DIRECT_DIMS),
+    ("评分理由", ["评分理由"]),
 ]
 
 # 样式（仅 openpyxl 可用时定义）
@@ -103,7 +122,9 @@ def _load_summarize(subject_name: str, intermediates_dir: Path) -> dict | None:
     path = intermediates_dir / subject_name / "08-summarize" / "output.json"
     if not path.exists():
         return None
+    # pi-lens-ignore: unchecked-throwing-call-python
     with open(path) as f:
+        # pi-lens-ignore: unchecked-throwing-call-python
         raw = json.load(f)
     return raw.get("data", {}) if raw else None
 
@@ -118,6 +139,16 @@ def _auto_column_widths(ws, max_col: int):
                 if cell.value is not None:
                     max_len = max(max_len, len(str(cell.value)))
         ws.column_dimensions[col_letter].width = max(max_len + 3, 8)
+
+
+def _total_formula(row_idx: int, final_start_col: int) -> str:
+    """生成总分 Excel 公式：=创新*4+质量*3+效能*3+风险*3+难度*3+业务*2。"""
+    terms = []
+    for offset, dim in enumerate(DIRECT_DIMS):
+        col = get_column_letter(final_start_col + offset)
+        weight = TOTAL_WEIGHTS[dim]
+        terms.append(f"{col}{row_idx}*{weight}")
+    return "=" + "+".join(terms)
 
 
 # ============================================================================
@@ -139,6 +170,7 @@ def main():
             "data": {},
         }
         Path(step_dir).mkdir(parents=True, exist_ok=True)
+        # pi-lens-ignore: unchecked-throwing-call-python
         with open(Path(step_dir) / "output.json", "w") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
         return
@@ -157,6 +189,7 @@ def main():
             "data": {"subject_count": 0},
         }
         Path(step_dir).mkdir(parents=True, exist_ok=True)
+        # pi-lens-ignore: unchecked-throwing-call-python
         with open(Path(step_dir) / "output.json", "w") as f:
             json.dump(output, f, ensure_ascii=False, indent=2)
         return
@@ -229,12 +262,18 @@ def main():
         original_scores = data.get("original_direct_scores", {})
 
         col_idx = 2
-        # 最终结果
+        # 最终结果（直接维度 + 总分公式）
+        final_start_col = col_idx
         for dim in DIRECT_DIMS:
             ws.cell(
                 row=row_idx, column=col_idx, value=final_scores.get(dim, "-")
             ).border = THIN_BORDER
             col_idx += 1
+        # 总分（Excel 加权求和公式）
+        ws.cell(
+            row=row_idx, column=col_idx, value=_total_formula(row_idx, final_start_col)
+        ).border = THIN_BORDER
+        col_idx += 1
         # 间接维度
         for dim in INDIRECT_DIMS:
             ws.cell(
@@ -247,9 +286,25 @@ def main():
                 row=row_idx, column=col_idx, value=original_scores.get(dim, "-")
             ).border = THIN_BORDER
             col_idx += 1
+        # 评分理由（最后一列：逐维 rationale + 降级原因）
+        rationale = data.get("rationale", {})
+        degradation_reason = data.get("degradation_reason", "")
+        reason_lines = []
+        for dim in DIRECT_DIMS:
+            r = (rationale or {}).get(dim)
+            if r:
+                reason_lines.append(f"{dim}：{r}")
+        if degradation_reason:
+            reason_lines.append(degradation_reason)
+        reason_cell = ws.cell(row=row_idx, column=col_idx, value="\n".join(reason_lines))
+        reason_cell.border = THIN_BORDER
+        reason_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        col_idx += 1
 
     # 列宽自适应
     _auto_column_widths(ws, total_cols)
+    # 评分理由列固定宽度（长文本换行，不参与自适应撑爆）
+    ws.column_dimensions[get_column_letter(total_cols)].width = 60
 
     # ── 写文件 ──
     output_path = Path(output_dir)
@@ -276,6 +331,7 @@ def main():
     }
 
     Path(step_dir).mkdir(parents=True, exist_ok=True)
+    # pi-lens-ignore: unchecked-throwing-call-python
     with open(Path(step_dir) / "output.json", "w") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 

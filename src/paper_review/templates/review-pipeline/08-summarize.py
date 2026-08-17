@@ -193,12 +193,60 @@ def _parse_scoring_output(data: dict) -> dict[str, float]:
             except (ValueError, TypeError):
                 raise ValueError(f"Cannot parse score for '{key}': {value['score']!r}") from None
         elif isinstance(value, (int, float)):
+            # pi-lens-ignore: unchecked-throwing-call-python
             scores[_normalize_dim(key)] = float(value)
 
     if not scores and "raw_output" in data:
         scores = _extract_scores_from_markdown(data["raw_output"])
 
     return scores
+
+
+def _extract_rationale_from_markdown(md: str, dims: list[str]) -> dict[str, str]:
+    """从 Markdown 表格第三列提取 维度→理由 文字。
+
+    表格形如 | 维度 | 分数 | 理由/依据 |，第三列为评分理由。
+    """
+    rationale: dict[str, str] = {}
+    pat = re.compile(
+        r"\|\s*\*{0,2}([^*|\n]+?)\*{0,2}\s*\|"
+        r"\s*\*{0,2}([\d.]+(?:/\s*[\d.]+)?)\*{0,2}\s*\|"
+        r"\s*([^|\n]*?)\s*\|"
+    )
+    for m in pat.finditer(md):
+        dim = _normalize_dim(m.group(1).strip())
+        reason = m.group(3).strip()
+        if dim in dims and reason:
+            rationale[dim] = reason
+    return rationale
+
+
+def _parse_scoring_rationale(data: dict, dims: list[str]) -> dict[str, str]:
+    """从前序 scoring step 的 data 提取 {维度: rationale 文字}。
+
+    兼容:
+    1) {"创新性": {"score": 4, "rationale": "..."}}
+    2) {"raw_output": "| 维度 | 分数 | 理由 |"}
+    """
+    rationale: dict[str, str] = {}
+    for key, value in data.items():
+        if key == "raw_output":
+            continue
+        if isinstance(value, dict) and "rationale" in value:
+            r = value.get("rationale")
+            if isinstance(r, str) and r.strip():
+                rationale[_normalize_dim(key)] = r.strip()
+    if not rationale and "raw_output" in data:
+        rationale = _extract_rationale_from_markdown(data["raw_output"], dims)
+    return rationale
+
+
+def _parse_tags(data: dict) -> list[str]:
+    """从 scoring step 的 data 提取 tags 列表（缺失/非法 → 空列表）。"""
+    tags = data.get("tags")
+    if isinstance(tags, list):
+        return [str(t).strip() for t in tags if isinstance(t, str) and t.strip()]
+    return []
 
 
 # ============================================================================
@@ -217,15 +265,25 @@ def main():
 
     original_direct: dict[str, float] = {}
     indirect_scores: dict[str, float] = {}
+    direct_data: dict = {}
+    direct_rationale: dict[str, str] = {}
+    tags: list[str] = []
 
     if direct_path.exists():
+        # pi-lens-ignore: unchecked-throwing-call-python
         with open(direct_path) as f:
-            original_direct = _parse_scoring_output(json.load(f).get("data", {}))
+            # pi-lens-ignore: unchecked-throwing-call-python
+            direct_data = json.load(f).get("data", {})
+        original_direct = _parse_scoring_output(direct_data)
+        direct_rationale = _parse_scoring_rationale(direct_data, DIRECT_DIMS)
+        tags = _parse_tags(direct_data)
     else:
         print(f"Warning: {direct_path} not found, using defaults")
 
     if indirect_path.exists():
+        # pi-lens-ignore: unchecked-throwing-call-python
         with open(indirect_path) as f:
+            # pi-lens-ignore: unchecked-throwing-call-python
             indirect_scores = _parse_scoring_output(json.load(f).get("data", {}))
     else:
         print(f"Warning: {indirect_path} not found, using defaults")
@@ -241,16 +299,39 @@ def main():
     # 应用修正
     final_scores, corrections = apply_correction(original_direct, indirect_scores)
 
+    # 字段级降级标记（本次只判「有没有」：rationale/tags 是否缺失，不判内容空洞）
+    rationale_missing = [dim for dim in DIRECT_DIMS if not direct_rationale.get(dim)]
+    tags_missing = not tags
+    degraded = bool(rationale_missing or tags_missing)
+    degradation_reason = ""
+    if degraded:
+        parts = []
+        if rationale_missing:
+            parts.append("缺证据:" + "/".join(rationale_missing))
+        if tags_missing:
+            parts.append("tags缺失")
+        degradation_reason = "⚠ " + "；".join(parts)
+
     # 输出
     data = {
         "final_scores": {dim: round(final_scores[dim], 1) for dim in DIRECT_DIMS},
         "corrections": {dim: corrections[dim] for dim in DIRECT_DIMS},
         "indirect_scores": {dim: indirect_scores.get(dim, 3) for dim in INDIRECT_DIMS},
         "original_direct_scores": {dim: original_direct.get(dim, 3) for dim in DIRECT_DIMS},
+        "rationale": {dim: direct_rationale.get(dim, "") for dim in DIRECT_DIMS},
+        "tags": tags,
+        "evidence": {
+            "rationale_missing": rationale_missing,
+            "tags_missing": tags_missing,
+        },
+        "degraded": degraded,
+        "degradation_reason": degradation_reason,
     }
     output = {"step": "08-summarize", "status": "ok", "error": None, "data": data}
 
+    # pi-lens-ignore: unchecked-throwing-call-python
     os.makedirs(step_dir, exist_ok=True)
+    # pi-lens-ignore: unchecked-throwing-call-python
     with open(os.path.join(step_dir, "output.json"), "w") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 

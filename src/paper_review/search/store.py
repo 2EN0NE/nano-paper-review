@@ -712,6 +712,51 @@ class Store:
             paper.meta.features = list(features)
         return updated
 
+    def promote_to_history(self, paper_ids: list[str]) -> int:
+        """将一批论文从 Pending Pool 提升到 History Pool（Pool Promotion，ADR 0016）。
+
+        Post 阶段（09-archive-reports）在批次评审完成后调用，把本批已索引的
+        Subject 全部标为 history，使其成为后续 review 的潜在 Reference。
+        幂等：重复调用无害。返回实际匹配（并被更新）的论文数。
+        """
+        if not paper_ids:
+            return 0
+        db = self.db
+        promoted = 0
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            for pid in paper_ids:
+                cur = db.execute("UPDATE papers SET pool = 'history' WHERE paper_id = ?", (pid,))
+                promoted += cur.rowcount
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        # 同步内存缓存（单测/已加载场景可见）
+        for pid in paper_ids:
+            paper = self.papers.get(pid)
+            if paper is not None:
+                paper.pool = "history"
+        return promoted
+
+    def count_pending(self, paper_ids: list[str]) -> int:
+        """返回 paper_ids 中 pool='pending' 的论文数（Pool Promotion 前置检查）。
+
+        ADR 0016「history 只增不减」：整批重跑时全部已是 history，pending 为 0
+        属正常，不应触发「池提升 0 篇」告警（区别于真的提升失败）。
+        """
+        if not paper_ids:
+            return 0
+        count = 0
+        for pid in paper_ids:
+            cur = self.db.execute(
+                "SELECT COUNT(*) FROM papers WHERE paper_id = ? AND pool = 'pending'",
+                (pid,),
+            )
+            row = cur.fetchone()
+            count += row[0] if row else 0
+        return count
+
     # ---- bulk 批量索引（轻内存） ----
 
     def bulk_add_paper(

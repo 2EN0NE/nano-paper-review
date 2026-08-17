@@ -14,10 +14,12 @@ from unittest.mock import patch
 
 import pytest
 
+from paper_review.agent import AgentConfig
 from paper_review.orchestrator import (
     _FULLTEXT_MAX_CHARS,
     _FULLTEXT_UNAVAILABLE_NOTE,
     PipelineConfig,
+    _apply_agent_overrides,
     _build_cli_tree,
     _collect_degradation_warnings,
     _estimate_subject_chars,
@@ -198,6 +200,91 @@ class TestPipelineConfigParsing:
         )
         assert cfg.phases[0].pool is not None
         assert cfg.phases[0].pool.granularity == "subject"
+
+    def test_agent_config_parsed_global_and_phase(self):
+        """全局 agent 段 + phase 级 agent 覆盖都被解析。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "agent-test",
+                "agent": {"type": "pi", "provider": "cli-proxy-api", "model": "deepseek-v4-pro"},
+                "phases": [
+                    {
+                        "name": "pre",
+                        "mode": "batch",
+                        "directory": "pre/",
+                        "agent": {"model": "deepseek-v4-flash"},
+                    },
+                    {"name": "review", "mode": "per_subject", "directory": "r/"},
+                ],
+            }
+        )
+        assert cfg.agent.type == "pi"
+        assert cfg.agent.provider == "cli-proxy-api"
+        assert cfg.agent.model == "deepseek-v4-pro"
+        pre = cfg.phases[0]
+        assert pre.agent is not None
+        assert pre.agent.provider == ""  # 未覆盖 → 空，继承全局
+        assert pre.agent.model == "deepseek-v4-flash"
+        assert cfg.phases[1].agent is None  # 未配置 → None，继承全局
+
+    def test_agent_config_defaults_empty(self):
+        """无 agent 段时默认 type=pi、provider/model 空（留空兜底）。"""
+        cfg = PipelineConfig.from_dict(
+            {
+                "name": "no-agent",
+                "phases": [{"name": "review", "mode": "per_subject", "directory": "r/"}],
+            }
+        )
+        assert cfg.agent.type == "pi"
+        assert cfg.agent.provider == ""
+        assert cfg.agent.model == ""
+        assert cfg.phases[0].agent is None
+
+    def test_shipped_pipeline_template_parses(self):
+        """shipped templates/pipeline.yaml 必须可被 PipelineConfig 解析（含 agent 段）。
+
+        真实模板从未被任何测试解析过——写错键名/语法错误不会在 CI 被拦截。
+        """
+        import yaml
+
+        template = (
+            Path(__file__).resolve().parent.parent / "src/paper_review/templates/pipeline.yaml"
+        )
+        data = yaml.safe_load(template.read_text(encoding="utf-8"))
+        cfg = PipelineConfig.from_dict(data)
+        assert cfg.phases, "shipped pipeline.yaml 无 phases"
+        assert cfg.agent is not None
+        assert cfg.agent.type == "pi"
+        # 默认模板不硬编码 provider/model（降低弱依赖）；phase 级覆盖仅作注释示例
+        assert cfg.agent.provider == ""
+        assert cfg.agent.model == ""
+
+
+class TestApplyAgentOverrides:
+    """phase 级 agent 覆盖全局 agent 注入（_apply_agent_overrides）。"""
+
+    def test_phase_overrides_global_model(self):
+        base = {
+            "PIPELINE_AGENT_TYPE": "pi",
+            "PIPELINE_AGENT_PROVIDER": "cli-proxy-api",
+            "PIPELINE_AGENT_MODEL": "deepseek-v4-pro",
+        }
+        env = _apply_agent_overrides(base, AgentConfig(model="deepseek-v4-flash"))
+        assert env["PIPELINE_AGENT_PROVIDER"] == "cli-proxy-api"  # 未覆盖 → 保留全局
+        assert env["PIPELINE_AGENT_MODEL"] == "deepseek-v4-flash"  # 覆盖
+
+    def test_phase_overrides_both(self):
+        base = {"PIPELINE_AGENT_PROVIDER": "old", "PIPELINE_AGENT_MODEL": "old"}
+        env = _apply_agent_overrides(base, AgentConfig(provider="new-p", model="new-m"))
+        assert env == {"PIPELINE_AGENT_PROVIDER": "new-p", "PIPELINE_AGENT_MODEL": "new-m"}
+
+    def test_none_agent_returns_original(self):
+        base = {"PIPELINE_AGENT_MODEL": "deepseek-v4-pro"}
+        assert _apply_agent_overrides(base, None) is base
+
+    def test_empty_agent_returns_original(self):
+        base = {"PIPELINE_AGENT_MODEL": "deepseek-v4-pro"}
+        assert _apply_agent_overrides(base, AgentConfig()) is base
 
 
 # ============================================================================
@@ -574,13 +661,18 @@ class TestCollectDegradationWarnings:
         )
         self._write(
             task_dir / "intermediates" / "post" / "09-archive-reports" / "output.json",
-            {"step": "09-archive-reports", "status": "ok", "data": {"tags_written": 0}},
+            {
+                "step": "09-archive-reports",
+                "status": "ok",
+                "data": {"tags_written": 0, "promoted": 0, "pending_before": 1},
+            },
         )
 
         warnings = _collect_degradation_warnings(task_dir)
         assert any("history" in w for w in warnings)
         assert any("技术特征" in w for w in warnings)
         assert any("标签写回" in w for w in warnings)
+        assert any("池提升" in w for w in warnings)
         assert any("标签缺失" in w for w in warnings)
 
     def test_no_signals_returns_empty(self, tmp_path):
@@ -609,10 +701,49 @@ class TestCollectDegradationWarnings:
         )
         self._write(
             task_dir / "intermediates" / "post" / "09-archive-reports" / "output.json",
-            {"step": "09-archive-reports", "status": "ok", "data": {"tags_written": 1}},
+            {
+                "step": "09-archive-reports",
+                "status": "ok",
+                "data": {"tags_written": 1, "promoted": 1, "pending_before": 1},
+            },
         )
 
         assert _collect_degradation_warnings(task_dir) == []
+
+    def test_promote_error_distinguished_from_zero(self, tmp_path):
+        """promote_error 存在 → 发「池提升失败」而非「池提升 0 篇」。"""
+        task_dir = tmp_path / "task"
+        self._write(
+            task_dir / "intermediates" / "post" / "09-archive-reports" / "output.json",
+            {
+                "step": "09-archive-reports",
+                "status": "ok",
+                "data": {
+                    "tags_written": 1,
+                    "promoted": 0,
+                    "promote_error": "RuntimeError: promotion exploded",
+                },
+            },
+        )
+
+        warnings = _collect_degradation_warnings(task_dir)
+        assert any("池提升失败" in w for w in warnings)
+        assert not any("池提升 0 篇" in w for w in warnings)
+
+    def test_zero_promoted_no_pending_is_silent(self, tmp_path):
+        """pending_before=0（整批重跑，全部已是 history）→ 不告警「池提升 0 篇」。"""
+        task_dir = tmp_path / "task"
+        self._write(
+            task_dir / "intermediates" / "post" / "09-archive-reports" / "output.json",
+            {
+                "step": "09-archive-reports",
+                "status": "ok",
+                "data": {"tags_written": 1, "promoted": 0, "pending_before": 0},
+            },
+        )
+
+        warnings = _collect_degradation_warnings(task_dir)
+        assert not any("池提升" in w for w in warnings)
 
     def test_no_intermediates_returns_empty(self, tmp_path):
         """intermediates 目录不存在 → 空列表。"""
@@ -657,6 +788,50 @@ class TestCollectDegradationWarnings:
         )
         warnings = _collect_degradation_warnings(task_dir)
         assert not any("覆盖率" in w for w in warnings)
+
+    def test_evidence_degradation_detected(self, tmp_path):
+        """08-summarize 的 evidence 标记 rationale/tags 缺失 → 收集到字段级降级项。"""
+        task_dir = tmp_path / "task"
+        sd = self._subject(task_dir, "subject-01")
+        self._write(
+            sd / "08-summarize" / "output.json",
+            {
+                "step": "08-summarize",
+                "status": "ok",
+                "data": {
+                    "evidence": {
+                        "rationale_missing": ["难度"],
+                        "tags_missing": True,
+                    },
+                },
+            },
+        )
+        warnings = _collect_degradation_warnings(task_dir)
+        degraded = [w for w in warnings if "评分证据降级" in w]
+        assert degraded
+        assert "subject-01" in degraded[0]
+        assert "缺证据:难度" in degraded[0]
+        assert "tags缺失" in degraded[0]
+
+    def test_no_evidence_degradation_when_complete(self, tmp_path):
+        """evidence 无缺失（rationale/tags 齐全）→ 不产生证据降级项。"""
+        task_dir = tmp_path / "task"
+        sd = self._subject(task_dir, "subject-01")
+        self._write(
+            sd / "08-summarize" / "output.json",
+            {
+                "step": "08-summarize",
+                "status": "ok",
+                "data": {
+                    "evidence": {
+                        "rationale_missing": [],
+                        "tags_missing": False,
+                    },
+                },
+            },
+        )
+        warnings = _collect_degradation_warnings(task_dir)
+        assert not any("评分证据降级" in w for w in warnings)
 
 
 # ============================================================================

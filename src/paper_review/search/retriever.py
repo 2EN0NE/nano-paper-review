@@ -70,18 +70,74 @@ def rrf_fuse(
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def overlap_score(subject_features: list[str], reference_features: list[str]) -> float:
-    """L3 技术特征覆盖度（ADR 0015）。
+# 技术特征归一化：剥前后缀泛称（ADR 0015 真实验证发现——特征粒度一致性）。
+# 前缀表只收「泛称限定词」——剥掉后残留仍是完整技术词（如「分布式 KV 存储」
+# →「kv存储」）。语义承载强的词（动态/静态/在线/离线/内存/统一/通用）是复合
+# 技术名的头部，剥掉会塌缩成无关泛词：「静态分析」「动态分析」都塌成「分析」
+# 被判为同一技术、「动态规划」→「规划」、「内存屏障」→「屏障」。这些词不进
+# 前缀表，靠 _features_match 的前缀匹配（短名 vs 全称）对齐同技术不同表述。
+GENERIC_PREFIXES = [
+    "分布式",
+    "持久化",
+]
+GENERIC_SUFFIXES = [
+    "收集器",
+    "回收器",
+    "算法",
+    "机制",
+    "技术",
+    "方案",
+    "框架",
+    "引擎",
+    "系统",
+    "平台",
+]
 
-    ``|subject特征 ∩ reference特征| / |reference特征|``
+
+def _normalize_feature(feature: str) -> str:
+    """归一化技术特征：去空格/小写 + 剥前后缀泛称。
+
+    「CMS 收集器」→「cms」，「分布式 KV 存储」→「kv存储」。
+    归一化是单向剥除（不可逆），只剥明确泛称，不展开缩写（缩写→全称
+    不可维护，靠抽取端 prompt 引导全称）。
+    """
+    f = feature.strip().lower().replace(" ", "")
+    for p in GENERIC_PREFIXES:
+        if f.startswith(p) and len(f) > len(p):
+            f = f[len(p) :]
+            break
+    for s in GENERIC_SUFFIXES:
+        if f.endswith(s) and len(f) > len(s):
+            f = f[: -len(s)]
+            break
+    return f
+
+
+def _features_match(a: str, b: str) -> bool:
+    """两个特征是否同一技术（含同技术不同表述，ADR 0015 模糊匹配）。
+
+    归一化后相等，或互为前缀（短名 vs 全称：「cms」是「cms并发标记清除」的前缀）。
+    前缀匹配而非子串匹配：子串会让短缩写（「gc」）虚高命中「zgc」「g1gc」等。
+    """
+    na, nb = _normalize_feature(a), _normalize_feature(b)
+    if na == nb:
+        return True
+    return bool(na) and bool(nb) and (na.startswith(nb) or nb.startswith(na))
+
+
+def overlap_score(subject_features: list[str], reference_features: list[str]) -> float:
+    """L3 技术特征覆盖度（ADR 0015，模糊匹配版）。
+
+    对每个 reference 特征，检查是否有 subject 特征模糊覆盖（归一化 + 前缀匹配），
+    命中记 1（二值，不加权）。overlap = 命中数 / |reference 特征|。
     方向性：Reference 的技术方法是否落在 Subject 的技术范围内。
     reference_features 为空时返回 0.0（L3 失效，退 L2-only）。
     """
     if not reference_features:
         return 0.0
     ref_set = set(reference_features)
-    subj_set = set(subject_features)
-    return len(subj_set & ref_set) / len(ref_set)
+    matched = sum(1 for r in ref_set if any(_features_match(s, r) for s in subject_features))
+    return matched / len(ref_set)
 
 
 def _l3_sort_key(c: dict) -> tuple[float, bool, float]:

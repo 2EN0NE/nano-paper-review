@@ -14,6 +14,7 @@ import yaml
 from typer.testing import CliRunner
 
 from paper_review.cli import app
+from paper_review.scaffold import SCAFFOLD_VERSION
 
 runner = CliRunner()
 
@@ -190,7 +191,7 @@ class TestInitResetCommand:
         assert pre_phase["manifest_step"] == "01-convert"
         # manifest 更新为 0.2.0 + 新名清单
         new_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        assert new_manifest["version"] == "0.2.0"
+        assert new_manifest["version"] == SCAFFOLD_VERSION
         assert "pipelines/standard/pre-review/01-convert.py" in new_manifest["files"]
         assert not any("00-convert" in f for f in new_manifest["files"])
 

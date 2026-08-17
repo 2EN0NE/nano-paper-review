@@ -17,6 +17,7 @@ from pathlib import Path
 
 import yaml
 
+from paper_review.agent import AgentConfig
 from paper_review.logging_config import get_logger
 
 logger = get_logger("orchestrator")
@@ -226,6 +227,9 @@ class PhaseConfig:
     # batch-only
     manifest_step: str = ""
 
+    # agent 启动配置覆盖（phase 级，覆盖全局 agent；type 仅全局生效）
+    agent: AgentConfig | None = None
+
     # per_subject-only
     subject_source: SubjectSourceConfig | None = None
     subject_order: SubjectOrderConfig | None = None
@@ -251,6 +255,7 @@ def _parse_phase(data: dict) -> PhaseConfig:
     subject_source_data = data.get("subject_source")
     priority_data = data.get("subject_order", {}).get("priority")
     pool_data = data.get("pool")
+    agent_data = data.get("agent")
 
     return PhaseConfig(
         name=data.get("name", ""),
@@ -264,6 +269,14 @@ def _parse_phase(data: dict) -> PhaseConfig:
         duplicate_policy=data.get("duplicate_policy", "skip"),
         manifest_step=data.get("manifest_step", ""),
         step_timeout=data.get("step_timeout", 0),
+        agent=(
+            AgentConfig(
+                provider=agent_data.get("provider", ""),
+                model=agent_data.get("model", ""),
+            )
+            if agent_data
+            else None
+        ),
         subject_source=(
             SubjectSourceConfig(
                 type=subject_source_data.get("type", "cli"),
@@ -299,6 +312,7 @@ class PipelineConfig:
     version: str = "1.0"
     output_dir: Path = Path("./output")
     phases: list[PhaseConfig] = field(default_factory=list)
+    agent: AgentConfig = field(default_factory=AgentConfig)
 
     @classmethod
     def from_dict(cls, data: dict) -> PipelineConfig:
@@ -312,11 +326,17 @@ class PipelineConfig:
             phase = _parse_phase(pd)
             phases.append(phase)
 
+        agent_data = data.get("agent") or {}
         return cls(
             name=name,
             version=version,
             output_dir=output_dir,
             phases=phases,
+            agent=AgentConfig(
+                type=agent_data.get("type", "pi"),
+                provider=agent_data.get("provider", ""),
+                model=agent_data.get("model", ""),
+            ),
         )
 
     @classmethod

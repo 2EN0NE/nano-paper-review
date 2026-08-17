@@ -20,6 +20,7 @@ from paper_review.pipeline_steps import (
     _classify_stderr_error,
     _extract_error_message,
     _output_json_is_valid,
+    _try_parse_agent_json,
 )
 
 # ============================================================================
@@ -295,6 +296,48 @@ class TestStripAnsi:
 
 
 # ============================================================================
+# _try_parse_agent_json — JSON 提取（直接 / 代码围栏）
+# ============================================================================
+
+
+class TestTryParseAgentJson:
+    def test_plain_dict(self):
+        assert _try_parse_agent_json('{"a": 1}') == {"a": 1}
+
+    def test_json_fence_extraction(self):
+        text = '好的，结果如下：\n```json\n{"step": "x", "status": "ok", "data": {}}\n```\n'
+        assert _try_parse_agent_json(text) == {"step": "x", "status": "ok", "data": {}}
+
+    def test_fence_without_lang_tag(self):
+        text = '```\n{"a": 1}\n```'
+        assert _try_parse_agent_json(text) == {"a": 1}
+
+    def test_non_json_returns_none(self):
+        assert _try_parse_agent_json("plain text") is None
+
+    def test_json_scalar_returns_none(self):
+        # 合法 JSON 但非 dict（字符串/数字/列表）→ 视为格式失败
+        assert _try_parse_agent_json('"hello"') is None
+        assert _try_parse_agent_json("123") is None
+        assert _try_parse_agent_json("[1, 2, 3]") is None
+
+    def test_empty_returns_none(self):
+        assert _try_parse_agent_json("") is None
+
+    def test_nested_braces_with_fence(self):
+        """代码围栏内嵌套花括号（字符串值含花括号）→ balance 扫描正确提取。"""
+        text = '好的：\n```json\n{"data": {"note": "含 { } 的文本", "scores": {"创新性": 5}}}\n```'
+        assert _try_parse_agent_json(text) == {
+            "data": {"note": "含 { } 的文本", "scores": {"创新性": 5}}
+        }
+
+    def test_fence_with_trailing_text_after_json(self):
+        """JSON 之后附说明文字再闭合围栏 → 仍能提取（旧正则要求 } 后紧跟 ```）。"""
+        text = '```json\n{"step": "x", "status": "ok", "data": {}}\n以上是评分结果。\n```'
+        assert _try_parse_agent_json(text) == {"step": "x", "status": "ok", "data": {}}
+
+
+# ============================================================================
 # AgentRunner 正常路径 — pi 成功退出，解析 output.json
 # ============================================================================
 
@@ -365,10 +408,42 @@ class TestAgentRunnerSuccess:
             timeout=5,
         )
 
+        assert result.status == "error"
+        assert "不是合法 JSON" in (result.error or "")
+        # 原文保留进 data.raw_output，供 08-summarize 重试耗尽后正则兜底
+        assert "plain text" in result.data["raw_output"]
+        # output.json 落盘为 error + raw_output
+        content = json.loads((step_dir / "output.json").read_text())
+        assert content["status"] == "error"
+        assert "plain text" in content["data"]["raw_output"]
+        # 失败反馈标记已写入（供下一次 attempt 注入 prompt）
+        assert (step_dir / "_format_error.txt").exists()
+
+    def test_format_error_feedback_injected_on_retry(self, tmp_path):
+        """第一次格式失败写 _format_error.txt → 第二次 run 把反馈注入 prompt 并消费掉。"""
+        step_dir = tmp_path / "step"
+        step_dir.mkdir(parents=True)
+        (step_dir / "_format_error.txt").write_text("上一次输出不是 JSON", encoding="utf-8")
+
+        script = self._make_success_pi(
+            tmp_path,
+            "fake_pi_retry",
+            {"step": "03-scoring", "status": "ok", "data": {"score": 90}},
+        )
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test prompt",
+            step_stem="03-scoring",
+            step_dir=step_dir,
+            env={"PIPELINE_PI_BINARY": str(script)},
+            timeout=5,
+        )
         assert result.status == "ok"
-        # 非 dict JSON 值或非 JSON 文本 → 兜底到 raw_output
-        # （pi 输出非 JSON 文本时，_parse_output 走 JSONDecodeError 分支，
-        #   raw_output 放入 data；输出 JSON 值但非 dict 时走 isinstance 分支）
+        # prompt.md 里包含注入的失败反馈
+        prompt_content = (step_dir / "prompt.md").read_text(encoding="utf-8")
+        assert "上一次输出不是 JSON" in prompt_content
+        # 反馈标记被消费掉
+        assert not (step_dir / "_format_error.txt").exists()
 
     def test_pi_non_zero_exit_parses_stderr(self, tmp_path):
         """pi exit=1 + stderr 含 503 → status=error + 错误分类正确。"""
@@ -806,3 +881,108 @@ class TestPiArgs:
         args = args_txt.read_text().strip().split()
         for expected in _DEFAULT_PI_ARGS:
             assert expected in args, f"Expected '{expected}' in args: {args}"
+
+    def test_provider_model_args_passed_to_agent(self, tmp_path):
+        """PIPELINE_AGENT_PROVIDER/MODEL 实际传到 pi 的 argv（回归 402）。"""
+        script = self._make_arg_recording_fake_pi(tmp_path, "fake_pi_provider")
+        step_dir = tmp_path / "step"
+
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test",
+            step_stem="01-test",
+            step_dir=step_dir,
+            env={
+                "PIPELINE_PI_BINARY": str(script),
+                "PIPELINE_AGENT_PROVIDER": "cli-proxy-api",
+                "PIPELINE_AGENT_MODEL": "deepseek-v4-pro",
+            },
+            timeout=5,
+        )
+
+        assert result.status == "ok"
+        args = (step_dir / "args.txt").read_text().strip().split()
+        assert "--provider" in args and "cli-proxy-api" in args
+        assert "--model" in args and "deepseek-v4-pro" in args
+
+
+class TestAgentModelFallback:
+    """显式 provider/model 报错 → 回退为不传（Agent 默认）重试。"""
+
+    def test_explicit_model_error_retries_without_model(self, tmp_path):
+        """显式 model 非零退出 → 第二次不带 model 重试成功。"""
+        script = tmp_path / "fake_pi_fallback"
+        script.write_text(
+            "#!/bin/sh\n"
+            'echo "$@" >> "$PIPELINE_STEP_DIR/all_args.txt"\n'
+            'case "$*" in *--model*) echo "402 Insufficient Balance" >&2; exit 1 ;; esac\n'
+            'echo \'{"step":"test","status":"ok","data":{"ok":true}}\'\n'
+            "exit 0\n"
+        )
+        os.chmod(str(script), stat.S_IRWXU)  # noqa: S103
+        step_dir = tmp_path / "step"
+
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test",
+            step_stem="01-test",
+            step_dir=step_dir,
+            env={
+                "PIPELINE_PI_BINARY": str(script),
+                "PIPELINE_AGENT_MODEL": "deepseek-v4-pro",
+            },
+            timeout=5,
+        )
+
+        assert result.status == "ok"
+        calls = (step_dir / "all_args.txt").read_text().strip().splitlines()
+        assert len(calls) == 2  # 第一次带 model 失败 → 第二次不带 model 成功
+        assert "--model" in calls[0].split()
+        assert "--model" not in calls[1].split()
+
+    def test_no_retry_when_no_explicit_model(self, tmp_path):
+        """未显式配置 model 时，失败不重试（避免双倍开销）。"""
+        script = tmp_path / "fake_pi_no_model"
+        script.write_text(
+            '#!/bin/sh\necho "$@" >> "$PIPELINE_STEP_DIR/all_args.txt"\necho "boom" >&2\nexit 1\n'
+        )
+        os.chmod(str(script), stat.S_IRWXU)  # noqa: S103
+        step_dir = tmp_path / "step"
+
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test",
+            step_stem="01-test",
+            step_dir=step_dir,
+            env={"PIPELINE_PI_BINARY": str(script)},
+            timeout=5,
+        )
+
+        assert result.status == "error"
+        calls = (step_dir / "all_args.txt").read_text().strip().splitlines()
+        assert len(calls) == 1  # 无显式 model，不重试
+
+    def test_non_model_error_does_not_retry(self, tmp_path):
+        """非模型错误（如 prompt 崩溃）→ 不回退，直接传播 error（避免静默换模型）。"""
+        script = tmp_path / "fake_pi_non_model_error"
+        script.write_text(
+            '#!/bin/sh\necho "$@" >> "$PIPELINE_STEP_DIR/all_args.txt"\necho "panic: index out of range" >&2\nexit 1\n'
+        )
+        os.chmod(str(script), stat.S_IRWXU)  # noqa: S103
+        step_dir = tmp_path / "step"
+
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test",
+            step_stem="01-test",
+            step_dir=step_dir,
+            env={
+                "PIPELINE_PI_BINARY": str(script),
+                "PIPELINE_AGENT_MODEL": "deepseek-v4-pro",
+            },
+            timeout=5,
+        )
+
+        assert result.status == "error"
+        calls = (step_dir / "all_args.txt").read_text().strip().splitlines()
+        assert len(calls) == 1  # 非模型错误，不回退重试

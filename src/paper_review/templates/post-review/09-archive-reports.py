@@ -1,6 +1,9 @@
 """
-09-archive-reports.py — 归档评审报告
-将评审中间产物汇总为最终报告写入 reports/ 目录
+09-archive-reports.py — 归档评审报告 + 索引写回（标签 + Pool Promotion）
+
+将评审中间产物汇总为最终报告写入 reports/ 目录；并把本批已索引的 Subject
+从 Pending Pool 提升到 History Pool（Pool Promotion，ADR 0016），使审过的
+论文成为后续 review 的潜在 Reference。
 """
 
 from __future__ import annotations
@@ -16,7 +19,12 @@ def main():
     step_dir = os.environ.get("PIPELINE_STEP_DIR", ".")
 
     output_root = Path(output_dir)
-    intermediates_dir = output_root / "intermediates"
+    # 修复：intermediates 实际位于 result/{task_id}/intermediates（orchestrator 注入的
+    # PIPELINE_INTERMEDIATES），而非 output_root/intermediates。缺失环境变量时回退旧
+    # 路径（runpy 直调/单测兼容）。
+    intermediates_dir = Path(
+        os.environ.get("PIPELINE_INTERMEDIATES", str(output_root / "intermediates"))
+    )
     reports_dir = output_root / "reports"
 
     # 收集所有 Subject 的 review 中间产物
@@ -72,8 +80,11 @@ def main():
             "data": {"archived_subjects": archived, "total": len(archived)},
         }
 
-    # ── 标签写回：把 06-direct-scoring 的 tags 落库 papers.tags ──
+    # ── 索引写回：标签 + Pool Promotion（ADR 0016）──
     tags_written = 0
+    promoted = 0
+    promote_error = None
+    pending_before = 0
     store_dir = Path(os.environ.get("PIPELINE_INDEX_STORE_DIR", "./index"))
     auto_index_output = intermediates_dir / "pre" / "02-auto-index" / "output.json"
     subject_paper_ids: dict[str, str] = {}
@@ -118,10 +129,24 @@ def main():
                     if updated:
                         tags_written += 1
                         print(f"  ✓ 标签写回: {subject_name} → {tags}")
+
+                # ── Pool Promotion：本批已索引 Subject → history ──
+                # 先查 pending 数：整批重跑时全部已是 history（pending=0）属正常，
+                # 不触发哨兵告警；真的提升失败则记录 promote_error 供哨兵区分。
+                try:
+                    pending_before = store.count_pending(list(subject_paper_ids.values()))
+                    promoted = store.promote_to_history(list(subject_paper_ids.values()))
+                    print(f"  ✓ 池提升: {promoted} 篇 pending → history")
+                except Exception as e:
+                    promote_error = f"{type(e).__name__}: {e}"
+                    print(f"  ⚠ 池提升失败: {promote_error}", file=sys.stderr)
             finally:
                 store.close()
 
     output["data"]["tags_written"] = tags_written
+    output["data"]["promoted"] = promoted
+    output["data"]["promote_error"] = promote_error
+    output["data"]["pending_before"] = pending_before
 
     try:
         os.makedirs(step_dir, exist_ok=True)
@@ -131,7 +156,8 @@ def main():
         print(f"Failed to write archive output: {e}", file=__import__("sys").stderr)
 
     print(
-        f"Archived {len(output['data']['archived_subjects'])} subject report(s), tags_written={tags_written}"
+        f"Archived {len(output['data']['archived_subjects'])} subject report(s), "
+        f"tags_written={tags_written}, promoted={promoted}"
     )
 
 

@@ -478,7 +478,7 @@ class TestAgentRunner:
         assert result.data == {"score": 0.9}
 
     def test_parse_output_non_json_raw(self, tmp_path):
-        """非 JSON stdout 包装为 raw_output。"""
+        """非 JSON stdout → 标记 error（触发重试），原文保留进 raw_output 供降级兑底。"""
         import subprocess
 
         runner = AgentRunner()
@@ -492,7 +492,8 @@ class TestAgentRunner:
             stderr="",
         )
         result = runner._parse_output(proc, "01-review", step_dir)
-        assert result.status == "ok"
+        assert result.status == "error"
+        assert "不是合法 JSON" in (result.error or "")
         assert "raw_output" in result.data
 
     def test_parse_output_nonzero_exit(self, tmp_path):

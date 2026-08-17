@@ -2012,7 +2012,7 @@ class TestRealModelChunkRetrieval:
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
         return script
 
-    def _setup_real_pipeline(self, pipelines_dir: Path) -> Path:
+    def _setup_real_pipeline(self, pipelines_dir: Path, post_archive_real: bool = False) -> Path:
         """复制真实 pre 01/02/03/04 + review 03/04/05；02-auto-index 用真实模板。"""
         src = Path(__file__).resolve().parent.parent.parent / "src" / "paper_review" / "templates"
         pipeline_dir = pipelines_dir / "chunk-retrieval-real"
@@ -2086,14 +2086,20 @@ phases:
         )
         shutil.copy(src / "review-pipeline" / "08-summarize.py", review_dir / "08-summarize.py")
 
-        # post 步骤（空，但目录需要存在）
-        (post_dir / "09-archive-reports.py").write_text(
-            "import json, os\n"
-            "d = os.environ['PIPELINE_STEP_DIR']\n"
-            "os.makedirs(d, exist_ok=True)\n"
-            "json.dump({'step':'09-archive-reports','status':'ok','data':{}},"
-            "open(os.path.join(d,'output.json'),'w'))\n"
-        )
+        # post 步骤：真实 09-archive（含 Pool Promotion）或 noop
+        if post_archive_real:
+            shutil.copy(
+                src / "post-review" / "09-archive-reports.py",
+                post_dir / "09-archive-reports.py",
+            )
+        else:
+            (post_dir / "09-archive-reports.py").write_text(
+                "import json, os\n"
+                "d = os.environ['PIPELINE_STEP_DIR']\n"
+                "os.makedirs(d, exist_ok=True)\n"
+                "json.dump({'step':'09-archive-reports','status':'ok','data':{}},"
+                "open(os.path.join(d,'output.json'),'w'))\n"
+            )
         return pipeline_dir
 
     def _run_review(self, data_dir: Path, input_dir: Path, mock_bin: Path, fake_pi: Path):
@@ -2201,6 +2207,61 @@ phases:
         assert summary["data"]["model"]["embedding_used"], (
             "真实 embedding 应参与检索（若 config 与模型缓存不一致会触发哈希降级）"
         )
+
+    @pytest.mark.skipif(
+        not _HAS_EMBEDDING_MODEL, reason="无本地 embedding 模型，跳过真实 Pool Promotion e2e"
+    )
+    def test_pool_promotion_after_review(self, tmp_path):
+        """Pool Promotion：批次评审完成后，pending Subject 提升为 history（ADR 0016）。"""
+        import sqlite3
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+
+        pipelines_dir = data_dir / "pipelines"
+        self._setup_real_pipeline(pipelines_dir, post_archive_real=True)
+
+        # reference_dir 放 history PDF（真实 02-auto-index 首次运行扫描建索引）
+        reference_dir = data_dir / "origin" / "pdf"
+        reference_dir.mkdir(parents=True)
+        _make_pdf(reference_dir / "history-a.pdf", "history paper A content")
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        fake_pi = self._make_capturing_pi(mock_bin)
+        _make_mock_pandoc(mock_bin)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _make_pdf(input_dir / "subject-a.pdf", "subject A content")
+
+        result = self._run_review(data_dir, input_dir, mock_bin, fake_pi)
+        assert result.returncode == 0, f"STDOUT:{result.stdout[:800]}\nSTDERR:{result.stderr[:800]}"
+
+        task_dir = _find_task_dir(data_dir / "output")
+        intermediates = task_dir / "intermediates"
+
+        # 1. 09-archive 产物记录了 promoted 数量
+        archive_out = intermediates / "post" / "09-archive-reports" / "output.json"
+        assert archive_out.exists(), f"09-archive 产物缺失: {archive_out}"
+        archive_data = json.loads(archive_out.read_text())
+        assert archive_data["data"]["promoted"] >= 1, "Pool Promotion 应提升至少 1 篇"
+
+        # 2. 索引里 subject 的 pool 从 pending 变为 history
+        auto_index_out = intermediates / "pre" / "02-auto-index" / "output.json"
+        ai_data = json.loads(auto_index_out.read_text())
+        subject_paper_ids = ai_data["data"]["subject_paper_ids"]
+        assert subject_paper_ids, "02-auto-index 应产出 subject_paper_ids"
+
+        conn = sqlite3.connect(data_dir / "index" / "index.sqlite")
+        try:
+            for subject, pid in subject_paper_ids.items():
+                row = conn.execute("SELECT pool FROM papers WHERE paper_id = ?", (pid,)).fetchone()
+                assert row is not None, f"索引里找不到 subject {subject} 的 paper {pid}"
+                assert row[0] == "history", f"subject {subject} 的 pool 应为 history，实际 {row[0]}"
+        finally:
+            conn.close()
 
 
 # ============================================================================
@@ -2351,23 +2412,35 @@ phases:
         "os.makedirs(d, exist_ok=True)\n"
         'json.dump({"step":"01-convert","status":"ok","data":{}},open(os.path.join(d,"output.json"),"w"))\n'
     )
-    # 简化 02-auto-index：建 papers 表（含 features 列）+ 写 subject_paper_ids
+    # 简化 02-auto-index：用 store.add_paper 完整建索引（chunks + 哈希向量），
+    # 使 05-batch-search 的检索有 chunks 可召回（验证 L3 模糊匹配需真实检索链路）
     (pre_dir / "02-auto-index.py").write_text(
         "import json, os, hashlib\n"
         "from pathlib import Path\n"
         'd=os.environ["PIPELINE_STEP_DIR"]\n'
         'out=os.environ["PIPELINE_OUTPUT_DIR"]\n'
         'store_dir=Path(os.environ.get("PIPELINE_INDEX_STORE_DIR","./index"))\n'
-        "from paper_review.search.store import Store\n"
+        "from paper_review.search.store import Store, Paper, PaperMeta, ChunkVector\n"
+        "from paper_review.search.chunker import chunk_paper\n"
+        "from paper_review.search.search_types import deterministic_hash_vector, VECTOR_DIM\n"
+        "from paper_review.extractor import extract_pdf\n"
         "store_dir.mkdir(parents=True, exist_ok=True)\n"
         'store=Store(str(store_dir/"index.sqlite"))\n'
         'manifest=json.loads((Path(out)/"subject-manifest.json").read_text())\n'
         "subject_paper_ids={}\n"
         'for subj in manifest.get("subjects",[]):\n'
+        '    name=subj["name"]\n'
         '    pid=hashlib.sha256(subj["pdf_path"].encode()).hexdigest()[:12]\n'
-        '    subject_paper_ids[subj["name"]]=pid\n'
-        '    store.db.execute("INSERT OR REPLACE INTO papers (paper_id,filepath,filename,pool) VALUES (?,?,?,?)",(pid,subj["pdf_path"],Path(subj["pdf_path"]).name,"pending"))\n'
-        "store.db.commit()\n"
+        "    subject_paper_ids[name]=pid\n"
+        "    try:\n"
+        "        raw_text=extract_pdf(subj['pdf_path'])\n"
+        "    except Exception:\n"
+        "        raw_text=''\n"
+        "    meta=PaperMeta(filename=Path(subj['pdf_path']).name, title_hint=name)\n"
+        "    paper=Paper(paper_id=pid, filepath=subj['pdf_path'], meta=meta, raw_text=raw_text, pages=1, pool='pending')\n"
+        "    chunks=chunk_paper(paper)\n"
+        "    cvs=[ChunkVector(chunk_id=c.chunk_id, vector=deterministic_hash_vector(c.text), dim=VECTOR_DIM) for c in chunks]\n"
+        "    store.add_paper(paper, cvs)\n"
         "store.close()\n"
         "os.makedirs(d, exist_ok=True)\n"
         'json.dump({"step":"02-auto-index","status":"ok","error":None,"data":{"subject_paper_ids":subject_paper_ids}},open(os.path.join(d,"output.json"),"w"))\n'
@@ -2499,3 +2572,70 @@ class TestTechnicalFeaturePipeline:
         assert data["l3_total"] == 1
         assert data["l3_covered"] == 0
         assert data["l3_coverage"] == 0.0
+
+    def test_fuzzy_match_aligns_granularity_in_search(self, tmp_path: Path):
+        """粒度不一致两篇（泛称 vs 具体），05-batch-search 模糊匹配对齐。
+
+        真实验证发现：ZGC 抽「CMS 收集器」（泛称），CMS GC 抽「CMS 并发标记清除」
+        （具体），精确交集为空 → overlap 0。模糊匹配应让两者对齐，combined_score 反映 overlap。
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "index").mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+        _setup_l3_pipeline(data_dir / "pipelines")
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        # mock pi：根据 prompt 里的 subject 名输出不同粒度特征（模拟粒度不一致）
+        (mock_bin / "pi").write_text(
+            "#!/bin/sh\n"
+            'PROMPT_FILE=""\n'
+            'for arg in "$@"; do\n'
+            '  case "$arg" in @*) PROMPT_FILE="${arg#@}" ;; esac\n'
+            "done\n"
+            'if grep -q "gc-a" "$PROMPT_FILE" 2>/dev/null; then\n'
+            "  echo '[\"CMS 收集器\"]'\n"
+            'elif grep -q "gc-b" "$PROMPT_FILE" 2>/dev/null; then\n'
+            "  echo '[\"CMS 并发标记清除\"]'\n"
+            "else\n"
+            "  echo '[]'\n"
+            "fi\n"
+        )
+        os.chmod(str(mock_bin / "pi"), stat.S_IRWXU)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _make_pdf(input_dir / "gc-a.pdf", "CMS 收集器 gc-a")
+        _make_pdf(input_dir / "gc-b.pdf", "CMS 并发标记清除 gc-b")
+
+        env = os.environ.copy()
+        env["PATH"] = str(mock_bin) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = str(mock_bin / "pi")
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                "--phase",
+                "pre",
+                str(input_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        assert result.returncode == 0, f"pre 失败:\nSTDERR:{result.stderr[:800]}"
+
+        task_dir = list((data_dir / "output" / "result").iterdir())[0]
+        out = task_dir / "intermediates" / "gc-a" / "05-batch-search" / "output.json"
+        data = json.loads(out.read_text())["data"]
+        pending = data["pending"]
+        # gc-a 排除自身后，pending 池应有 gc-b（同批 subject）
+        assert len(pending) == 1, f"pending 应为 gc-b，实为 {pending}"
+        # 模糊匹配：gc-b 的 combined_score = overlap（1.0），非退化 vector
+        assert pending[0]["combined_score"] > 0.9, f"模糊匹配未生效: {pending[0]}"

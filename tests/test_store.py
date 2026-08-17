@@ -94,6 +94,44 @@ class TestStore:
         assert not store.update_features("no_such_paper", ["特征"])
         store.close()
 
+    def test_promote_to_history(self):
+        """Pool Promotion：pending → history 批量提升（ADR 0016）。"""
+        store = Store(":memory:")
+        papers = []
+        for name in ["A", "B"]:
+            paper = make_sample_paper(name, pool="pending")
+            chunks = chunk_paper(paper)
+            cvs = make_mock_chunk_vecs(chunks)
+            store.add_paper(paper, cvs)
+            papers.append(paper)
+        promoted = store.promote_to_history([p.paper_id for p in papers])
+        assert promoted == 2
+        assert store.papers[papers[0].paper_id].pool == "history"
+        assert store.papers[papers[1].paper_id].pool == "history"
+        store.close()
+
+    def test_promote_to_history_empty_and_nonexistent(self):
+        store = Store(":memory:")
+        assert store.promote_to_history([]) == 0
+        assert store.promote_to_history(["no_such_paper"]) == 0
+        store.close()
+
+    def test_count_pending(self):
+        """count_pending：返回 pool='pending' 的论文数（Pool Promotion 前置检查）。"""
+        store = Store(":memory:")
+        papers = []
+        for name, pool in [("A", "pending"), ("B", "history"), ("C", "pending")]:
+            paper = make_sample_paper(name, pool=pool)
+            chunks = chunk_paper(paper)
+            cvs = make_mock_chunk_vecs(chunks)
+            store.add_paper(paper, cvs)
+            papers.append(paper)
+        ids = [p.paper_id for p in papers]
+        assert store.count_pending(ids) == 2
+        assert store.count_pending([]) == 0
+        assert store.count_pending(["no_such_paper"]) == 0
+        store.close()
+
     def test_bm25_search_found(self):
         store = Store(":memory:")
         paper = make_sample_paper("信用评估")

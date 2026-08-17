@@ -50,6 +50,10 @@ _Avoid_: 历史库, historical corpus, reference corpus
 当前批次待评审的 Subject 集合（`pool="pending"`）。检索结果中与本批次的其他 Subject 分开呈现，并排除内容与 Subject 自身相同的论文。
 _Avoid_: 当前批次, current batch, subject pool
 
+**Pool Promotion**:
+池提升。Post 阶段在批次评审完成后，将本批所有已索引 Subject 从 Pending Pool 提升到 History Pool 的动作。批次级触发（非逐篇），提升对象为本批成功索引的论文（不论评审状态）。与 Subject Copy 配合（后者负责复制 PDF 到 Origin Directory，本术语负责提升池），共同实现「审过的论文成为后续 review 的潜在 Reference」。
+_Avoid_: 晋升, promote to history, archive
+
 **Origin Directory**:
 原始 PDF 文件的存放目录。位于 `{data_dir}/origin/pdf/`，用作参考论文的持久化归档。由 `pipeline.yaml` 的 `index.reference_dir` 字段指向。
 _Avoid_: pdfs/, pdf directory, source folder

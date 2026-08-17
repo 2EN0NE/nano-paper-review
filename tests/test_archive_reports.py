@@ -187,3 +187,54 @@ class TestTagWriteback:
         out = _run_archive_template(_make_env(tmp_path, index_dir, output_dir))
         data = json.loads(out.read_text())
         assert data["data"]["tags_written"] == 0
+
+    def test_promote_failure_does_not_abort(self, tmp_path, monkeypatch):
+        """池提升抛异常 → 归档 step 仍落盘（promoted=0），不被写回失败阻断。"""
+        index_dir = tmp_path / "data" / "index"
+        output_dir = tmp_path / "output"
+        output_dir.mkdir(parents=True)
+        paper_id = _build_index_with_subject(index_dir, "信用评估")
+        intermediates = output_dir / "intermediates"
+        _write_auto_index(intermediates, {"信用评估": paper_id})
+        _write_scoring(intermediates, "信用评估", ["数据库", "流量回放", "SQL"])
+
+        def _boom(self, paper_ids):
+            raise RuntimeError("promotion exploded")
+
+        monkeypatch.setattr(Store, "promote_to_history", _boom)
+
+        out = _run_archive_template(_make_env(tmp_path, index_dir, output_dir))
+        data = json.loads(out.read_text())
+        assert data["status"] == "ok"
+        assert data["data"]["promoted"] == 0
+        # 失败原因记录进 promote_error（供哨兵区分「失败」与「0 篇可提升」）
+        assert data["data"]["promote_error"] is not None
+        assert "promotion exploded" in data["data"]["promote_error"]
+        # 归档与标签写回不受池提升失败影响
+        assert data["data"]["total"] >= 1
+        assert data["data"]["tags_written"] == 1
+
+    def test_uses_pipeline_intermediates_env(self, tmp_path):
+        """修复回归：intermediates 用 PIPELINE_INTERMEDIATES 环境变量定位
+        （orchestrator 实际注入 result/{task_id}/intermediates，而非 output/intermediates）。"""
+        index_dir = tmp_path / "data" / "index"
+        output_dir = tmp_path / "output"
+        output_dir.mkdir(parents=True)
+        paper_id = _build_index_with_subject(index_dir, "信用评估")
+        # intermediates 在非默认位置（模拟 result/{task_id}/intermediates）
+        intermediates = tmp_path / "result" / "task-1" / "intermediates"
+        _write_auto_index(intermediates, {"信用评估": paper_id})
+        _write_scoring(intermediates, "信用评估", ["数据库", "流量回放", "SQL"])
+
+        env = _make_env(tmp_path, index_dir, output_dir)
+        env["PIPELINE_INTERMEDIATES"] = str(intermediates)
+
+        out = _run_archive_template(env)
+        data = json.loads(out.read_text())
+        # 用 PIPELINE_INTERMEDIATES 找到 intermediates → tags 写回成功
+        assert data["data"]["tags_written"] == 1
+
+        store = Store(str(index_dir / "index.sqlite"))
+        store.load_for_search()
+        assert store.papers[paper_id].meta.tags == ["数据库", "流量回放", "SQL"]
+        store.close()

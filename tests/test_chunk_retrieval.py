@@ -227,3 +227,67 @@ class TestL3LayeredRerank:
         store = self._setup_with_features([("信用评估", "history", ["数据库"])])
         results = store.search("信用评估", with_rerank=False, subject_features=None)
         assert len(results) == 1
+
+
+class TestFeatureFuzzyMatch:
+    """ADR 0015 特征粒度一致性：归一化 + 前缀匹配的模糊 overlap。
+
+    真实验证发现：ZGC 抽「CMS 收集器」（泛称），CMS GC 抽「CMS 并发标记清除」
+    （具体算法），精确交集为空 → overlap 恒 0。模糊匹配让两者对齐到「cms」。
+    """
+
+    def test_normalize_strips_suffix_and_prefix(self):
+        from paper_review.search.retriever import _normalize_feature
+
+        assert _normalize_feature("CMS 收集器") == "cms"
+        assert _normalize_feature("G1 收集器") == "g1"
+        assert _normalize_feature("分布式 KV 存储") == "kv存储"
+
+    def test_normalize_lowercases_and_despaces(self):
+        from paper_review.search.retriever import _normalize_feature
+
+        assert _normalize_feature("  ZGC  ") == "zgc"
+        assert _normalize_feature("CMS GC") == "cmsgc"
+
+    def test_normalize_does_not_strip_technical_part(self):
+        from paper_review.search.retriever import _normalize_feature
+
+        # 「神经网络」的「网络」不在后缀表，不误剥为「神经」
+        assert _normalize_feature("神经网络") == "神经网络"
+
+    def test_normalize_keeps_compound_prefixes(self):
+        from paper_review.search.retriever import _normalize_feature
+
+        # 前缀词是复合技术名的语义头，不剥——剥掉会塌缩成无关泛词
+        assert _normalize_feature("动态规划") == "动态规划"
+        assert _normalize_feature("静态分析") == "静态分析"
+        assert _normalize_feature("在线学习") == "在线学习"
+        assert _normalize_feature("离线强化学习") == "离线强化学习"
+        assert _normalize_feature("内存屏障") == "内存屏障"
+        assert _normalize_feature("统一内存") == "统一内存"
+
+    def test_features_match_aligns_short_and_full(self):
+        from paper_review.search.retriever import _features_match
+
+        # 真实验证例子：前缀匹配对齐「CMS 收集器」与「CMS 并发标记清除」
+        assert _features_match("CMS 收集器", "CMS 并发标记清除")
+
+    def test_features_match_distinguishes_different_tech(self):
+        from paper_review.search.retriever import _features_match
+
+        assert not _features_match("ZGC", "G1")
+        assert not _features_match("STW", "CMS")
+
+    def test_features_match_distinguishes_prefix_pairs(self):
+        from paper_review.search.retriever import _features_match
+
+        # 静态分析 vs 动态分析、在线学习 vs 离线学习：不同技术，不得归一化为同一泛词
+        assert not _features_match("静态分析", "动态分析")
+        assert not _features_match("在线学习", "离线学习")
+
+    def test_overlap_counts_fuzzy_hit(self):
+        from paper_review.search.retriever import overlap_score
+
+        subj = ["ZGC", "STW", "CMS 收集器", "G1 收集器"]
+        ref = ["CMS 并发标记清除"]
+        assert overlap_score(subj, ref) == 1.0

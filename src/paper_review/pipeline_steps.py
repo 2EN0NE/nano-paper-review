@@ -19,6 +19,12 @@ import threading
 from pathlib import Path
 from typing import Protocol
 
+from paper_review.agent import (
+    AgentConfig,
+    build_command,
+    build_command_without_model,
+    is_model_config_error,
+)
 from paper_review.logging_config import get_logger
 from paper_review.pipeline_models import StepFile, StepResult
 
@@ -73,6 +79,7 @@ class PyStepRunner:
     ) -> StepResult:
         logger.info("  [.py] %s — starting", step.stem)
 
+        # pi-lens-ignore: unchecked-throwing-call-python
         os.makedirs(step_dir, exist_ok=True)
         step_env = {**os.environ, **env, "PIPELINE_STEP_DIR": str(step_dir)}
 
@@ -261,6 +268,45 @@ def _extract_error_message(stderr_clean: str) -> str:
 _DEFAULT_PI_ARGS = ["-ne"]
 
 
+class _AgentTimeoutError(Exception):
+    """Agent 子进程超时（携带文本 stderr 供调用方分类错误）。"""
+
+    def __init__(self, stderr: str) -> None:
+        super().__init__("agent subprocess timed out")
+        self.stderr = stderr
+
+
+def _run_agent_subprocess(
+    cmd: list[str],
+    step_env: dict,
+    step_timeout: int,
+) -> subprocess.CompletedProcess:
+    """执行一次 Agent 子进程（Popen + communicate，超时杀进程）。
+
+    超时时抛出 _AgentTimeoutError（携带文本 stderr 供分类）。
+    二进制不存在时 FileNotFoundError 原样上抛（调用方处理为 skipped）。
+    """
+    proc = subprocess.Popen(  # noqa: S603 — binary 来自环境配置，用户可控
+        cmd,
+        env=step_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        stdout_data, stderr_data = proc.communicate(timeout=step_timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, stderr_data = proc.communicate()
+        raise _AgentTimeoutError(stderr_data)
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=proc.returncode,
+        stdout=stdout_data or "",
+        stderr=stderr_data or "",
+    )
+
+
 def _output_json_is_valid(output_file: Path) -> bool:
     """检查 output.json 是否已由 pi 写入且有有效数据。
 
@@ -293,6 +339,68 @@ def _read_output_json_if_valid(output_file: Path) -> dict | None:
     return data
 
 
+def _extract_braced_json(text: str) -> str | None:
+    """从文本中提取第一个「平衡花括号」包裹的 JSON 对象原始片段。
+
+    用 balance 扫描（正确处理嵌套花括号与字符串字面量内的花括号），
+    从首个 `{` 匹配到对应 `}`。相比非贪婪正则，能容忍「JSON 后附说明
+    文字再闭合围栏」的常见 LLM 输出形态。
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _try_parse_agent_json(output_text: str) -> dict | None:
+    """从 pi stdout 提取结构化 JSON（dict）。
+
+    1) 直接 json.loads（成功且是 dict → 返回）
+    2) 首末花括号 balance 扫描提取再 loads（容忍代码围栏 / 前后说明文字）
+    3) 均失败 → None（调用方视为格式失败，触发重试）
+    """
+    if not output_text:
+        return None
+    try:
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    # 首末花括号 balance 扫描（容忍嵌套 JSON 与「JSON 后附文字」）
+    candidate = _extract_braced_json(output_text)
+    if candidate is None:
+        return None
+    try:
+        inner = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(inner, dict):
+        return inner
+    return None
+
+
 class AgentRunner:
     """通过 subprocess 调用 pi 执行 Agent 步骤。
 
@@ -316,11 +424,34 @@ class AgentRunner:
             env: 环境变量，可包含：
                 - PIPELINE_PI_BINARY: pi 可执行文件路径（默认 "pi"）
                 - PIPELINE_PI_ARGS: 空格分隔的 pi 额外参数（覆盖默认值 -ne）
+                - PIPELINE_AGENT_TYPE/PROVIDER/MODEL: Agent 类型与模型配置
+                  （留空不传 flag；显式配置报错时回退为不传）
                 - PIPELINE_STEP_TIMEOUT: 步骤超时秒数
             timeout: subprocess 超时秒数。
         """
+        # pi-lens-ignore: unchecked-throwing-call-python
         os.makedirs(step_dir, exist_ok=True)
         step_env = {**env, "PIPELINE_STEP_DIR": str(step_dir)}
+
+        # 失败反馈注入：上一次 attempt 因格式不合格失败时，把失败原因追加到 prompt
+        feedback_file = step_dir / "_format_error.txt"
+        if feedback_file.exists():
+            try:
+                feedback = feedback_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                feedback = ""
+            if feedback:
+                prompt += (
+                    "\n\n---\n\n"
+                    "⚠ 重要：你上一次的回复因未遵循「只输出一个 JSON 对象」的要求被判为不合格。"
+                    "这次请务必严格只输出一个 JSON 对象（首字符 `{`、末字符 `}`，"
+                    "禁止 Markdown、表格、代码围栏、解释性文字）。\n"
+                    "上一次的失败诊断：\n" + feedback
+                )
+            try:
+                feedback_file.unlink()
+            except OSError:
+                pass
 
         # 写入临时 prompt 文件（避免 CLI 参数过长 + shell 转义问题）
         prompt_file = step_dir / "prompt.md"
@@ -355,39 +486,39 @@ class AgentRunner:
         else:
             pi_extra_args = list(_DEFAULT_PI_ARGS)
 
+        # Agent 配置（type/provider/model）——留空不传 flag（继承 Agent 默认），
+        # 显式配置报错时回退为不传（降低对特定 provider/model 的硬编码弱依赖）。
+        agent_cfg = AgentConfig.from_env(env)
+        cmd = build_command(agent_cfg, pi_binary, str(prompt_file), pi_extra_args)
+
         prompt_size_kb = len(prompt) / 1024
         logger.info(
-            "  [%s] ▶ pi %s %s --no-session -p @%s (%.1fKB, timeout=%ds)",
+            "  [%s] ▶ pi %s (%.1fKB, timeout=%ds)",
             step_stem,
-            pi_binary,
-            " ".join(pi_extra_args),
-            prompt_file,
+            " ".join(cmd),
             prompt_size_kb,
             step_timeout,
         )
-        proc = None
         try:
-            proc = subprocess.Popen(  # noqa: S603 — pi_binary is user-configurable
-                [pi_binary, *pi_extra_args, "--no-session", "-p", f"@{prompt_file}"],
-                env=step_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            stdout_data, stderr_data = proc.communicate(timeout=step_timeout)
-            # 构造兼容 subprocess.run 返回值的 CompletedProcess
-            result = subprocess.CompletedProcess(
-                args=proc.args,
-                returncode=proc.returncode,
-                stdout=stdout_data or "",
-                stderr=stderr_data or "",
-            )
-        except subprocess.TimeoutExpired:
-            if proc is not None:
-                proc.kill()
-                stdout_data, stderr_data = proc.communicate()
-            else:
-                stdout_data, stderr_data = "", ""
+            result = _run_agent_subprocess(cmd, step_env, step_timeout)
+            # 显式 provider/model 配置无效（402/模型不存在等）→ 回退为不传重试一次。
+            # 其他非零退出（prompt 崩溃、网络抖动等）直接传播为 error，不静默换模型。
+            if (
+                result.returncode != 0
+                and agent_cfg.has_explicit_model()
+                and is_model_config_error(result.stderr or "")
+            ):
+                logger.warning(
+                    "  [%s] ⚠ 显式 provider/model 配置无效（exit %d）——回退为 Agent 默认重试",
+                    step_stem,
+                    result.returncode,
+                )
+                fallback_cmd = build_command_without_model(
+                    agent_cfg, pi_binary, str(prompt_file), pi_extra_args
+                )
+                result = _run_agent_subprocess(fallback_cmd, step_env, step_timeout)
+        except _AgentTimeoutError as e:
+            stderr_data = e.stderr
 
             # pi 可能已将结果写入 output.json（prompt 模板要求），检查文件是否存在有效数据
             output_file = step_dir / "output.json"
@@ -461,6 +592,7 @@ class AgentRunner:
                 "error": f"pi exited with code {proc.returncode}: {stderr_tail}",
                 "data": {},
             }
+            # pi-lens-ignore: unchecked-throwing-call-python
             with open(output_file, "w") as f:
                 json.dump(output_json, f, ensure_ascii=False, indent=2)
             return StepResult(
@@ -471,17 +603,41 @@ class AgentRunner:
 
         output_text = proc.stdout.strip()
 
-        try:
-            parsed = json.loads(output_text) if output_text else {}
-            if not isinstance(parsed, dict):
-                parsed = {"raw_output": output_text}
-        # pi-lens-ignore: bare-exception
-        except json.JSONDecodeError:
-            parsed = {
+        parsed = _try_parse_agent_json(output_text)
+
+        if parsed is None:
+            # 输出不是合法 JSON 对象 → 不再静默兜底为 ok。
+            # 标记 error 触发 _retry_step 重试；原文保留进 data.raw_output，
+            # 供 08-summarize 在重试耗尽后走正则兜底（降级保分）。
+            error_msg = "agent 输出不是合法 JSON 对象（未遵循结构化输出要求）"
+            output_json = {
                 "step": step_stem,
-                "status": "ok",
+                "status": "error",
+                "error": error_msg,
                 "data": {"raw_output": output_text},
             }
+            # pi-lens-ignore: unchecked-throwing-call-python
+            with open(output_file, "w") as f:
+                json.dump(output_json, f, ensure_ascii=False, indent=2)
+            # 记录失败原因供下次 attempt 注入 prompt（失败反馈）
+            try:
+                (step_dir / "_format_error.txt").write_text(
+                    error_msg + "\n\n你上一次输出的开头：\n" + output_text[:500],
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            logger.warning(
+                "  [%s] ✗ 输出不是合法 JSON 对象（stdout=%dB），触发重试",
+                step_stem,
+                len(output_text),
+            )
+            return StepResult(
+                step_name=step_stem,
+                status="error",
+                error=error_msg,
+                data={"raw_output": output_text},
+            )
 
         output_json = {
             "step": parsed.get("step", step_stem),
@@ -489,6 +645,7 @@ class AgentRunner:
             "error": parsed.get("error"),
             "data": parsed.get("data", {}),
         }
+        # pi-lens-ignore: unchecked-throwing-call-python
         with open(output_file, "w") as f:
             json.dump(output_json, f, ensure_ascii=False, indent=2)
 

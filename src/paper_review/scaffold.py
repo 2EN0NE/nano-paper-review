@@ -22,7 +22,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Scaffold Template 当前版本。仅在 src/paper_review/templates/ 内容实际变化时递增。
-SCAFFOLD_VERSION = "0.2.0"
+SCAFFOLD_VERSION = "0.2.1"
 
 # manifest 文件名（相对 data_dir）
 MANIFEST_FILENAME = ".scaffold-manifest"

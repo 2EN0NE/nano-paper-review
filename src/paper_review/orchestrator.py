@@ -22,6 +22,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from pathlib import Path
 
+from paper_review.agent import ENV_AGENT_MODEL, ENV_AGENT_PROVIDER, ENV_AGENT_TYPE, AgentConfig
 from paper_review.dynamic_pool import DynamicPool, _is_productive_timeout, _is_rate_or_server_error
 from paper_review.logging_config import get_logger
 from paper_review.pipeline_models import (
@@ -245,6 +246,22 @@ def _retry_step(
 # ============================================================================
 
 
+def _apply_agent_overrides(base_env: dict, agent: AgentConfig | None) -> dict:
+    """应用 phase 级 agent 覆盖到 step 环境变量（不改原 base_env）。
+
+    phase.agent.provider/model 覆盖全局 agent 注入的值；空字段不覆盖（保留
+    base_env 里的全局值）。type 仅全局生效，phase 级不覆盖。
+    """
+    if not agent or not agent.has_explicit_model():
+        return base_env
+    env = dict(base_env)
+    if agent.provider:
+        env[ENV_AGENT_PROVIDER] = agent.provider
+    if agent.model:
+        env[ENV_AGENT_MODEL] = agent.model
+    return env
+
+
 def _execute_batch(
     phase: PhaseConfig,
     steps: list[StepFile],
@@ -263,14 +280,17 @@ def _execute_batch(
 
     for step in steps:
         step_dir = Path(result_base) / "intermediates" / phase.name / step.stem
-        env = {
-            **base_env,
-            "PIPELINE_PHASE": phase.name,
-            "PIPELINE_SUBJECT": "_batch_",
-            "PIPELINE_STEP_NAME": step.stem,
-            "PIPELINE_INTERMEDIATES": str(Path(result_base) / "intermediates"),
-            "PIPELINE_DUPLICATE_POLICY": phase.duplicate_policy,
-        }
+        env = _apply_agent_overrides(
+            {
+                **base_env,
+                "PIPELINE_PHASE": phase.name,
+                "PIPELINE_SUBJECT": "_batch_",
+                "PIPELINE_STEP_NAME": step.stem,
+                "PIPELINE_INTERMEDIATES": str(Path(result_base) / "intermediates"),
+                "PIPELINE_DUPLICATE_POLICY": phase.duplicate_policy,
+            },
+            phase.agent,
+        )
 
         result = _retry_step(
             step=step,
@@ -317,6 +337,7 @@ def _execute_per_subject(
     当 pool.workers > 1 且 subjects > 1 时启用 ThreadPoolExecutor 并发。
     skip_completed=True（Resume 续做）时，已有 output.json 的 Subject-Step 跳过。
     """
+    base_env = _apply_agent_overrides(base_env, phase.agent)
     pool_cfg = phase.pool
     use_pool = pool_cfg is not None and pool_cfg.workers > 1 and len(subjects) > 1
 
@@ -1282,9 +1303,10 @@ def _collect_degradation_warnings(task_dir: Path) -> list[str]:
     信号：
       1. history 参考恒空（05-batch-search 的 history_count 全 0）
       2. 技术特征恒空（04-extract-features 的 feature_count 全 0）
-      3. 标签写回 0 篇（09-archive-reports 的 tags_written == 0）
+      3. 标签写回 0 篇 / 池提升失败或 0 篇（09-archive-reports 的 tags_written / promote_error / promoted）
       4. 评分标签缺失（06-direct-scoring 的 data.tags 空）
       5. L3 技术特征覆盖率低（04-extract-features 汇总的 l3_coverage < 50%）
+      6. 评分证据降级（08-summarize 的 evidence 字段级标记：rationale/tags 缺失）
     """
     warnings: list[str] = []
     intermediates = task_dir / "intermediates"
@@ -1332,11 +1354,23 @@ def _collect_degradation_warnings(task_dir: Path) -> list[str]:
             "技术特征恒空（04-extract-features 的 LLM 抽取 + 词表兜底均无产出，L3 检索失效）"
         )
 
-    # 3. tags_written == 0
+    # 3. tags_written == 0 / promoted == 0（09-archive-reports 写回闭环）
     archive_out = intermediates / "post" / "09-archive-reports" / "output.json"
     if archive_out.exists():
-        if (_load(archive_out).get("data", {}).get("tags_written") or 0) == 0:
+        archive_data = _load(archive_out).get("data", {})
+        if (archive_data.get("tags_written") or 0) == 0:
             warnings.append("标签写回 0 篇（09-archive-reports tags_written=0，标签库不会自更新）")
+        promote_error = archive_data.get("promote_error")
+        if promote_error:
+            warnings.append(
+                f"池提升失败（09-archive-reports promote_to_history 异常: {promote_error}）"
+            )
+        elif (archive_data.get("promoted") or 0) == 0 and (
+            archive_data.get("pending_before") or 0
+        ) > 0:
+            warnings.append(
+                "池提升 0 篇（09-archive-reports promoted=0 但存在 pending，history 池无新增 Reference）"
+            )
 
     # 4. data.tags 缺失
     checked = False
@@ -1362,6 +1396,27 @@ def _collect_degradation_warnings(task_dir: Path) -> list[str]:
             warnings.append(
                 f"L3 技术特征覆盖率低（{covered}/{total} 篇有 features，L3 检索大面积退化）"
             )
+
+    # 6. rationale/tags 证据降级（基于 08-summarize 的 evidence 字段，字段级精确到维度）
+    degraded = []
+    for sd in subject_dirs:
+        out = sd / "08-summarize" / "output.json"
+        if not out.exists():
+            continue
+        ev = _load(out).get("data", {}).get("evidence", {})
+        if not isinstance(ev, dict):
+            continue
+        missing = ev.get("rationale_missing") or []
+        tags_missing = bool(ev.get("tags_missing"))
+        if missing or tags_missing:
+            parts = []
+            if missing:
+                parts.append("缺证据:" + "/".join(str(d) for d in missing))
+            if tags_missing:
+                parts.append("tags缺失")
+            degraded.append(f"{sd.name}（{'；'.join(parts)}）")
+    if degraded:
+        warnings.append(f"评分证据降级 {len(degraded)} 篇：" + "；".join(degraded))
 
     return warnings
 
@@ -1716,6 +1771,13 @@ def run_pipeline(
         "PIPELINE_RESULT_DIR": str(task_dir),
         "PIPELINE_INPUT_PATH": str(input_path.absolute()),
     }
+
+    # 全局 agent 配置注入（step 内调 Agent 的 type/provider/model）
+    base_env[ENV_AGENT_TYPE] = config.agent.type
+    if config.agent.provider:
+        base_env[ENV_AGENT_PROVIDER] = config.agent.provider
+    if config.agent.model:
+        base_env[ENV_AGENT_MODEL] = config.agent.model
 
     # ── Index 配置注入 step 环境变量 ──
     from paper_review.auto_index import resolve_index_config

@@ -112,9 +112,23 @@ class TestBuildFeaturePrompt:
         assert "JSON" in prompt
 
     def test_constrains_to_method_not_domain(self):
-        """prompt 要求只抽技术方法，不抽宽泛领域词。"""
+        """prompt 要求消歧（歧义缩写展开全称）并统一中文全称。"""
         prompt = _mod._build_feature_prompt("x")
-        assert "不要抽取宽泛的领域词" in prompt
+        assert "消歧" in prompt
+        assert "中文全称" in prompt
+        assert "有歧义的缩写" in prompt
+
+    def test_injects_tag_library(self):
+        """标签库作为参考规范词表注入 prompt。"""
+        prompt = _mod._build_feature_prompt("x", tag_library=["向量化执行", "MPP"])
+        assert "参考规范词表" in prompt
+        assert "向量化执行" in prompt
+        assert "MPP" in prompt
+
+    def test_no_tag_library_omits_lib_block(self):
+        """无标签库时不注入参考词表。"""
+        prompt = _mod._build_feature_prompt("x")
+        assert "参考规范词表" not in prompt
 
 
 class TestParseFeatureJson:
@@ -179,3 +193,68 @@ class TestLlmExtractFeatures:
 
     def test_pi_not_found_returns_empty(self):
         assert _mod._llm_extract_features("x", pi_binary="/nonexistent/pi") == []
+
+    def test_passes_provider_model_to_pi(self, tmp_path, monkeypatch):
+        """PIPELINE_AGENT_PROVIDER/MODEL 实际传到 pi 的 argv（回归 402）。"""
+        mock_pi = tmp_path / "pi"
+        mock_pi.write_text(
+            '#!/bin/sh\necho "$@" > "$(dirname "$0")/args.txt"\necho \'["向量化执行"]\'\n'
+        )
+        mock_pi.chmod(0o755)
+        monkeypatch.setenv("PIPELINE_AGENT_PROVIDER", "cli-proxy-api")
+        monkeypatch.setenv("PIPELINE_AGENT_MODEL", "deepseek-v4-flash")
+
+        assert _mod._llm_extract_features("x", pi_binary=str(mock_pi)) == ["向量化执行"]
+
+        args = (tmp_path / "args.txt").read_text().strip().split()
+        assert "--provider" in args and "cli-proxy-api" in args
+        assert "--model" in args and "deepseek-v4-flash" in args
+
+    def test_explicit_model_error_retries_without_model(self, tmp_path, monkeypatch):
+        """显式 model 非零退出 → 回退为不传 model 重试成功（与 AgentRunner 同款逻辑，防漂移）。"""
+        mock_pi = tmp_path / "pi"
+        mock_pi.write_text(
+            "#!/bin/sh\n"
+            'echo "$@" >> "$(dirname "$0")/all_args.txt"\n'
+            'case "$*" in *--model*) echo "402 Insufficient Balance" >&2; exit 1 ;; esac\n'
+            "echo '[\"向量化执行\"]'\n"
+            "exit 0\n"
+        )
+        mock_pi.chmod(0o755)
+        monkeypatch.setenv("PIPELINE_AGENT_MODEL", "deepseek-v4-pro")
+
+        assert _mod._llm_extract_features("x", pi_binary=str(mock_pi)) == ["向量化执行"]
+
+        calls = (tmp_path / "all_args.txt").read_text().strip().splitlines()
+        assert len(calls) == 2  # 第一次带 model 失败 → 第二次不带 model 成功
+        assert "--model" in calls[0].split()
+        assert "--model" not in calls[1].split()
+
+    def test_no_retry_when_no_explicit_model(self, tmp_path, monkeypatch):
+        """未显式配置 model 时，失败不重试（避免双倍开销）。"""
+        mock_pi = tmp_path / "pi"
+        mock_pi.write_text(
+            '#!/bin/sh\necho "$@" >> "$(dirname "$0")/all_args.txt"\necho "boom" >&2\nexit 1\n'
+        )
+        mock_pi.chmod(0o755)
+        monkeypatch.delenv("PIPELINE_AGENT_MODEL", raising=False)
+        monkeypatch.delenv("PIPELINE_AGENT_PROVIDER", raising=False)
+
+        assert _mod._llm_extract_features("x", pi_binary=str(mock_pi)) == []
+
+        calls = (tmp_path / "all_args.txt").read_text().strip().splitlines()
+        assert len(calls) == 1  # 无显式 model，不重试
+
+    def test_non_model_error_no_retry(self, tmp_path, monkeypatch):
+        """非模型错误（非 402/模型不存在）→ 不回退，返回空列表（词表兑底）。"""
+        mock_pi = tmp_path / "pi"
+        mock_pi.write_text(
+            '#!/bin/sh\necho "$@" >> "$(dirname "$0")/all_args.txt"\necho "panic: index out of range" >&2\nexit 1\n'
+        )
+        mock_pi.chmod(0o755)
+        monkeypatch.setenv("PIPELINE_AGENT_MODEL", "deepseek-v4-pro")
+
+        assert _mod._llm_extract_features("x", pi_binary=str(mock_pi)) == []
+
+        calls = (tmp_path / "all_args.txt").read_text().strip().splitlines()
+        assert len(calls) == 1  # 非模型错误，不回退重试
