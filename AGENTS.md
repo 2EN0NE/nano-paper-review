@@ -271,6 +271,8 @@ CI 中也使用 `pip install -e .[dev]` 方式安装，不依赖 `requirements.l
   `logger.info/warning` 和 `self.log()`。
 - **管线步骤日志边界**：`.py` 步骤经 `runpy.run_path()` 进程内执行，logger 名不是
   `paper_review.*`，默认只走 root→stderr（WARNING+），**不会**进 paper-review.log；
+  例外：Pre 模板步骤 04/05 显式用 `logging.getLogger("paper_review.pre")` 使逐篇
+  耗时/失败日志进文件（runpy 下 `__name__` 是 `__main__`，默认 logger 不挂 FileHandler）；
   `.md` Agent 步骤经 subprocess 调用 pi，stdout/stderr 被捕获记入步骤中间产物。
 
 ### 测试运行

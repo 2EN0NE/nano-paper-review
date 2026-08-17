@@ -102,6 +102,19 @@ JSON，env 未注入时 no-op）；进度卡 spinner 线程每 tick 轮询该文
 - 门控与 review 阶段一致：仅当 input 路径与 subjects 列表与前序一致才允许复用产物
   （否则全量重跑，避免跨批次混批）。
 
+#### 单篇超时与失败隔离（卡死/失败不拖累批次）
+
+- **04 单篇 extract_pdf 软超时**：PyMuPDF 同步调用无超时——`_extract_pdf_with_timeout`
+  用 daemon 线程 + join(timeout)（默认 60s）做软超时，超时/异常返回空串走词表兜底，
+  卡死的线程不阻塞主循环。单篇 LLM 调用本身有 subprocess 超时（300s，`_llm_extract_features`）。
+- **05 单篇检索失败隔离**：`_search_subject` 包 try/except——某篇 hybrid_search 异常
+  → 写 status=error 产物（空结果）+ 继续下一篇，不中断批次；error 产物在 resume 时
+  按 ADR 0005 重跑该篇（load_existing_step_products 只认 ok/skipped）。
+- **逐篇日志**：04/05 每篇的耗时/结果/失败原因记入 `paper-review.log`（logger 命名空间
+  `paper_review.pre`——`.py` 步骤经 runpy 执行时 `__name__` 是 `__main__`，默认 logger
+  不进文件，必须用 `paper_review.*` 前缀才被 FileHandler 记录）。卡住时通过
+  `grep "04 \[" logs/paper-review.log` 定位到具体篇与失败原因。
+
 ### Review Phase (per_subject)
 
 ```

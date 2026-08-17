@@ -19,7 +19,10 @@ import logging
 import os
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from paper_review.search.retriever import hybrid_search
+from paper_review.search.search_types import HISTORY_TOP_N, PENDING_TOP_N
+
+logger = logging.getLogger("paper_review.pre")
 
 
 def _serialize_result(r) -> dict:
@@ -73,6 +76,52 @@ def _load_models(cfg):
         logger.warning("reranker 模型加载失败（%s），本次跳过精排", e)
 
     return embed_model, reranker
+
+
+def _search_subject(
+    store,
+    query: str,
+    name: str,
+    embed_model,
+    reranker,
+    exclude_hash: str | None,
+    subject_features: list[str] | None,
+) -> tuple[dict, str | None]:
+    """单篇检索（失败隔离：异常 → 空结果 + error 消息，不中断批次）。
+
+    Returns: (subj_data, error_message)。error 非 None 时 subj_data 为
+    history/pending 均空的占位——调用方写 status=error 产物（resume 重跑该篇）。
+    """
+    try:
+        results = hybrid_search(
+            store,
+            query,
+            embed_model=embed_model,
+            reranker=reranker,
+            exclude_content_hash=exclude_hash,
+            history_top_n=HISTORY_TOP_N,
+            pending_top_n=PENDING_TOP_N,
+            subject_features=subject_features,
+        )
+    except Exception as e:  # noqa: BLE001 — 单篇失败隔离，不中断批次
+        logger.error("05: %s 检索失败: %s", name, e)
+        return {
+            "query": query,
+            "history": [],
+            "pending": [],
+            "history_count": 0,
+            "pending_count": 0,
+        }, str(e)
+
+    history = [_serialize_result(r) for r in results if r.pool == "history"]
+    pending = [_serialize_result(r) for r in results if r.pool == "pending"]
+    return {
+        "query": query,
+        "history": history,
+        "pending": pending,
+        "history_count": len(history),
+        "pending_count": len(pending),
+    }, None
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -146,8 +195,6 @@ def main():
 
     # ── 打开 Store + 加载模型一次 ──
     from paper_review.config import load_config
-    from paper_review.search.retriever import hybrid_search
-    from paper_review.search.search_types import HISTORY_TOP_N, PENDING_TOP_N
     from paper_review.search.store import Store
 
     cfg = load_config(data_dir=data_dir or None)
@@ -196,38 +243,37 @@ def main():
             except Exception as e:
                 logger.warning("提取 %s 全文失败（%s），无法排除自身", name, e)
 
-            results = hybrid_search(
-                store,
-                query,
+            # 单篇检索（失败隔离：异常 → 空结果 + error，不中断批次）
+            subj_data, error = _search_subject(
+                store=store,
+                query=query,
+                name=name,
                 embed_model=embed_model,
                 reranker=reranker,
-                exclude_content_hash=exclude_hash,
-                history_top_n=HISTORY_TOP_N,
-                pending_top_n=PENDING_TOP_N,
+                exclude_hash=exclude_hash,
                 subject_features=subject_features.get(name),
             )
-
-            history = [_serialize_result(r) for r in results if r.pool == "history"]
-            pending = [_serialize_result(r) for r in results if r.pool == "pending"]
-
-            subj_data = {
-                "query": query,
-                "history": history,
-                "pending": pending,
-                "history_count": len(history),
-                "pending_count": len(pending),
-            }
             per_subject_results[name] = subj_data
 
             # per-subject intermediates（Review Phase 模板变量读取）
+            # 检索失败 → status=error 产物（ADR 0005：失败产物续做时重跑该篇）
             _write_json(
                 Path(intermediates_dir) / name / "05-batch-search" / "output.json",
                 {
                     "step": "05-batch-search",
-                    "status": "ok",
-                    "error": None,
+                    "status": "ok" if error is None else "error",
+                    "error": error,
                     "data": subj_data,
                 },
+            )
+            logger.info(
+                "05 [%d/%d] %s: history=%d pending=%d%s",
+                i,
+                total,
+                name,
+                subj_data["history_count"],
+                subj_data["pending_count"],
+                f" 失败={error}" if error else "",
             )
             report_batch_progress(i, total, name, reused=reused)
 

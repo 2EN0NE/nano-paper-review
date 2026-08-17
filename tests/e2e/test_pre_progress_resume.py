@@ -440,3 +440,68 @@ class TestResume01And03:
         # manifest 覆盖全部 3 篇
         manifest = pre_out["data"]["manifest"]
         assert {s["name"] for s in manifest["subjects"]} == {"alpha", "beta", "gamma"}
+
+
+class TestPrePerSubjectLogging:
+    """T7: 04/05 逐篇日志写入 paper-review.log（卡住时可定位到篇）。"""
+
+    def test_04_writes_per_subject_log_to_file(self, tmp_path: Path):
+        """04 每篇的耗时/结果记入 paper-review.log（文件日志不受 TTY 静音影响）。"""
+        data_dir, input_dir, env = _setup_data(tmp_path, ("alpha", "beta"))
+
+        r1 = _run_first(data_dir, input_dir, env)
+        assert r1.returncode == 0, f"首次失败:\n{r1.stdout[-600:]}"
+
+        log_file = data_dir / "logs" / "paper-review.log"
+        assert log_file.exists(), "paper-review.log 应存在"
+        text = log_file.read_text(encoding="utf-8")
+        # 04 逐篇日志（INFO 级，含篇名与耗时）
+        assert "04 [" in text, f"缺 04 逐篇日志:\n{text[-1200:]}"
+        assert "alpha" in text and "beta" in text, f"日志缺篇名:\n{text[-1200:]}"
+        assert "extract=" in text, f"日志缺 extract 耗时:\n{text[-1200:]}"
+
+    def test_05_writes_per_subject_log_to_file(self, tmp_path: Path):
+        """05 每篇的检索结果记入 paper-review.log。"""
+        data_dir, input_dir, env = _setup_data(tmp_path, ("alpha", "beta"))
+
+        r1 = _run_first(data_dir, input_dir, env)
+        assert r1.returncode == 0, f"首次失败:\n{r1.stdout[-600:]}"
+
+        log_file = data_dir / "logs" / "paper-review.log"
+        text = log_file.read_text(encoding="utf-8")
+        assert "05 [" in text, f"缺 05 逐篇日志:\n{text[-1200:]}"
+        assert "history=" in text, f"日志缺检索结果:\n{text[-1200:]}"
+
+
+class TestSearchErrorProductResume:
+    """T7: 05 检索失败产物（status=error）在 resume 时被重跑（ADR 0005）。"""
+
+    def test_error_product_rerun_on_resume(self, tmp_path: Path):
+        """beta 的 05 产物为 error → resume 后 05 重跑该篇（ok 覆盖），其余复用。"""
+        data_dir, input_dir, env = _setup_data(tmp_path, ("alpha", "beta", "gamma"))
+
+        r1 = _run_first(data_dir, input_dir, env)
+        assert r1.returncode == 0, f"首次失败:\n{r1.stdout[-600:]}"
+
+        task_dir = _find_task_dir(data_dir / "output")
+        # 模拟 beta 检索失败：产物标记 error + 删 05 全局产物（触发 05 重跑）
+        beta_out = task_dir / "intermediates" / "beta" / "05-batch-search" / "output.json"
+        data = _read_json(beta_out)
+        data["status"] = "error"
+        data["error"] = "simulated hybrid_search failure"
+        beta_out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        (task_dir / "intermediates" / "pre" / "05-batch-search" / "output.json").unlink()
+        from paper_review.orchestrator import write_task_manifest
+
+        write_task_manifest(task_dir, status="running")
+
+        r2 = _run_resume(data_dir, input_dir, env)
+        assert r2.returncode == 0, f"续做失败:\n{r2.stdout[-600:]}"
+
+        # beta 被重跑（error → ok），alpha/gamma 复用
+        beta_out2 = _read_json(
+            task_dir / "intermediates" / "beta" / "05-batch-search" / "output.json"
+        )
+        assert beta_out2["status"] == "ok", f"beta 应被重跑为 ok: {beta_out2}"
+        pre_out = _read_json(task_dir / "intermediates" / "pre" / "05-batch-search" / "output.json")
+        assert pre_out["data"]["reused_count"] == 2, pre_out["data"]

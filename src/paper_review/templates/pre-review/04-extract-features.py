@@ -14,11 +14,20 @@ output.json），供 Review Phase 评分步骤通过模板变量读取。
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
+from paper_review.extractor import extract_pdf
 from paper_review.search.search_types import QUERY_FIRST_PARA_CHARS
+
+logger = logging.getLogger("paper_review.pre")
+
+# 单篇 extract_pdf 软超时（秒）：PyMuPDF 同步调用无超时，卡死篇经 daemon 线程软超时跳过
+_EXTRACT_PDF_TIMEOUT = 60
 
 # 冷启动种子词表（标签库为空时兑底；随评审积累的标签库会替代它）
 _SEED_KEYWORDS = [
@@ -166,6 +175,108 @@ def _write_json(path: Path, payload: dict) -> None:
         print(f"  ✗ 写入 {path} 失败: {e}")
 
 
+def _extract_pdf_with_timeout(pdf_path: str, timeout: int = _EXTRACT_PDF_TIMEOUT) -> str:
+    """提取 PDF 文本，超时/异常返回空串（卡死篇不阻塞批次）。
+
+    PyMuPDF 同步调用无超时——用 daemon 线程 + join(timeout) 做软超时：超时后
+    返回空串（该篇走词表兜底继续），卡死的线程不阻塞主循环（进程退出时回收）。
+    失败原因记录到 paper-review.log（文件日志，不受 TTY 进度卡静音影响）。
+    """
+    result: dict[str, object] = {}
+
+    def _run() -> None:
+        try:
+            result["text"] = extract_pdf(pdf_path)
+        except Exception as e:  # noqa: BLE001 — 单篇失败隔离，吞掉继续批次
+            result["error"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        logger.warning("04: extract_pdf 超时（>%ds）: %s", timeout, pdf_path)
+        return ""
+    if "error" in result:
+        logger.warning("04: extract_pdf 失败 %s: %s", pdf_path, result["error"])
+        return ""
+    return str(result.get("text", ""))
+
+
+def _process_subject(
+    name: str,
+    pdf_path: Path,
+    subject_paper_ids: dict[str, str],
+    tag_library: list[str],
+    store,
+    intermediates_dir: str,
+    pi_binary: str,
+    extract_timeout: int = _EXTRACT_PDF_TIMEOUT,
+) -> tuple[int, int, int]:
+    """处理单篇：提取 → 词表 → LLM → 写回 features → 写 per-subject 产物。
+
+    单篇失败隔离：extract_pdf 失败/超时返回空文本、LLM 失败由词表兜底——
+    均不中断批次；耗时与失败原因记入 paper-review.log。
+
+    Returns: (features_written_delta, llm_feature_count, feature_count)
+    """
+    t0 = time.monotonic()
+    raw_text = _extract_pdf_with_timeout(str(pdf_path), timeout=extract_timeout)
+    extract_t = time.monotonic() - t0
+
+    first_para = raw_text[:QUERY_FIRST_PARA_CHARS]
+    text_with_name = first_para + " " + name.replace("-", " ")
+    # 词表兜底（确定性，保证已知词永不丢）
+    keyword_features = extract_keywords(text_with_name, tag_library)
+    # LLM 主线（发现新词 + 已知词）
+    t1 = time.monotonic()
+    llm_features = _llm_extract_features(
+        text_with_name, pi_binary=pi_binary, tag_library=tag_library
+    )
+    llm_t = time.monotonic() - t1
+    # 并集汇总
+    features = merge_feature_sets(llm_features, keyword_features)
+
+    # 写回 papers.features（立即写，使同批后续 Subject 可检索到）
+    features_written = 0
+    paper_id = subject_paper_ids.get(name)
+    if store is not None and paper_id and features:
+        try:
+            if store.update_features(paper_id, features):
+                features_written = 1
+        except Exception as e:  # noqa: BLE001 — 写回失败不中断批次
+            logger.warning("04: %s features 写回失败: %s", name, e)
+
+    _write_json(
+        Path(intermediates_dir) / name / "04-extract-features" / "output.json",
+        {
+            "step": "04-extract-features",
+            "status": "ok",
+            "error": None,
+            "data": {
+                # 兼容 06-direct-scoring 的 {intermediates.04-extract-features.data.keywords}
+                "keywords": keyword_features,
+                "keyword_count": len(keyword_features),
+                # L3 精排数据源（ADR 0015）
+                "features": features,
+                "feature_count": len(features),
+                "llm_features": llm_features,
+            },
+        },
+    )
+
+    logger.info(
+        "04 %s: extract=%.1fs llm=%.1fs features=%d (llm=%d, kw=%d, written=%d)",
+        name,
+        extract_t,
+        llm_t,
+        len(features),
+        len(llm_features),
+        len(keyword_features),
+        features_written,
+    )
+    return features_written, len(llm_features), len(features)
+
+
 def _load_subject_paper_ids(intermediates_dir: str) -> dict[str, str]:
     """读 02-auto-index 产出的 subject name → paper_id 映射。
 
@@ -239,9 +350,13 @@ def _llm_extract_features(
                 timeout=timeout,
             )
         if proc.returncode != 0:
+            # 失败原因记入 paper-review.log（词表兜底继续，但可观测定位）
+            stderr_tail = (proc.stderr or "").strip()[-200:] or f"exit {proc.returncode}"
+            logger.warning("04: LLM 抽取失败（%s），词表兜底", stderr_tail)
             return []
         return _parse_feature_json(proc.stdout or "")
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.warning("04: LLM 抽取超时/异常（%s），词表兜底", e)
         return []
     finally:
         try:
@@ -264,7 +379,6 @@ def main():
         except (json.JSONDecodeError, OSError):
             print(f"  ⚠ 无法读取 manifest: {manifest_path}")
 
-    from paper_review.extractor import extract_pdf
     from paper_review.progress import load_existing_step_products, report_batch_progress
     from paper_review.search.store import Store
 
@@ -312,49 +426,21 @@ def main():
             continue
         pdf_path = Path(subj["pdf_path"])
 
-        try:
-            raw_text = extract_pdf(str(pdf_path))
-        except Exception:
-            raw_text = ""
-
-        first_para = raw_text[:QUERY_FIRST_PARA_CHARS]
-        text_with_name = first_para + " " + name.replace("-", " ")
-        # 词表兜底（确定性，保证已知词永不丢）
-        keyword_features = extract_keywords(text_with_name, tag_library)
-        # LLM 主线（发现新词 + 已知词）
-        llm_features = _llm_extract_features(
-            text_with_name, pi_binary=pi_binary, tag_library=tag_library
+        # 单篇处理（提取→词表→LLM→写回→产物），失败隔离 + 耗时记入 paper-review.log
+        written, llm_count, feature_count = _process_subject(
+            name=name,
+            pdf_path=pdf_path,
+            subject_paper_ids=subject_paper_ids,
+            tag_library=tag_library,
+            store=store,
+            intermediates_dir=intermediates_dir,
+            pi_binary=pi_binary,
         )
-        # 并集汇总
-        features = merge_feature_sets(llm_features, keyword_features)
-
-        # 写回 papers.features（立即写）
-        paper_id = subject_paper_ids.get(name)
-        if store is not None and paper_id and features:
-            try:
-                if store.update_features(paper_id, features):
-                    features_written += 1
-            except Exception as e:
-                print(f"  ⚠ {name} features 写回失败: {e}")
-
-        _write_json(
-            Path(intermediates_dir) / name / "04-extract-features" / "output.json",
-            {
-                "step": "04-extract-features",
-                "status": "ok",
-                "error": None,
-                "data": {
-                    # 兼容 06-direct-scoring 的 {intermediates.04-extract-features.data.keywords}
-                    "keywords": keyword_features,
-                    "keyword_count": len(keyword_features),
-                    # L3 精排数据源（ADR 0015）
-                    "features": features,
-                    "feature_count": len(features),
-                    "llm_features": llm_features,
-                },
-            },
-        )
+        features_written += written
         subject_count += 1
+        logger.info(
+            "04 [%d/%d] %s: 完成 (llm=%d, features=%d)", i, total, name, llm_count, feature_count
+        )
         report_batch_progress(i, total, name, reused=reused)
 
     # 统计 L3 覆盖率（索引中 features 非空的 paper 比例，ADR 0015 哨兵信号）
