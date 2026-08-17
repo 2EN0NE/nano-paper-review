@@ -1,0 +1,12 @@
+{
+  "name": "download-meituan-tech-pdf",
+  "version": "1.0.0",
+  "private": true,
+  "description": "逐年下载美团技术团队博客文章为 PDF（Playwright + Chromium 渲染）",
+  "scripts": {
+    "test": "node --test test_lib.js"
+  },
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}
