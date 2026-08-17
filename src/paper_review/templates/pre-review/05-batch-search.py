@@ -19,6 +19,7 @@ import logging
 import os
 from pathlib import Path
 
+from paper_review.extractor import extract_pdf_with_timeout
 from paper_review.search.retriever import hybrid_search
 from paper_review.search.search_types import HISTORY_TOP_N, PENDING_TOP_N
 
@@ -220,8 +221,6 @@ def main():
         embed_used = embed_model is not None
         rerank_used = reranker is not None and reranker.is_loaded
 
-        from paper_review.extractor import extract_pdf
-
         total = len(subjects)
         for i, subj in enumerate(subjects, 1):
             name = subj["name"]
@@ -235,13 +234,11 @@ def main():
             pdf_path = Path(subj["pdf_path"])
 
             # 排除自身：content_hash = SHA-256(全文)，与 content_dedup 同源
+            # 带软超时（与 04 同一实现）：卡死 PDF 不阻塞批次，超时/失败时退化为不排除自身
             exclude_hash: str | None = None
-            try:
-                raw_text = extract_pdf(str(pdf_path))
-                if raw_text.strip():
-                    exclude_hash = hashlib.sha256(raw_text.encode()).hexdigest()
-            except Exception as e:
-                logger.warning("提取 %s 全文失败（%s），无法排除自身", name, e)
+            raw_text, _timed_out = extract_pdf_with_timeout(str(pdf_path))
+            if raw_text.strip():
+                exclude_hash = hashlib.sha256(raw_text.encode()).hexdigest()
 
             # 单篇检索（失败隔离：异常 → 空结果 + error，不中断批次）
             subj_data, error = _search_subject(

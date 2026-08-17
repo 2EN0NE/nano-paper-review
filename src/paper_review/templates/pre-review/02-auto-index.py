@@ -38,6 +38,20 @@ def _write_per_subject_output(
         print(f"  ✗ 写入 {path} 失败: {e}")
 
 
+def _stale_existing_names(existing_products: dict[str, dict], store) -> list[str]:
+    """store 中找不到对应 paper_id 的现有产物名（索引被重建/清空后续做）。
+
+    返回应从「续做复用集合」移出的篇名——其产物文件仍在，但 store 已无对应
+    paper（如用户重建/清空 index 后 resume），复用会导致这些篇永不重新索引。
+    """
+    stale: list[str] = []
+    for name, data in existing_products.items():
+        pid = (data.get("data") or {}).get("paper_id")
+        if pid and not store.paper_exists(str(pid)):
+            stale.append(name)
+    return stale
+
+
 def main():
     step_dir = os.environ.get("PIPELINE_STEP_DIR", ".")
     output_dir = os.environ.get("PIPELINE_OUTPUT_DIR", ".")
@@ -67,6 +81,7 @@ def main():
 
     resume_skip = os.environ.get("PIPELINE_RESUME_SKIP_EXISTING") == "1"
     existing: set[str] = set()
+    existing_products: dict[str, dict] = {}
     if resume_skip:
         existing_products = load_existing_step_products(
             subjects, intermediates_dir, "02-auto-index"
@@ -97,6 +112,21 @@ def main():
     db_path = str(store_dir / "index.sqlite")
     store = Store(db_path)
     store.load_content_hashes_only()
+
+    # T5b: 校验索引存储状态——store 中缺失 paper_id 的现有产物视为未索引（重新索引）。
+    # 用户重建/清空 index 后续做时，产物文件仍在但 store 已无对应 paper——若复用，
+    # 这些篇永不重新索引，05 检索对其静默为空。
+    if resume_skip and existing:
+        stale = _stale_existing_names(existing_products, store)
+        for name in stale:
+            existing.discard(name)
+            subject_paper_ids.pop(name, None)
+        if stale:
+            print(
+                f"02-auto-index: {len(stale)} 篇产物存在但索引缺失，重新索引: "
+                + ", ".join(sorted(stale))
+            )
+
     if not store.load_faiss():
         store.init_faiss()
 

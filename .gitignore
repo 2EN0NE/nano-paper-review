@@ -239,6 +239,13 @@ requirements.lock
 .paper-review/
 logs/
 
+# 管线运行中间产物（在仓库根目录直接运行模板步骤时误落 cwd）
+#   - output.json / subject-manifest.json：batch 步骤（04/01）未注入产物目录时的落盘
+#   - intermediates/：per-subject 逐篇中间产物目录
+/output.json
+/subject-manifest.json
+/intermediates/
+
 # 开发 scratch 工作笔记
 .scratch/
 

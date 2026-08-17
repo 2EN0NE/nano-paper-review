@@ -132,6 +132,18 @@ class TestStore:
         assert store.count_pending(["no_such_paper"]) == 0
         store.close()
 
+    def test_paper_exists(self):
+        """paper_exists：按 paper_id 查存在（resume 续做索引存储校验用）。"""
+        store = Store(":memory:")
+        paper = make_sample_paper("信用评估")
+        chunks = chunk_paper(paper)
+        cvs = make_mock_chunk_vecs(chunks)
+        store.add_paper(paper, cvs)
+        assert store.paper_exists(paper.paper_id)
+        assert not store.paper_exists("no_such_paper")
+        assert not store.paper_exists("")
+        store.close()
+
     def test_bm25_search_found(self):
         store = Store(":memory:")
         paper = make_sample_paper("信用评估")

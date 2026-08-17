@@ -739,6 +739,20 @@ class Store:
                 paper.pool = "history"
         return promoted
 
+    def paper_exists(self, paper_id: str) -> bool:
+        """按 paper_id 查询 papers 表是否存在该论文（只读，轻量）。
+
+        用于 resume 断点续做时校验索引存储状态：per-subject 产物存在但 store 中
+        找不到对应 paper（索引被重建/清空）时，应重新索引而非复用产物。
+        """
+        if not paper_id:
+            return False
+        cur = self.db.execute(
+            "SELECT 1 FROM papers WHERE paper_id = ? LIMIT 1",
+            (paper_id,),
+        )
+        return cur.fetchone() is not None
+
     def count_pending(self, paper_ids: list[str]) -> int:
         """返回 paper_ids 中 pool='pending' 的论文数（Pool Promotion 前置检查）。
 

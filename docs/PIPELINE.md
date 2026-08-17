@@ -94,22 +94,31 @@ JSON，env 未注入时 no-op）；进度卡 spinner 线程每 tick 轮询该文
 
 - **步骤级**：续做时逐 step 检查 `intermediates/pre/{step}/output.json`（status 为
   ok/skipped 才算完成）——已完成步骤跳过（skipped），未完成步骤重跑（不再整个 Pre 重跑）。
+  额外约束：某步骤存在 status=error 的 per-subject 产物（如 05 单篇检索失败）时，即使步骤级
+  产物为 ok 也不跳过——失败篇须在续做时重跑（ADR 0005），避免空引用被静默固化到评审。
 - **步骤内增量**：未完成步骤收到 `PIPELINE_RESUME_SKIP_EXISTING=1`；模板步骤经
   `paper_review.progress.load_existing_step_products(subjects, intermediates_dir, step)`
   读已有 per-subject 产物（`intermediates/{subject}/{step}/output.json`，status ok/skipped）
   跳过该篇（不重复调 LLM/检索/embedding），汇总 output.json 记录 `reused_count`，进度
   上报携带 `reused` 显示“N 复用”。
+- **02 索引存储校验**：02-auto-index 复用前额外校验 store 中存在对应 paper_id——用户重建/
+  清空索引（embedding 指纹变更提示重建）后续做时，产物文件仍在但 store 无对应 paper，
+  这些篇会移出复用集重新索引（否则永不重新索引，05 检索对其静默为空）。
 - 门控与 review 阶段一致：仅当 input 路径与 subjects 列表与前序一致才允许复用产物
   （否则全量重跑，避免跨批次混批）。
 
 #### 单篇超时与失败隔离（卡死/失败不拖累批次）
 
-- **04 单篇 extract_pdf 软超时**：PyMuPDF 同步调用无超时——`_extract_pdf_with_timeout`
+- **04 单篇 extract_pdf 软超时**：PyMuPDF 同步调用无超时——`extractor.extract_pdf_with_timeout`
   用 daemon 线程 + join(timeout)（默认 60s）做软超时，超时/异常返回空串走词表兜底，
-  卡死的线程不阻塞主循环。单篇 LLM 调用本身有 subprocess 超时（300s，`_llm_extract_features`）。
+  卡死的线程不阻塞主循环。04 本地包装累计卡死篇数达阈值（`_MAX_STUCK_PDFS=5`）后不再
+  启动新线程（防多个卡死 PDF 的 daemon 线程与文档句柄累积到进程结束）。单篇 LLM 调用本身
+  有 subprocess 超时（300s，`_llm_extract_features`）。
 - **05 单篇检索失败隔离**：`_search_subject` 包 try/except——某篇 hybrid_search 异常
   → 写 status=error 产物（空结果）+ 继续下一篇，不中断批次；error 产物在 resume 时
-  按 ADR 0005 重跑该篇（load_existing_step_products 只认 ok/skipped）。
+  按 ADR 0005 重跑该篇（load_existing_step_products 只认 ok/skipped；步骤级判定同样
+  检查 per-subject error，见上）。05 的 exclude_hash 提取（同 04 的卡死风险）也走
+  `extract_pdf_with_timeout`——超时/失败退化为不排除自身，不阻塞批次。
 - **逐篇日志**：04/05 每篇的耗时/结果/失败原因记入 `paper-review.log`（logger 命名空间
   `paper_review.pre`——`.py` 步骤经 runpy 执行时 `__name__` 是 `__main__`，默认 logger
   不进文件，必须用 `paper_review.*` 前缀才被 FileHandler 记录）。卡住时通过

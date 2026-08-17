@@ -350,6 +350,10 @@ def _execute_batch(
             logger.error("Aborting batch phase '%s' due to %s failure", phase.name, step.stem)
             break
 
+    # 清除 batch 进度文件路径：spinner 不再轮询已删除的文件（防整个剩余运行
+    # 每 100ms 一次无意义的 open 系统调用）
+    if pp:
+        pp.set_batch_progress_file(phase.name, None)
     return {"_batch_": results}
 
 
@@ -1334,6 +1338,32 @@ def _render_leaf_outputs(
     return out_lines
 
 
+def _per_subject_step_has_error(task_dir: Path, step_stem: str) -> bool:
+    """该步骤是否存在 status=error 的 per-subject 产物（resume 跳过判定用）。
+
+    05-batch-search 单篇检索失败时写 status=error 的 per-subject 产物，而步骤级
+    产物仍为 ok——若续做时跳过该步骤，失败篇的空引用会被静默固化到评审
+    （ADR 0005“失败产物续做时重跑”原则要求重跑）。subject 目录排除 batch 汇总
+    目录（约定 pre/post，与 _collect_degradation_warnings 一致）。
+    """
+    intermediates = task_dir / "intermediates"
+    if not intermediates.is_dir():
+        return False
+    for subj_dir in intermediates.iterdir():
+        if not subj_dir.is_dir() or subj_dir.name in ("pre", "post"):
+            continue
+        out = subj_dir / step_stem / "output.json"
+        if not out.exists():
+            continue
+        try:
+            data = json.loads(out.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("status") == "error":
+            return True
+    return False
+
+
 # ============================================================================
 # 报告生成
 # ============================================================================
@@ -1952,7 +1982,16 @@ def run_pipeline(
                     try:
                         out = json.loads(step_out.read_text(encoding="utf-8"))
                         if out.get("status", "ok") in ("ok", "skipped"):
-                            pre_step_skip.add(sf.stem)
+                            # 步骤级 ok 还不够：per-subject 产物存在 status=error 的篇
+                            # （如 05 单篇检索失败）时不得跳过该步骤——失败篇需在续做时
+                            # 重跑（ADR 0005），否则空引用被静默固化到评审。
+                            if _per_subject_step_has_error(task_dir, sf.stem):
+                                logger.info(
+                                    "Resume: step '%s' has error per-subject products — will re-run",
+                                    sf.stem,
+                                )
+                            else:
+                                pre_step_skip.add(sf.stem)
                     except (json.JSONDecodeError, OSError):
                         logger.debug(
                             "pre step product unreadable: %s (treated as incomplete)", step_out
@@ -2185,9 +2224,18 @@ def run_pipeline(
                             phase.name,
                         )
                     else:
-                        logger.info(
-                            "Manifest step '%s' completed successfully", phase.manifest_step
-                        )
+                        # skipped = resume 时步骤级跳过（产物复用）——不是“成功执行”，
+                        # 日志须区分，避免误导排障；manifest 文件来自上次运行仍有效，
+                        # subject 重发现照常执行。
+                        if mr.status == "skipped":
+                            logger.info(
+                                "Manifest step '%s' skipped (resume: products reused)",
+                                phase.manifest_step,
+                            )
+                        else:
+                            logger.info(
+                                "Manifest step '%s' completed successfully", phase.manifest_step
+                            )
                         # 刷新 Subject 列表：discover_subjects() 在循环开始前已调用过一次，
                         # 彼时 manifest 尚未生成，per_subject 阶段若以 manifest 为 subject_source
                         # 会静默 fallback 到 CLI 目录扫描（只认 .pdf，漏掉 docx/doc 转换产物）。

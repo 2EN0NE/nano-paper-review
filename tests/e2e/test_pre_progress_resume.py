@@ -477,20 +477,23 @@ class TestSearchErrorProductResume:
     """T7: 05 检索失败产物（status=error）在 resume 时被重跑（ADR 0005）。"""
 
     def test_error_product_rerun_on_resume(self, tmp_path: Path):
-        """beta 的 05 产物为 error → resume 后 05 重跑该篇（ok 覆盖），其余复用。"""
+        """beta 的 05 产物为 error → resume 后 05 重跑该篇（ok 覆盖），其余复用。
+
+        步骤级产物保持 ok（运行完成但部分失败）——resume 步骤级判定必须发现
+        per-subject error 产物并重跑该步骤，而不是整体跳过（ADR 0005）。
+        """
         data_dir, input_dir, env = _setup_data(tmp_path, ("alpha", "beta", "gamma"))
 
         r1 = _run_first(data_dir, input_dir, env)
         assert r1.returncode == 0, f"首次失败:\n{r1.stdout[-600:]}"
 
         task_dir = _find_task_dir(data_dir / "output")
-        # 模拟 beta 检索失败：产物标记 error + 删 05 全局产物（触发 05 重跑）
+        # 模拟 beta 检索失败：仅标记 per-subject 产物为 error（步骤级产物保持 ok）
         beta_out = task_dir / "intermediates" / "beta" / "05-batch-search" / "output.json"
         data = _read_json(beta_out)
         data["status"] = "error"
         data["error"] = "simulated hybrid_search failure"
         beta_out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        (task_dir / "intermediates" / "pre" / "05-batch-search" / "output.json").unlink()
         from paper_review.orchestrator import write_task_manifest
 
         write_task_manifest(task_dir, status="running")

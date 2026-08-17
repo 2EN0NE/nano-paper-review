@@ -1863,6 +1863,41 @@ class TestResumePreStepLevel:
             )
             assert out["data"].get("PIPELINE_RESUME_SKIP_EXISTING") == "0", stem
 
+    def test_resume_pre_reruns_step_with_per_subject_error(self, tmp_path):
+        """步骤级产物 ok 但某篇 per-subject 产物为 error → 该步骤不得跳过（重跑）。
+
+        05-batch-search 单篇检索失败时写 status=error 的 per-subject 产物而步骤级仍
+        ok——若跳过该步骤，失败篇的空引用会被静默固化（ADR 0005 要求续做重跑）。
+        """
+        output_dir = tmp_path / "output"
+        steps_dir = tmp_path / "steps"
+        steps_dir.mkdir(parents=True)
+        for stem in ("00-pre", "01-mid", "02-last"):
+            self._write_step(steps_dir, stem)
+
+        pdf_dir = tmp_path / "pdfs"
+        pdf_dir.mkdir()
+        (pdf_dir / "a.pdf").write_text("dummy")
+
+        r1 = run_pipeline(self._pipeline_yaml(output_dir, steps_dir), pdf_dir)
+        assert r1.success
+
+        # 模拟 02-last 曾单篇失败：步骤级产物保持 ok，per-subject 产物写为 error
+        per_out = r1.task_dir / "intermediates" / "a" / "02-last" / "output.json"
+        per_out.parent.mkdir(parents=True, exist_ok=True)
+        per_out.write_text(
+            json.dumps({"step": "02-last", "status": "error", "error": "simulated", "data": {}}),
+            encoding="utf-8",
+        )
+
+        r2 = run_pipeline(
+            self._pipeline_yaml(output_dir, steps_dir), pdf_dir, resume_task_dir=r1.task_dir
+        )
+        assert r2.success
+        by_name = {r.step_name: r.status for r in r2.step_results if r.subject == "_batch_"}
+        # 02-last 有 per-subject error → 重跑为 ok，不得 skipped（00/01 正常复用）
+        assert by_name == {"00-pre": "skipped", "01-mid": "skipped", "02-last": "ok"}, by_name
+
 
 # ============================================================================
 # 错误场景

@@ -17,17 +17,20 @@ import json
 import logging
 import os
 import sqlite3
-import threading
 import time
 from pathlib import Path
 
-from paper_review.extractor import extract_pdf
+from paper_review.extractor import extract_pdf_with_timeout
 from paper_review.search.search_types import QUERY_FIRST_PARA_CHARS
 
 logger = logging.getLogger("paper_review.pre")
 
 # 单篇 extract_pdf 软超时（秒）：PyMuPDF 同步调用无超时，卡死篇经 daemon 线程软超时跳过
 _EXTRACT_PDF_TIMEOUT = 60
+# 卡死篇阈值：累计超时达此值后不再启动新线程（直接返回空串走词表兑底），
+# 防止批内多个卡死 PDF 持续累积 daemon 线程与打开的文档句柄直到进程退出
+_MAX_STUCK_PDFS = 5
+_stuck_count = 0
 
 # 冷启动种子词表（标签库为空时兑底；随评审积累的标签库会替代它）
 _SEED_KEYWORDS = [
@@ -175,31 +178,23 @@ def _write_json(path: Path, payload: dict) -> None:
         print(f"  ✗ 写入 {path} 失败: {e}")
 
 
-def _extract_pdf_with_timeout(pdf_path: str, timeout: int = _EXTRACT_PDF_TIMEOUT) -> str:
+def _extract_pdf_with_timeout(pdf_path: str, timeout: int | float = _EXTRACT_PDF_TIMEOUT) -> str:
     """提取 PDF 文本，超时/异常返回空串（卡死篇不阻塞批次）。
 
-    PyMuPDF 同步调用无超时——用 daemon 线程 + join(timeout) 做软超时：超时后
-    返回空串（该篇走词表兜底继续），卡死的线程不阻塞主循环（进程退出时回收）。
-    失败原因记录到 paper-review.log（文件日志，不受 TTY 进度卡静音影响）。
+    extract_pdf_with_timeout 的本地包装：累计卡死篇数达到 _MAX_STUCK_PDFS 后
+    不再启动新线程（直接返回空串），避免多个卡死 PDF 的 daemon 线程与文档句柄
+    持续累积到进程结束。失败原因记录到 paper-review.log（文件日志）。
     """
-    result: dict[str, object] = {}
-
-    def _run() -> None:
-        try:
-            result["text"] = extract_pdf(pdf_path)
-        except Exception as e:  # noqa: BLE001 — 单篇失败隔离，吞掉继续批次
-            result["error"] = e
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        logger.warning("04: extract_pdf 超时（>%ds）: %s", timeout, pdf_path)
+    global _stuck_count
+    if _stuck_count >= _MAX_STUCK_PDFS:
+        logger.warning(
+            "04: 已达卡死阈值（%d 篇），跳过提取（词表兑底）: %s", _MAX_STUCK_PDFS, pdf_path
+        )
         return ""
-    if "error" in result:
-        logger.warning("04: extract_pdf 失败 %s: %s", pdf_path, result["error"])
-        return ""
-    return str(result.get("text", ""))
+    text, timed_out = extract_pdf_with_timeout(pdf_path, timeout=timeout)
+    if timed_out:
+        _stuck_count += 1
+    return text
 
 
 def _process_subject(
