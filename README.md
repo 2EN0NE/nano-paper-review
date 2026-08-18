@@ -70,6 +70,7 @@ paper-review review ./papers/subject-001.pdf  # 单篇模式
 ```bash
 paper-review search "深度学习信用评估"    # 快速检索
 paper-review status                      # 索引状态
+paper-review tags                        # 标签池（Tag Library）
 paper-review serve --port 8765           # HTTP API
 ```
 

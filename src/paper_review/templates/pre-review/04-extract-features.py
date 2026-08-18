@@ -80,7 +80,7 @@ def _load_tag_library(store_dir: str) -> list[str]:
     conn = sqlite3.connect(str(db_path))
     try:
         rows = conn.execute(
-            "SELECT tags FROM papers WHERE tags IS NOT NULL AND tags != '[]'"
+            "SELECT tags FROM papers WHERE tags IS NOT NULL AND tags != '[]' ORDER BY rowid"
         ).fetchall()
     finally:
         conn.close()

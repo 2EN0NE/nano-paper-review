@@ -230,7 +230,7 @@ class TestHelp:
     def test_help_contains_commands(self):
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        for cmd in ("index", "search", "status", "serve", "review"):
+        for cmd in ("index", "search", "status", "tags", "serve", "review"):
             assert cmd in result.stdout
 
     def test_no_args_shows_help(self):
@@ -273,6 +273,45 @@ class TestStatusCommand:
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0
         assert "0" in result.stdout
+
+
+class TestTagsCommand:
+    """paper-review tags"""
+
+    @patch("paper_review.cli.open_store")
+    def test_tags_output(self, mock_open_store):
+        mock_store = MagicMock()
+        mock_store.list_tags.return_value = ["数据库", "流量回放", "SQL"]
+        mock_store.papers = {
+            "p1": MagicMock(meta=MagicMock(tags=["数据库", "流量回放"])),
+            "p2": MagicMock(meta=MagicMock(tags=["流量回放", "SQL"])),
+            "p3": MagicMock(meta=MagicMock(tags=[])),
+        }
+        mock_open_store.return_value = mock_store
+
+        result = runner.invoke(app, ["tags"])
+        assert result.exit_code == 0
+        assert "标签总数: 3" in result.stdout
+        assert "已打标签论文: 2" in result.stdout
+        assert "数据库" in result.stdout
+        assert "流量回放" in result.stdout
+        assert "SQL" in result.stdout
+        mock_open_store.assert_called_once()
+        assert mock_open_store.call_args.kwargs.get("load_vectors") is False
+
+    @patch("paper_review.cli.open_store")
+    def test_tags_empty_index(self, mock_open_store):
+        mock_store = MagicMock()
+        mock_store.list_tags.return_value = []
+        mock_store.papers = {}
+        mock_open_store.return_value = mock_store
+
+        result = runner.invoke(app, ["tags"])
+        assert result.exit_code == 0
+        assert "标签总数: 0" in result.stdout
+        assert "尚无标签" in result.stdout
+        mock_open_store.assert_called_once()
+        assert mock_open_store.call_args.kwargs.get("load_vectors") is False
 
 
 class TestSearchCommand:

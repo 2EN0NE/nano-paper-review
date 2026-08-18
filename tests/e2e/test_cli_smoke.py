@@ -58,7 +58,7 @@ class TestSmoke:
         """Help output lists core subcommands."""
         result = _run("--help")
         assert result.returncode == 0
-        for cmd in ("index", "search", "status", "serve", "review"):
+        for cmd in ("index", "search", "status", "tags", "serve", "review"):
             assert cmd in result.stdout, f"Expected '{cmd}' in help output"
 
     def test_no_args_shows_help(self):

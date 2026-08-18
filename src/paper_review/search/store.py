@@ -395,7 +395,7 @@ class Store:
         self.chunk_vectors.clear()
         self.content_hashes.clear()
 
-        for row in db.execute("SELECT * FROM papers"):
+        for row in db.execute("SELECT * FROM papers ORDER BY rowid"):
             pid = row["paper_id"]
             meta = PaperMeta(
                 filename=row["filename"],
@@ -661,6 +661,22 @@ class Store:
             raise
 
         return chunks
+
+    def list_tags(self) -> list[str]:
+        """聚合标签库（Tag Library）：全部论文技术标签去重保序。
+
+        与 04-extract-features.py 的 ``_load_tag_library`` 语义一致——从
+        papers.tags 聚合，按首次出现顺序去重并 strip 空白。评审积累的标签库
+        既是论文元数据，也是后续评审 Reference 的 Technical Feature Set 来源
+        （ADR 0015/0016）。空标签跳过；无任何标签返回空列表（冷启动）。
+        """
+        tags: list[str] = []
+        for paper in self.papers.values():
+            for t in paper.meta.tags:
+                t = t.strip()
+                if t and t not in tags:
+                    tags.append(t)
+        return tags
 
     def update_tags(self, paper_id: str, tags: list[str]) -> bool:
         """更新论文的技术标签（papers.tags 字段），实现标签库自动积累。
@@ -1233,11 +1249,15 @@ def cosine_similarity(a, b) -> float:
     return float(np.dot(aa[:n], bb[:n]))
 
 
-def open_store(data_dir: str | None = None) -> Store:
+def open_store(data_dir: str | None = None, *, load_vectors: bool = True) -> Store:
     """打开索引（数据目录含 FAISS 初始化）。
 
     命令行和测试的统一入口。自动解析 data_dir → index.sqlite 路径，
     加载全部数据并初始化/恢复 FAISS 索引。
+
+    load_vectors=False 时走轻量加载：仅 load_for_search（papers/chunks），
+    不反序列化 chunk_vectors BLOB、不加载/初始化 FAISS，供 tags 等只需
+    论文元数据的只读命令使用。
 
     Store 构造时传入 data_dir 感知的 config，确保 config.vector_dim
     与 FAISS 索引维度一致（P1 修复：--data-dir 场景下 Store 曾使用错误配置）。
@@ -1251,7 +1271,10 @@ def open_store(data_dir: str | None = None) -> Store:
     db_path = str(index_dir / "index.sqlite")
 
     store = Store(db_path, config=cfg)
-    store.load_all()
-    if not store.load_faiss():
-        store.init_faiss()
+    if load_vectors:
+        store.load_all()
+        if not store.load_faiss():
+            store.init_faiss()
+    else:
+        store.load_for_search()
     return store

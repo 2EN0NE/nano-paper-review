@@ -6,6 +6,7 @@ CLI 入口 —— 论文检索服务的命令行接口
 - index: 从 PDF 目录建索引
 - search: 执行检索
 - status: 查看索引状态
+- tags: 查看标签池（Tag Library）
 - serve: 启动 HTTP 服务
 """
 
@@ -449,6 +450,30 @@ def status(ctx: typer.Context):
     else:
         typer.echo(f"  当前: {recorded} → 最新 {SCAFFOLD_VERSION}")
         typer.secho("  ⚠ 建议: paper-review init --reset", fg=typer.colors.YELLOW, bold=True)
+
+
+@app.command()
+def tags(ctx: typer.Context):
+    """查看标签池（Tag Library）—— 全部论文技术标签的去重聚合。
+
+    标签池不独立落盘：评审完成后由 09-archive-reports 把每篇论文的 3 个技术
+    标签写回索引（papers.tags），本命令从索引聚合去重、按首次出现顺序展示。
+    数据目录解析与 status 一致（--data-dir > cwd 下 .paper-review/ > ~/.paper-review/）。
+    """
+    dd = resolve_data_dir(_get_data_dir(ctx))
+    store = open_store(data_dir=str(dd), load_vectors=False)
+    tag_list = store.list_tags()
+    tagged = sum(1 for p in store.papers.values() if p.meta.tags)
+    typer.echo("\n标签池（Tag Library）")
+    typer.echo("─" * 40)
+    typer.echo(f"  标签总数: {len(tag_list)}")
+    typer.echo(f"  已打标签论文: {tagged}")
+    typer.echo()
+    if not tag_list:
+        typer.echo("  （尚无标签：评审完成后由 09-archive-reports 写回索引）")
+        return
+    for i, t in enumerate(tag_list, 1):
+        typer.echo(f"  {i:>3}. {t}")
 
 
 @app.command()

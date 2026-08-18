@@ -211,6 +211,35 @@ class TestUserFlow:
         assert "3" in result.stdout
 
         # ════════════════════════════════════════
+        # Step 2b: tags（index 的论文尚未评审打标签，标签池为空）
+        # ════════════════════════════════════════
+        result = _run("--data-dir", str(data_dir), "tags", check=False)
+        assert result.returncode == 0
+        assert "标签池" in result.stdout
+        assert "尚无标签" in result.stdout
+
+        # ════════════════════════════════════════
+        # Step 2c: tags 非空标签池（写回标签后聚合去重保序）
+        # ════════════════════════════════════════
+        from paper_review.search.store import Store
+
+        store = Store(str(data_dir / "index" / "index.sqlite"))
+        store.load_for_search()
+        pids = list(store.papers.keys())
+        assert len(pids) >= 2, f"index 后应有论文，实际 {len(pids)} 篇"
+        store.update_tags(pids[0], ["数据库", "流量回放"])
+        store.update_tags(pids[1], ["流量回放", "SQL", "  "])
+        store.close()
+
+        result = _run("--data-dir", str(data_dir), "tags", check=False)
+        assert result.returncode == 0
+        assert "标签总数: 3" in result.stdout
+        assert "已打标签论文: 2" in result.stdout
+        assert "数据库" in result.stdout
+        assert "流量回放" in result.stdout
+        assert "SQL" in result.stdout
+
+        # ════════════════════════════════════════
         # Step 3: search
         # ════════════════════════════════════════
         result = _run(

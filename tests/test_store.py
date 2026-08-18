@@ -1,8 +1,10 @@
 """Store/SQLite 持久化层测试"""
 
+from unittest.mock import patch
+
 from helpers import make_mock_chunk_vecs, make_sample_paper
 from paper_review.search.chunker import chunk_paper
-from paper_review.search.store import Store
+from paper_review.search.store import Store, open_store
 
 
 class TestStore:
@@ -49,6 +51,26 @@ class TestStore:
     def test_update_tags_nonexistent(self):
         store = Store(":memory:")
         assert not store.update_tags("no_such_paper", ["标签"])
+        store.close()
+
+    def test_list_tags_empty(self):
+        """无标签时返回空列表（冷启动）。"""
+        store = Store(":memory:")
+        assert store.list_tags() == []
+        store.close()
+
+    def test_list_tags_dedup_and_order(self):
+        """聚合去重保序 + 跳过空/空白标签。"""
+        store = Store(":memory:")
+        for name, tags in [
+            ("A", ["数据库", "流量回放"]),
+            ("B", ["流量回放", "SQL", "  "]),
+            ("C", []),
+        ]:
+            paper = make_sample_paper(name)
+            store.add_paper(paper, make_mock_chunk_vecs(chunk_paper(paper)))
+            store.update_tags(paper.paper_id, tags)
+        assert store.list_tags() == ["数据库", "流量回放", "SQL"]
         store.close()
 
     def test_add_paper_persists_features(self):
@@ -352,4 +374,40 @@ class TestStore:
         # bm25 不抛异常且能检索到内容
         results = store.bm25_search("信用评估")
         assert len(results) > 0
+        store.close()
+
+
+def test_open_store_load_vectors_false_uses_lightweight_load(tmp_path):
+    """open_store(load_vectors=False) 仅加载 papers/chunks，跳过向量与 FAISS。
+
+    tags 等只读元数据命令不应反序列化整库 chunk_vectors BLOB、不加载/初始化
+    FAISS 索引（否则列出标签会白白加载全量向量）。
+    """
+    with (
+        patch.object(Store, "load_for_search") as m_light,
+        patch.object(Store, "load_all") as m_all,
+        patch.object(Store, "load_faiss") as m_load_faiss,
+        patch.object(Store, "init_faiss") as m_init_faiss,
+    ):
+        store = open_store(data_dir=str(tmp_path), load_vectors=False)
+        m_light.assert_called_once()
+        m_all.assert_not_called()
+        m_load_faiss.assert_not_called()
+        m_init_faiss.assert_not_called()
+        store.close()
+
+
+def test_open_store_default_still_loads_vectors_and_faiss(tmp_path):
+    """open_store() 默认路径保持 load_all + FAISS 初始化（回归对照）。"""
+    with (
+        patch.object(Store, "load_all") as m_all,
+        patch.object(Store, "load_for_search") as m_light,
+        patch.object(Store, "load_faiss", return_value=False) as m_load_faiss,
+        patch.object(Store, "init_faiss") as m_init_faiss,
+    ):
+        store = open_store(data_dir=str(tmp_path))
+        m_all.assert_called_once()
+        m_light.assert_not_called()
+        m_load_faiss.assert_called_once()
+        m_init_faiss.assert_called_once()
         store.close()
