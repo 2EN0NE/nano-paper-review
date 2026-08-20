@@ -1982,18 +1982,20 @@ def _embedding_model_available() -> bool:
     虽然哈希降级也能建 FAISS 索引，但该降级路径已由
     TestChunkLevelRetrievalPipeline（noop 02-auto-index + 内存 store）覆盖。
     这里只测「真实模型 + 真实 FAISS」的完整链路，无模型则跳过。
+
+    只扫 paper-review cache（~/.cache/paper-review/models）：CLI 链路
+    （02-auto-index / 05-batch-search）经 config.model_cache_dir 加载模型，
+    不读 HF hub cache。若扫 HF cache，会出现「_HAS_EMBEDDING_MODEL 非 True
+    但实际哈希降级」的误判（offline_pack.sh 下载模型到 HF cache 的中间态）。
     """
     try:
-        from paper_review.model_discovery import scan_huggingface_cache, scan_model_cache
+        from paper_review.model_discovery import scan_model_cache
     except ImportError:
         return False
 
     try:
         model_cache = Path.home() / ".cache" / "paper-review" / "models"
         for m in scan_model_cache(model_cache):
-            if m.model_type == "embedding":
-                return True
-        for m in scan_huggingface_cache():
             if m.model_type == "embedding":
                 return True
     except Exception:  # noqa: BLE001 — 模型检测尽力而为，任何异常都视为无模型
