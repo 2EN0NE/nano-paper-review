@@ -1283,10 +1283,17 @@ class TestDynamicPoolDowngrade:
         script = tmp_path / name
         counter_file = tmp_path / f"{name}.counter"
         counter_file.write_text("0")
+        # 并发下用 mkdir 原子锁保护计数器读-改-写：4 个 subject 并发调用假 pi，
+        # 若不加锁，多个进程可能同时读到相同 CNT（均偶数）→ 全部成功、无 429，
+        # 测试断言「至少看到 429」会 flaky 失败。mkdir 是 POSIX 原子操作，
+        # 不依赖 flock（macOS 无 flock，CI 是 ubuntu/dash）。
         lines = [
             "#!/bin/sh",
+            f"LOCKDIR={counter_file}.lock",
+            'while ! mkdir "$LOCKDIR" 2>/dev/null; do sleep 0.05; done',
             f"CNT=$(cat {counter_file})",
             f"echo $((CNT + 1)) > {counter_file}",
+            'rmdir "$LOCKDIR"',
             "if [ $((CNT % 2)) -eq 0 ]; then",
             '  echo \'{"step":"03-scoring","status":"ok","data":{"score":80}}\'',
             "  exit 0",

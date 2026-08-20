@@ -53,10 +53,12 @@ def _find_embedding_model() -> DiscoveredModel | None:
 
 
 def _find_reranker_model() -> DiscoveredModel | None:
+    # 只扫 paper-review cache：CrossEncoderReranker.load() 仅认 model_cache_dir
+    # （~/.cache/paper-review/models），不读 HF hub cache。若扫 HF cache，会出现
+    # 「_HAS_RERANKER 非 None（HF cache 有模型）但 load() 加载失败」的误判。
+    # 与 OnnxEmbedder 不同：embedder 直接传 model.path，能加载 HF cache snapshot，
+    # 故 _find_embedding_model 仍扫 HF cache；reranker 无 path 加载路径，不扫。
     for m in scan_model_cache(_MODEL_CACHE):
-        if m.model_type == "reranker":
-            return m
-    for m in scan_huggingface_cache():
         if m.model_type == "reranker":
             return m
     return None
