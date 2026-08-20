@@ -23,9 +23,16 @@ version: "2.0"
 # 所有 .md 步骤和 .py 步骤内调 Agent 的类型与默认 provider/model。
 # type: pi 为当前唯一支持（opencode 预留未实现）。
 # provider/model 留空 = 不传 flag，继承 Agent 默认（pi 跟随 PI_PROVIDER/PI_MODEL 会话）。
-# 显式配置的 provider/model 若报错，运行时会回退为不传（Agent 默认）并告警。
+# escalate = 升级链（Agent Escalation Chain，ADR 0017）：第 N 次尝试用第 N 条命令，
+#   超出链长复用末条（顶部饱和）。留空 = 不启用升级链，回退 provider/model 单命令路径。
+#   默认两条均用默认命令，与各 phase 的 retry.max_attempts=2 对齐——开箱即用不会执行
+#   占位模型。需要“换更强模型再试”时，把第 2 条替换为：
+#     - "pi -ne --model <你的模型名>"   # 第 2 次：升级到指定模型
 agent:
   type: pi
+  escalate:
+    - "pi -ne" # 第 1 次：默认（继承会话模型）
+    - "pi -ne" # 第 2 次：默认（可替换为 --model <模型名> 实现升级）
 
 phases:
   # ── Pre Phase（批量执行）────────────────────────────────────────────────

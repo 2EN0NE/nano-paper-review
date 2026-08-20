@@ -22,10 +22,12 @@ from paper_review.orchestrator import (
     _apply_agent_overrides,
     _build_cli_tree,
     _collect_degradation_warnings,
+    _degradation_kind,
     _estimate_subject_chars,
     _execute_batch,
     _generate_report,
     _load_subject_text,
+    _record_agent_stats,
     _retry_step,
     detect_unfinished_tasks,
     discover_steps,
@@ -206,13 +208,18 @@ class TestPipelineConfigParsing:
         cfg = PipelineConfig.from_dict(
             {
                 "name": "agent-test",
-                "agent": {"type": "pi", "provider": "cli-proxy-api", "model": "deepseek-v4-pro"},
+                "agent": {
+                    "type": "pi",
+                    "provider": "cli-proxy-api",
+                    "model": "deepseek-v4-pro",
+                    "escalate": ["pi -ne", "pi --model x"],
+                },
                 "phases": [
                     {
                         "name": "pre",
                         "mode": "batch",
                         "directory": "pre/",
-                        "agent": {"model": "deepseek-v4-flash"},
+                        "agent": {"model": "deepseek-v4-flash", "escalate": ["pi --model y"]},
                     },
                     {"name": "review", "mode": "per_subject", "directory": "r/"},
                 ],
@@ -221,10 +228,12 @@ class TestPipelineConfigParsing:
         assert cfg.agent.type == "pi"
         assert cfg.agent.provider == "cli-proxy-api"
         assert cfg.agent.model == "deepseek-v4-pro"
+        assert cfg.agent.escalate == ["pi -ne", "pi --model x"]
         pre = cfg.phases[0]
         assert pre.agent is not None
         assert pre.agent.provider == ""  # 未覆盖 → 空，继承全局
         assert pre.agent.model == "deepseek-v4-flash"
+        assert pre.agent.escalate == ["pi --model y"]
         assert cfg.phases[1].agent is None  # 未配置 → None，继承全局
 
     def test_agent_config_defaults_empty(self):
@@ -258,6 +267,10 @@ class TestPipelineConfigParsing:
         # 默认模板不硬编码 provider/model（降低弱依赖）；phase 级覆盖仅作注释示例
         assert cfg.agent.provider == ""
         assert cfg.agent.model == ""
+        # 默认模板带 2 条升级链（ADR 0017），与各 phase 的 max_attempts=2 对齐；
+        # 不含 REPLACE_ME 占位符（开箱即用不执行必然失败的占位模型）。
+        assert len(cfg.agent.escalate) == 2
+        assert all(entry == "pi -ne" for entry in cfg.agent.escalate)
 
 
 class TestApplyAgentOverrides:
@@ -285,6 +298,27 @@ class TestApplyAgentOverrides:
     def test_empty_agent_returns_original(self):
         base = {"PIPELINE_AGENT_MODEL": "deepseek-v4-pro"}
         assert _apply_agent_overrides(base, AgentConfig()) is base
+
+    def test_phase_escalate_overrides_global(self):
+        base = {"PIPELINE_AGENT_ESCALATE": '["pi -ne"]'}
+        env = _apply_agent_overrides(base, AgentConfig(escalate=["pi --model x"]))
+        assert env["PIPELINE_AGENT_ESCALATE"] == '["pi --model x"]'
+
+    def test_phase_model_clears_global_escalate(self):
+        """phase 只配 provider/model（不配 escalate）时清除全局升级链，回退单命令路径。"""
+        base = {
+            "PIPELINE_AGENT_ESCALATE": '["pi -ne"]',
+            "PIPELINE_AGENT_MODEL": "deepseek-v4-pro",
+        }
+        env = _apply_agent_overrides(base, AgentConfig(model="deepseek-v4-flash"))
+        assert "PIPELINE_AGENT_ESCALATE" not in env
+        assert env["PIPELINE_AGENT_MODEL"] == "deepseek-v4-flash"
+
+    def test_phase_escalate_keeps_escalate_over_model(self):
+        """phase 同时配 provider/model 和 escalate 时 escalate 整体接管（不改原语义）。"""
+        base = {"PIPELINE_AGENT_ESCALATE": '["pi -ne"]'}
+        env = _apply_agent_overrides(base, AgentConfig(model="m", escalate=["pi --model x"]))
+        assert env["PIPELINE_AGENT_ESCALATE"] == '["pi --model x"]'
 
 
 # ============================================================================
@@ -2089,6 +2123,279 @@ class TestRetryAbort:
         assert result.status == "ok"
         assert result.attempt == 3
         assert result.data == {"done": True}
+
+
+# ============================================================================
+# 升级链（Agent Escalation Chain）——_retry_step 注入
+# ============================================================================
+
+
+class TestRetryEscalation:
+    """_retry_step 按升级链注入命令（ADR 0017）。"""
+
+    def test_md_step_injects_per_attempt_command(self, tmp_path):
+        """.md 步骤：每次尝试注入链第 N 条命令（ENV_AGENT_COMMAND），超出链长饱和末条。"""
+        recorded: list[str] = []
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
+                recorded.append(env.get("PIPELINE_AGENT_COMMAND", ""))
+                return StepResult(step_name=step.stem, status="error", error="fail")
+
+        step = StepFile(path=tmp_path / "01-test.md", stem="01-test", step_type="md")
+        retry_cfg = RetryConfig(max_attempts=5, on_failure="skip")
+        env = {
+            "PIPELINE_AGENT_ESCALATE": json.dumps(
+                ["pi -ne", "pi -ne --model a", "pi -ne --model b"]
+            )
+        }
+
+        _retry_step(
+            step=step,
+            step_dir=tmp_path / "step",
+            env=env,
+            prior_results=[],
+            subject_name="test",
+            retry_cfg=retry_cfg,
+            executor=RecordingExecutor(),
+        )
+
+        decoded = [json.loads(r) for r in recorded]
+        assert decoded[0] == ["pi", "-ne"]
+        assert decoded[1] == ["pi", "-ne", "--model", "a"]
+        assert decoded[2] == ["pi", "-ne", "--model", "b"]
+        assert decoded[3] == ["pi", "-ne", "--model", "b"]  # 顶部饱和
+        assert decoded[4] == ["pi", "-ne", "--model", "b"]
+
+    def test_py_step_gets_chain_and_budget_not_single_command(self, tmp_path):
+        """.py 步骤：不注入单条命令，整链 + 总预算经 env 传入（脚本自行迭代）。"""
+        recorded: list[tuple[str, str]] = []
+
+        class RecordingExecutor:
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
+                recorded.append(
+                    (
+                        env.get("PIPELINE_AGENT_COMMAND", ""),
+                        env.get("PIPELINE_AGENT_MAX_ATTEMPTS", ""),
+                    )
+                )
+                return StepResult(step_name=step.stem, status="error", error="fail")
+
+        step = StepFile(path=tmp_path / "01-test.py", stem="01-test", step_type="py")
+        retry_cfg = RetryConfig(max_attempts=3, on_failure="skip")
+        env = {"PIPELINE_AGENT_ESCALATE": json.dumps(["pi -ne", "pi --model x"])}
+
+        _retry_step(
+            step=step,
+            step_dir=tmp_path / "step",
+            env=env,
+            prior_results=[],
+            subject_name="test",
+            retry_cfg=retry_cfg,
+            executor=RecordingExecutor(),
+        )
+
+        assert len(recorded) == 3
+        for cmd, max_att in recorded:
+            assert cmd == ""  # .py 不注入单条命令
+            assert max_att == "3"  # 但注入总预算
+
+    def test_md_step_break_on_success_records_command(self, tmp_path):
+        """.md 步骤 attempt 2 成功 → break，result.command 记为第 2 条命令（ADR 0018 by_command）。"""
+
+        class SuccessOnSecond:
+            def __init__(self):
+                self.n = 0
+
+            def execute(self, step, step_dir, env, prior_results, subject_name, subject_text=""):
+                self.n += 1
+                if self.n == 2:
+                    return StepResult(step_name=step.stem, status="ok")
+                return StepResult(step_name=step.stem, status="error", error="attempt fail")
+
+        step = StepFile(path=tmp_path / "01-test.md", stem="01-test", step_type="md")
+        retry_cfg = RetryConfig(max_attempts=3, on_failure="skip")
+        env = {"PIPELINE_AGENT_ESCALATE": json.dumps(["pi -ne", "pi -ne --model a"])}
+
+        result = _retry_step(
+            step=step,
+            step_dir=tmp_path / "step",
+            env=env,
+            prior_results=[],
+            subject_name="test",
+            retry_cfg=retry_cfg,
+            executor=SuccessOnSecond(),
+        )
+
+        assert result.status == "ok"
+        assert result.attempt == 2
+        assert result.command == "pi -ne --model a"  # 成功尝试所用命令被正确归属
+
+
+# ============================================================================
+# Agent 观测（ADR 0018）——_record_agent_stats / _degradation_kind
+# ============================================================================
+
+
+class TestDegradationKind:
+    """降级哨兵 → 稳定短 key 映射。"""
+
+    def test_known_sentinels_map(self):
+        assert _degradation_kind("历史参考恒空（…）") == "history_empty"
+        assert _degradation_kind("技术特征恒空（…）") == "features_empty"
+        assert _degradation_kind("标签写回 0 篇（…）") == "tags_written_zero"
+        assert _degradation_kind("池提升失败（…）") == "promote_error"
+        assert _degradation_kind("池提升 0 篇（…）") == "promote_zero"
+        assert _degradation_kind("评分标签缺失（…）") == "score_tags_missing"
+        assert _degradation_kind("L3 技术特征覆盖率低（…）") == "l3_coverage_low"
+        assert _degradation_kind("评分证据降级 2 篇：…") == "evidence_degraded"
+
+    def test_unknown_falls_back(self):
+        assert _degradation_kind("完全陌生的哨兵") == "degradation"
+
+
+class TestRecordAgentStats:
+    """_record_agent_stats：按管线分桶 + 指纹重置 + 降级哨兵计入（ADR 0018）。"""
+
+    def _make_config(self, pipeline_dir: Path, escalate: list | None = None) -> PipelineConfig:
+        step_dir = pipeline_dir / "review-pipeline"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        (step_dir / "01-score.md").write_text("# score\n", encoding="utf-8")
+        (step_dir / "02-extra.py").write_text("x = 1\n", encoding="utf-8")
+        return PipelineConfig(
+            name="test",
+            phases=[PhaseConfig(name="review", mode="per_subject", directory="review-pipeline/")],
+            agent=AgentConfig(escalate=escalate or []),
+        )
+
+    def test_writes_bucket_and_counts_md_steps_only(self, tmp_path):
+        """只有 .md 步骤计入分母；异常 = error 步骤 + 降级哨兵。"""
+        pipeline_dir = tmp_path / "pipelines" / "std"
+        config = self._make_config(pipeline_dir)
+        results = [
+            StepResult(step_name="01-score", status="ok", command="pi -ne"),
+            StepResult(
+                step_name="01-score",
+                status="error",
+                error="Agent step timed out (60s)",
+                command="pi -ne",
+            ),
+            StepResult(step_name="02-extra", status="error", error="boom"),  # .py → 忽略
+        ]
+        data_dir = tmp_path / "data"
+
+        _record_agent_stats(
+            config,
+            pipeline_dir,
+            results,
+            ["技术特征恒空（LLM 抽取 + 词表兜底均无产出）"],
+            str(data_dir),
+        )
+
+        data = json.loads((data_dir / "agent-stats.json").read_text(encoding="utf-8"))
+        slot = data["pipelines"]["std"]
+        assert slot["total_steps"] == 2  # 02-extra 是 .py，不计数
+        assert slot["total_anomalies"] == 2  # 1 个 error + 1 个降级哨兵
+        assert slot["by_kind"]["timeout"] == 1
+        assert slot["by_kind"]["degradation:features_empty"] == 1
+        assert slot["by_command"]["pi -ne"]["steps"] == 2
+        assert slot["by_command"]["pi -ne"]["anomalies"] == 1
+
+    def test_fingerprint_change_resets_bucket(self, tmp_path):
+        """改 escalate → 指纹变化 → 该管线计数清零重来（不叠加历史）。"""
+        pipeline_dir = tmp_path / "pipelines" / "std"
+        data_dir = tmp_path / "data"
+        err = StepResult(step_name="01-score", status="error", error="boom")
+
+        _record_agent_stats(
+            self._make_config(pipeline_dir, escalate=["pi -ne"]),
+            pipeline_dir,
+            [err],
+            [],
+            str(data_dir),
+        )
+        _record_agent_stats(
+            self._make_config(pipeline_dir, escalate=["pi --model x"]),
+            pipeline_dir,
+            [StepResult(step_name="01-score", status="ok")],
+            [],
+            str(data_dir),
+        )
+
+        data = json.loads((data_dir / "agent-stats.json").read_text(encoding="utf-8"))
+        slot = data["pipelines"]["std"]
+        assert slot["total_steps"] == 1  # 清零后只算第二次的 1 步
+        assert slot["total_anomalies"] == 0
+
+    def test_per_attempt_attribution_by_command(self, tmp_path):
+        """attempt_history 逐次计数：升级链中间失败不再被最后一次尝试归因掩盖。"""
+        pipeline_dir = tmp_path / "pipelines" / "std"
+        config = self._make_config(pipeline_dir, escalate=["pi -ne", "pi -ne --model a"])
+        results = [
+            StepResult(
+                step_name="01-score",
+                status="ok",
+                command="pi -ne --model a",
+                attempt_history=[
+                    {"command": "pi -ne", "ok": False, "error": "pi exited with code 1"},
+                    {"command": "pi -ne --model a", "ok": True, "error": ""},
+                ],
+            ),
+        ]
+        data_dir = tmp_path / "data"
+
+        _record_agent_stats(config, pipeline_dir, results, [], str(data_dir))
+
+        data = json.loads((data_dir / "agent-stats.json").read_text(encoding="utf-8"))
+        slot = data["pipelines"]["std"]
+        assert slot["total_steps"] == 2  # 两次 attempt 各自计数
+        assert slot["total_anomalies"] == 1
+        assert slot["by_command"]["pi -ne"]["steps"] == 1
+        assert slot["by_command"]["pi -ne"]["anomalies"] == 1
+        assert slot["by_command"]["pi -ne --model a"]["steps"] == 1
+        assert slot["by_command"]["pi -ne --model a"]["anomalies"] == 0
+
+    def test_resumed_steps_are_not_counted(self, tmp_path):
+        """续做复用（resumed=True）的 .md 步骤不进入分母——避免跨 resume 重复计数。"""
+        pipeline_dir = tmp_path / "pipelines" / "std"
+        config = self._make_config(pipeline_dir)
+        results = [
+            StepResult(step_name="01-score", status="ok", resumed=True),
+            StepResult(step_name="01-score", status="error", error="boom"),
+        ]
+        data_dir = tmp_path / "data"
+
+        _record_agent_stats(config, pipeline_dir, results, [], str(data_dir))
+
+        data = json.loads((data_dir / "agent-stats.json").read_text(encoding="utf-8"))
+        slot = data["pipelines"]["std"]
+        assert slot["total_steps"] == 1  # resumed 步骤不计入
+        assert slot["total_anomalies"] == 1
+
+    def test_degradation_not_recorded_on_resume(self, tmp_path):
+        """续做（record_degradation=False）不重复记录降级哨兵——避免异常占比被污染。
+
+        首次全量运行记录降级哨兵；续做/fix-warn 复用产物后降级是重算的全量快照，
+        重复计入会膨胀 total_anomalies（.md 步骤已有 resumed 守卫，降级哨兵同级门控）。
+        """
+        pipeline_dir = tmp_path / "pipelines" / "std"
+        config = self._make_config(pipeline_dir)
+        warnings = ["技术特征恒空（LLM 抽取 + 词表兜底均无产出）"]
+        err = StepResult(step_name="01-score", status="error", error="boom")
+        data_dir = tmp_path / "data"
+
+        # 首次全量运行：记录降级哨兵
+        _record_agent_stats(config, pipeline_dir, [err], warnings, str(data_dir))
+        # 续做：跳过降级哨兵，只记录 .md 步骤异常
+        _record_agent_stats(
+            config, pipeline_dir, [err], warnings, str(data_dir), record_degradation=False
+        )
+
+        data = json.loads((data_dir / "agent-stats.json").read_text(encoding="utf-8"))
+        slot = data["pipelines"]["std"]
+        assert slot["total_steps"] == 2  # 两次各 1 个 .md 步骤
+        assert slot["total_anomalies"] == 3  # 2 个步骤异常 + 1 个降级哨兵（仅首次）
+        assert slot["by_kind"]["degradation:features_empty"] == 1  # 续做不翻倍
 
 
 # ============================================================================

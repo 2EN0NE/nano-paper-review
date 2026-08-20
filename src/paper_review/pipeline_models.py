@@ -273,6 +273,7 @@ def _parse_phase(data: dict) -> PhaseConfig:
             AgentConfig(
                 provider=agent_data.get("provider", ""),
                 model=agent_data.get("model", ""),
+                escalate=agent_data.get("escalate", []),
             )
             if agent_data
             else None
@@ -336,6 +337,7 @@ class PipelineConfig:
                 type=agent_data.get("type", "pi"),
                 provider=agent_data.get("provider", ""),
                 model=agent_data.get("model", ""),
+                escalate=agent_data.get("escalate", []),
             ),
         )
 
@@ -446,6 +448,14 @@ class StepResult:
     subject: str = ""
     data: dict = field(default_factory=dict)
     attempt: int = 1
+    command: str = ""  # 最终尝试所用的 agent 命令（升级链；agent 观测 by_command 用）
+    # 每次尝试的记录（agent 观测 per-attempt）：[{"command", "ok", "error"}]。
+    # 由 _retry_step 填充，_record_agent_stats 据此按 attempt 逐次计数，避免
+    # 「最后一次尝试」的归因偏差（ADR 0018 by_command）。
+    attempt_history: list[dict] = field(default_factory=list)
+    # 续做（resume）复用产物时置 True：该步骤本次运行未产生任何执行尝试，
+    # agent 观测（_record_agent_stats）据此跳过，避免跨 resume 重复计数（ADR 0018）。
+    resumed: bool = False
 
 
 @dataclass

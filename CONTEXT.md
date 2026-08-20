@@ -170,6 +170,18 @@ _Avoid_: Output contract, step format
 **Retry Policy**:
 Step 执行失败时的重试策略：重试次数、是否跳过继续（skip-and-continue）或中断，可在 `pipeline.yaml` 定义。
 
+**Agent Escalation Chain**:
+Agent 步骤（.md 与调 pi 的 .py 步骤）每次尝试所使用的完整 pi 命令序列。第 N 次尝试用第 N 条命令，超出链长后复用最后一条（顶部饱和）；任意失败（超时/格式错/非零退出/异常）推进到下一条。每条是一条完整命令行（`shlex.split` 解析，可写成字符串或 YAML 数组），框架自动追加 `--no-session -p @prompt.md`。定义在 `pipeline.yaml` 的 `agent.escalate`，每条管线自带；缺省时回退旧的 `agent.type/provider/model` 单命令路径。
+_Avoid_: 升级指令列表, 升级命令列表, fallback command chain
+
+**Agent Observation**:
+Agent 步骤（.md）执行结果的聚合计数，用于衡量“异常占总处理步骤数的比例”。按管线分桶存储于 `{data_dir}/agent-stats.json`（计数器 + agent 段指纹），异常按开放式归一化 key（`timeout` / `json_format` / `exit:<code>` / `exception:<ClassName>` / `degradation:缺证据` 等）计数；调 pi 的 .py 步骤失败经降级哨兵间接计入；原始细节留在 paper-review.log，不重复落盘。改管线 `agent` 段或 `paper-review agent-status --clear` 会清零对应计数。
+_Avoid_: agent metrics, agent 表现日志, 观测事件流
+
+**Fix-Warn**:
+逐篇修复。`review --fix-warn` 扫描当前输入路径下已完成（status=done）且存在逐篇问题的批次，交互式选择后只重跑问题篇目的 Review 阶段（复用 Pre 产物）。问题 = Review 步骤 status=error（ERROR）或 08-summarize 证据降级「缺证据/tags缺失」（WARN）；批次级降级（技术特征恒空等）不在修复范围。默认回写（Post 归档），`--fix-skip-archive` 跳过。
+_Avoid_: 修复模式, fix batch, repair run
+
 **Orchestrator**:
 流水线的执行引擎。纯 Python 模块（`src/paper_review/orchestrator.py`），负责 Step 发现/排序/顺序执行。.py 步骤用 Python 直接执行；.md 步骤通过 `subprocess.run(["pi", "-p", "@prompt_file.md"])` 调用 pi。
 _Avoid_: Pipeline runner, executor, engine
@@ -189,7 +201,7 @@ Review Run 的状态，记录在 task-manifest 中。取值：`running`（进行
 _Avoid_: Run state, job status
 
 **Resume**:
-对未完成的 Review Run 原地续做：复用原 task 目录的 intermediates，已完成 Steps（有 output.json 且状态为 ok/skipped 的 Subject-Step）跳过——失败产物（status=error）不跳过、会重跑重试；从断点继续，最终报告合并进原 task。Pre Phase（仅指首个 per_subject 阶段之前的 batch 阶段）在前序 Pre 产物确证（最后一步 output.json 存在且 status 为 ok/skipped）、subjects 与输入路径均一致时跳过；任一条件不满足则重跑 Pre，避免混批。
+对未完成的 Review Run 原地续做：复用原 task 目录的 intermediates，已完成 Steps（有 output.json 且状态为 ok/skipped 的 Subject-Step）跳过——失败产物（status=error）不跳过、会重跑重试；从断点继续，最终报告合并进原 task。Pre Phase（仅指首个 per_subject 阶段之前的 batch 阶段）在前序 Pre 产物确证（最后一步 output.json 存在且 status 为 ok/skipped）、subjects 与输入路径均一致时跳过；任一条件不满足则重跑 Pre，避免混批。检测到多个未完成任务时交互式选择：继续最近一批 / 选择其他中断任务（按当前输入路径的规范化绝对路径过滤，滚动列表上下键选择）/ 重新一批 / 取消。
 _Avoid_: Resume run, continue job, restart
 
 **Output Root**:

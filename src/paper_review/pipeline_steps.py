@@ -20,15 +20,20 @@ from pathlib import Path
 from typing import Protocol
 
 from paper_review.agent import (
+    ENV_AGENT_COMMAND,
     AgentConfig,
+    append_prompt_args,
     build_command,
-    build_command_without_model,
-    is_model_config_error,
 )
 from paper_review.logging_config import get_logger
 from paper_review.pipeline_models import StepFile, StepResult
 
 logger = get_logger("orchestrator")
+
+# .md 步骤输出不是合法 JSON 对象时的稳定错误文案。
+# agent_stats.classify_kind 依据此常量（而非易变的子串）归类为 json_format——
+# 文案一旦改动，只需改这一处，分类口径不漂移（ADR 0018）。
+AGENT_OUTPUT_NOT_JSON_ERROR = "agent 输出不是合法 JSON 对象（未遵循结构化输出要求）"
 
 # 进程内执行 .py 步骤时的环境变量互斥锁（Worker 池并发时保护 os.environ）
 _py_step_lock = threading.Lock()
@@ -479,17 +484,22 @@ class AgentRunner:
                     step_timeout,
                 )
 
-        # 解析 pi 额外参数
-        pi_args_str = env.get("PIPELINE_PI_ARGS", "")
-        if pi_args_str:
-            pi_extra_args = pi_args_str.split()
-        else:
-            pi_extra_args = list(_DEFAULT_PI_ARGS)
-
-        # Agent 配置（type/provider/model）——留空不传 flag（继承 Agent 默认），
-        # 显式配置报错时回退为不传（降低对特定 provider/model 的硬编码弱依赖）。
-        agent_cfg = AgentConfig.from_env(env)
-        cmd = build_command(agent_cfg, pi_binary, str(prompt_file), pi_extra_args)
+        # 命令来源：升级链注入（_retry_step 为 .md 步骤按 attempt 解析的单条命令）优先；
+        # 否则回退旧的单命令路径（escalate 缺省时的向后兼容）。
+        cmd: list[str] | None = None
+        injected = env.get(ENV_AGENT_COMMAND, "") or ""
+        if injected:
+            try:
+                parsed = json.loads(injected)
+                if isinstance(parsed, list):
+                    cmd = append_prompt_args([str(x) for x in parsed], str(prompt_file))
+            except json.JSONDecodeError:
+                cmd = None
+        if cmd is None:
+            pi_args_str = env.get("PIPELINE_PI_ARGS", "")
+            pi_extra_args = pi_args_str.split() if pi_args_str else list(_DEFAULT_PI_ARGS)
+            agent_cfg = AgentConfig.from_env(env)
+            cmd = build_command(agent_cfg, pi_binary, str(prompt_file), pi_extra_args)
 
         prompt_size_kb = len(prompt) / 1024
         logger.info(
@@ -501,22 +511,6 @@ class AgentRunner:
         )
         try:
             result = _run_agent_subprocess(cmd, step_env, step_timeout)
-            # 显式 provider/model 配置无效（402/模型不存在等）→ 回退为不传重试一次。
-            # 其他非零退出（prompt 崩溃、网络抖动等）直接传播为 error，不静默换模型。
-            if (
-                result.returncode != 0
-                and agent_cfg.has_explicit_model()
-                and is_model_config_error(result.stderr or "")
-            ):
-                logger.warning(
-                    "  [%s] ⚠ 显式 provider/model 配置无效（exit %d）——回退为 Agent 默认重试",
-                    step_stem,
-                    result.returncode,
-                )
-                fallback_cmd = build_command_without_model(
-                    agent_cfg, pi_binary, str(prompt_file), pi_extra_args
-                )
-                result = _run_agent_subprocess(fallback_cmd, step_env, step_timeout)
         except _AgentTimeoutError as e:
             stderr_data = e.stderr
 
@@ -609,7 +603,7 @@ class AgentRunner:
             # 输出不是合法 JSON 对象 → 不再静默兜底为 ok。
             # 标记 error 触发 _retry_step 重试；原文保留进 data.raw_output，
             # 供 08-summarize 在重试耗尽后走正则兜底（降级保分）。
-            error_msg = "agent 输出不是合法 JSON 对象（未遵循结构化输出要求）"
+            error_msg = AGENT_OUTPUT_NOT_JSON_ERROR
             output_json = {
                 "step": step_stem,
                 "status": "error",

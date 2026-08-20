@@ -14,7 +14,7 @@ fmt-check:                                     # 仅检查格式（CI / pre-push
 	uv run ruff check .
 
 test-unit:                                     # 单元测试（对齐 CI unit-tests job）
-	uv run pytest tests/ -q -m "not integration and not e2e_slow"
+	uv run pytest tests/ -q -m "not integration and not e2e_slow" --ignore=tests/e2e
 
 test-integration:                              # 集成测试（对齐 CI integration-tests job）
 	uv run pytest tests/ -q -m "integration"

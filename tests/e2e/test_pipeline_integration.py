@@ -389,6 +389,19 @@ class TestPipelineSinglePDF:
         # 验证 post intermediates
         assert (intermediates / "post" / "01-archive" / "output.json").exists()
 
+        # agent-stats.json 落盘（ADR 0018）：.md 步骤（06/07）被计入分母；
+        # .md 步骤因 pi-not-found 而 skipped（不算异常），但降级哨兵（评分标签缺失/
+        # 证据降级）会作为额外异常计入 total_anomalies。
+        stats_path = data_dir / "agent-stats.json"
+        assert stats_path.exists(), "agent-stats.json 未落盘"
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        assert "pipelines" in stats
+        assert "e2e-test" in stats["pipelines"], f"分桶名异常: {stats['pipelines'].keys()}"
+        slot = stats["pipelines"]["e2e-test"]
+        assert slot["total_steps"] == 2
+        assert slot["total_anomalies"] >= 1
+        assert any(k.startswith("degradation:") for k in slot["by_kind"])
+
 
 # ============================================================================
 # 场景 2: 单 docx 文件

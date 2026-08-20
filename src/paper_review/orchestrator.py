@@ -20,9 +20,28 @@ import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
-from paper_review.agent import ENV_AGENT_MODEL, ENV_AGENT_PROVIDER, ENV_AGENT_TYPE, AgentConfig
+from paper_review.agent import (
+    ENV_AGENT_COMMAND,
+    ENV_AGENT_ESCALATE,
+    ENV_AGENT_MAX_ATTEMPTS,
+    ENV_AGENT_MODEL,
+    ENV_AGENT_PROVIDER,
+    ENV_AGENT_TYPE,
+    AgentConfig,
+    parse_escalation_chain,
+    resolve_command_for_attempt,
+)
+from paper_review.agent_stats import (  # pyright: ignore[reportMissingImports] — 新模块，pyright 文件索引未刷新
+    AgentStatsRecorder,
+    classify_kind,
+    compute_fingerprint,
+    default_stats,
+    load_stats,
+    save_stats,
+)
 from paper_review.dynamic_pool import DynamicPool, _is_productive_timeout, _is_rate_or_server_error
 from paper_review.logging_config import get_logger
 from paper_review.pipeline_models import (
@@ -172,11 +191,32 @@ def _retry_step(
     唯一的重试实现点——_execute_batch 和 _execute_per_subject 都调用此函数。
     step_timeout 通过 env['PIPELINE_STEP_TIMEOUT'] 传递给 executor。
     """
-    timed_env = {**env, "PIPELINE_STEP_TIMEOUT": str(step_timeout)}
+    timed_env = {
+        **env,
+        "PIPELINE_STEP_TIMEOUT": str(step_timeout),
+        ENV_AGENT_MAX_ATTEMPTS: str(retry_cfg.max_attempts),
+    }
+    # 升级链：.md 步骤每次尝试用第 N 条命令（单调推进 + 顶部饱和，ADR 0017）；
+    # .py 步骤（04-extract-features 等）从 ENV_AGENT_ESCALATE 读整链自行按 subject 迭代。
+    # 注：.py 步骤内部按链迭代 max_attempts 次，且 _retry_step 又在步骤级重试
+    # max_attempts 次——若某 .py 步骤硬失败（返回 error），最坏为 N² 次子进程调用。
+    # 当前模板 .py 步骤均为软失败（词表兜底返回空）故不触发；属潜在放大风险而非 bug。
+    escalation_chain = parse_escalation_chain(AgentConfig.from_env(env).escalate)
     result: StepResult | None = None
+    last_command = ""
+    attempt_history: list[dict] = []
     t0 = time.monotonic()
 
     for attempt in range(1, retry_cfg.max_attempts + 1):
+        attempt_env = timed_env
+        attempt_command = ""
+        if step.step_type == "md":
+            cmd = resolve_command_for_attempt(escalation_chain, attempt)
+            if cmd is not None:
+                attempt_env = {**timed_env, ENV_AGENT_COMMAND: json.dumps(cmd)}
+                attempt_command = " ".join(cmd)
+                last_command = attempt_command
+
         logger.info(
             "  [%s] ▶ step '%s' attempt %d/%d (timeout=%ds)",
             subject_name,
@@ -187,12 +227,19 @@ def _retry_step(
         )
 
         try:
-            result = executor.execute(
-                step, step_dir, timed_env, prior_results, subject_name, subject_text=subject_text
+            result = executor.execute(  # pi-lens-ignore: python-sql-injection — StepExecutor 非 SQL
+                step, step_dir, attempt_env, prior_results, subject_name, subject_text=subject_text
             )
             elapsed = time.monotonic() - t0
             result.subject = subject_name
             result.attempt = attempt
+            attempt_history.append(
+                {
+                    "command": attempt_command,
+                    "ok": result.status in ("ok", "skipped"),
+                    "error": result.error or "",
+                }
+            )
 
             if result.status in ("ok", "skipped"):
                 logger.info(
@@ -203,7 +250,7 @@ def _retry_step(
                     elapsed,
                     attempt,
                 )
-                return result
+                break
 
             logger.warning(
                 "  [%s] ✗ step '%s' attempt %d failed (%.1fs elapsed): %s",
@@ -223,6 +270,7 @@ def _retry_step(
                 elapsed,
                 e,
             )
+            attempt_history.append({"command": attempt_command, "ok": False, "error": str(e)})
             result = StepResult(
                 step_name=step.stem,
                 status="error",
@@ -238,6 +286,8 @@ def _retry_step(
             error="All attempts exhausted (no result)",
             subject=subject_name,
         )
+    result.command = last_command
+    result.attempt_history = attempt_history
     return result
 
 
@@ -249,16 +299,23 @@ def _retry_step(
 def _apply_agent_overrides(base_env: dict, agent: AgentConfig | None) -> dict:
     """应用 phase 级 agent 覆盖到 step 环境变量（不改原 base_env）。
 
-    phase.agent.provider/model 覆盖全局 agent 注入的值；空字段不覆盖（保留
-    base_env 里的全局值）。type 仅全局生效，phase 级不覆盖。
+    phase.agent.provider/model/escalate 覆盖全局 agent 注入的值；空字段不覆盖
+    （保留 base_env 里的全局值）。type 仅全局生效，phase 级不覆盖。
+
+    phase 显式配置 provider/model 而未配置 escalate 时，清除全局注入的
+    escalate——否则 _retry_step 会走升级链命令而静默忽略 provider/model。
     """
-    if not agent or not agent.has_explicit_model():
+    if not agent or not (agent.has_explicit_model() or agent.escalate):
         return base_env
     env = dict(base_env)
     if agent.provider:
         env[ENV_AGENT_PROVIDER] = agent.provider
     if agent.model:
         env[ENV_AGENT_MODEL] = agent.model
+    if agent.escalate:
+        env[ENV_AGENT_ESCALATE] = json.dumps(agent.escalate)
+    elif agent.has_explicit_model():
+        env.pop(ENV_AGENT_ESCALATE, None)
     return env
 
 
@@ -539,6 +596,7 @@ def _run_steps_for_subject(
                         error=out.get("error"),
                         subject=subject,
                         data=out.get("data", {}),
+                        resumed=True,
                     )
             except (json.JSONDecodeError, OSError):
                 result = None  # 产物损坏 → 正常重跑
@@ -1476,25 +1534,207 @@ def _collect_degradation_warnings(task_dir: Path) -> list[str]:
     # 6. rationale/tags 证据降级（基于 08-summarize 的 evidence 字段，字段级精确到维度）
     degraded = []
     for sd in subject_dirs:
-        out = sd / "08-summarize" / "output.json"
-        if not out.exists():
-            continue
-        ev = _load(out).get("data", {}).get("evidence", {})
-        if not isinstance(ev, dict):
-            continue
-        missing = ev.get("rationale_missing") or []
-        tags_missing = bool(ev.get("tags_missing"))
-        if missing or tags_missing:
-            parts = []
-            if missing:
-                parts.append("缺证据:" + "/".join(str(d) for d in missing))
-            if tags_missing:
-                parts.append("tags缺失")
-            degraded.append(f"{sd.name}（{'；'.join(parts)}）")
+        problems = _subject_evidence_problems(sd)
+        if problems:
+            degraded.append(f"{sd.name}（{'；'.join(problems)}）")
     if degraded:
         warnings.append(f"评分证据降级 {len(degraded)} 篇：" + "；".join(degraded))
 
     return warnings
+
+
+def _subject_evidence_problems(subject_dir: Path) -> list[str]:
+    """单篇的 08-summarize evidence 降级问题列表（缺证据:<维度> / tags缺失）。"""
+    out = subject_dir / "08-summarize" / "output.json"
+    if not out.exists():
+        return []
+    try:
+        ev = json.loads(out.read_text(encoding="utf-8")).get("data", {}).get("evidence", {})
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(ev, dict):
+        return []
+    problems = []
+    missing = ev.get("rationale_missing") or []
+    if missing:
+        problems.append("缺证据:" + "/".join(str(d) for d in missing))
+    if ev.get("tags_missing"):
+        problems.append("tags缺失")
+    return problems
+
+
+@dataclass
+class FixReport:
+    """一个已完成批次里「有问题的篇目」清单（逐篇 ERROR / WARN，供 --fix-warn）。"""
+
+    error_subjects: list[str]  # Review 步骤产物 status=error 的篇目
+    warn_subjects: dict[str, list[str]]  # 篇目 → 降级类型（缺证据:… / tags缺失）
+
+    @property
+    def all_subjects(self) -> list[str]:
+        seen: list[str] = []
+        for s in self.error_subjects:
+            if s not in seen:
+                seen.append(s)
+        for s in self.warn_subjects:
+            if s not in seen:
+                seen.append(s)
+        return seen
+
+    @property
+    def error_count(self) -> int:
+        return len(self.error_subjects)
+
+    @property
+    def warn_count(self) -> int:
+        return len(self.warn_subjects)
+
+    @property
+    def problem_count(self) -> int:
+        return len(self.all_subjects)
+
+
+def collect_fix_subjects(task_dir: Path) -> FixReport:
+    """扫描已完成批次的逐篇问题（--fix-warn 数据源）。
+
+    - ERROR：manifest.steps（Review 阶段步骤全集）产物 status=error 的篇目；
+    - WARN：08-summarize evidence 字段级降级（缺证据/tags缺失）。
+    """
+    manifest = read_task_manifest(task_dir)
+    steps = set(manifest.get("steps") or [])
+    intermediates = task_dir / "intermediates"
+    if not intermediates.is_dir():
+        return FixReport(error_subjects=[], warn_subjects={})
+
+    subject_dirs = [
+        d for d in sorted(intermediates.iterdir()) if d.is_dir() and d.name not in ("pre", "post")
+    ]
+
+    error_subjects: list[str] = []
+    warn_subjects: dict[str, list[str]] = {}
+
+    for sd in subject_dirs:
+        # ERROR：Review 步骤产物 status=error
+        if steps:
+            for step_dir in sorted(sd.iterdir()):
+                if not step_dir.is_dir() or step_dir.name not in steps:
+                    continue
+                out = step_dir / "output.json"
+                if not out.exists():
+                    continue
+                try:
+                    data = json.loads(out.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if data.get("status") == "error":
+                    error_subjects.append(sd.name)
+                    break
+        # WARN：08-summarize evidence
+        problems = _subject_evidence_problems(sd)
+        if problems:
+            warn_subjects[sd.name] = problems
+
+    return FixReport(error_subjects=error_subjects, warn_subjects=warn_subjects)
+
+
+# ============================================================================
+# Agent 观测（Agent Observation）——agent-stats 记录（ADR 0018）
+# ============================================================================
+
+# 降级哨兵 → 稳定短 key（与 _collect_degradation_warnings 的哨兵一一对应）
+_DEGRADATION_KINDS = {
+    "历史参考恒空": "history_empty",
+    "技术特征恒空": "features_empty",
+    "标签写回 0 篇": "tags_written_zero",
+    "池提升失败": "promote_error",
+    "池提升 0 篇": "promote_zero",
+    "评分标签缺失": "score_tags_missing",
+    "L3 技术特征覆盖率低": "l3_coverage_low",
+    "评分证据降级": "evidence_degraded",
+}
+
+
+def _degradation_kind(warning: str) -> str:
+    for prefix, key in _DEGRADATION_KINDS.items():
+        if warning.startswith(prefix):
+            return key
+    return "degradation"
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    """宽容转 int：None/非数字/损坏值回退默认（agent-stats 合并不因脏数据崩溃）。"""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _record_agent_stats(
+    config: PipelineConfig,
+    pipeline_dir: Path,
+    all_step_results: list[StepResult],
+    degradation_warnings: list[str],
+    data_dir: str,
+    record_degradation: bool = True,
+) -> None:
+    """把本次运行的 agent 步骤异常 + 降级记录进 agent-stats.json（ADR 0018）。
+
+    - 分母 = .md 步骤执行数（跨所有 phase）；分子 = 其中 status=error 的。
+    - 降级哨兵（缺证据等）作为额外异常计入（不增 total_steps）。
+    - 按管线目录名分桶；agent 段指纹变化 → 该管线计数清零。
+    - record_degradation=False 时跳过降级哨兵记录：续做（resume/fix-warn）
+      复用产物后降级哨兵是重算的全量快照，重复计入会污染「异常占比」
+      （.md 步骤已有 resumed 守卫，降级哨兵需同级别门控）。
+    """
+    md_steps: set[str] = set()
+    for phase in config.phases:
+        for sf in discover_steps(pipeline_dir / phase.directory):
+            if sf.step_type == "md":
+                md_steps.add(sf.stem)
+
+    recorder = AgentStatsRecorder()
+    for r in all_step_results:
+        if r.step_name not in md_steps:
+            continue
+        if r.resumed:
+            # 续做复用产物（未执行）→ 不计入统计，避免跨 resume 重复计数
+            continue
+        if r.attempt_history:
+            # 按 attempt 逐次计数（ADR 0018 by_command）：升级链中间失败不再被
+            # 「最后一次尝试」归因掩盖。
+            for a in r.attempt_history:
+                ok = bool(a["ok"])
+                kind = "" if ok else classify_kind(a["error"] or "")
+                recorder.record(ok=ok, kind=kind, command=a["command"])
+        else:
+            # 无 per-attempt 记录（老数据/非 _retry_step 路径）回退单次记录
+            ok = r.status != "error"
+            kind = "" if ok else classify_kind(r.error or "")
+            recorder.record(ok=ok, kind=kind, command=r.command)
+
+    if record_degradation:
+        for w in degradation_warnings:
+            recorder.record_anomaly(f"degradation:{_degradation_kind(w)}")
+
+    pipeline_name = pipeline_dir.name
+    fingerprint = compute_fingerprint(config.agent)
+    stats_path = Path(data_dir) / "agent-stats.json"
+    data = load_stats(stats_path)
+    pipelines = data.setdefault("pipelines", {})
+    slot = pipelines.get(pipeline_name)
+    if not isinstance(slot, dict) or slot.get("fingerprint") != fingerprint:
+        # 首次记录或 agent 段指纹变化 → 清零重来
+        slot = default_stats(fingerprint)
+    slot["total_steps"] = _as_int(slot.get("total_steps")) + recorder.total_steps
+    slot["total_anomalies"] = _as_int(slot.get("total_anomalies")) + recorder.total_anomalies
+    for k, v in recorder.by_kind.items():
+        slot.setdefault("by_kind", {})[k] = slot.get("by_kind", {}).get(k, 0) + v
+    for cmd, c in recorder.by_command.items():
+        cmd_slot = slot.setdefault("by_command", {}).setdefault(cmd, {"steps": 0, "anomalies": 0})
+        cmd_slot["steps"] += c["steps"]
+        cmd_slot["anomalies"] += c["anomalies"]
+    pipelines[pipeline_name] = slot
+    save_stats(stats_path, data)
 
 
 def _generate_report(
@@ -1735,6 +1975,21 @@ def detect_unfinished_tasks(output_dir: Path) -> list[Path]:
     return unfinished
 
 
+def list_done_tasks(output_dir: Path) -> list[Path]:
+    """扫描 result/ 下 status=done 的任务目录，最近优先（--fix-warn 数据源）。"""
+    result_root = Path(output_dir) / "result"
+    if not result_root.is_dir():
+        return []
+    done: list[Path] = []
+    for task_dir in sorted(result_root.iterdir(), reverse=True):
+        if not task_dir.is_dir() or not _TASK_DIR_NAME_RE.match(task_dir.name):
+            continue
+        manifest = read_task_manifest(task_dir)
+        if manifest.get("status") == "done":
+            done.append(task_dir)
+    return done
+
+
 # ============================================================================
 # 主入口 — 薄编排层
 # ============================================================================
@@ -1751,6 +2006,9 @@ def run_pipeline(
     pool_progress: PoolProgress | None = None,
     resume_task_dir: Path | None = None,
     allow_degraded: bool = False,
+    only_subjects: list[str] | None = None,
+    recompute_review: bool = False,
+    archive: bool = True,
 ) -> PipelineResult:
     """执行一条完整的 pipeline。
 
@@ -1768,6 +2026,12 @@ def run_pipeline(
         allow_degraded: 显式降级开关（ADR 0014 哨兵）。默认 False——batch
             phase（pre/post）有 step 失败时中断管线，避免静默降级；传 True
             时失败后继续执行后续 phase（但 overall_success 仍为 False）。
+        only_subjects: 只运行这些 subject（--fix-warn 用）。None = 全量。
+            过滤只作用于 per_subject 阶段；manifest.subjects 与 resume 门控
+            仍用全量列表（任务归属不变）。
+        recompute_review: True 时续做不复用已完成 review 步骤产物（重跑）。
+            --fix-warn 需重跑问题篇目，故置 True；Pre 仍按门控复用。
+        archive: True（默认）时执行 Post 写回（标签库/history 池）；False 跳过。
 
     Returns:
         PipelineResult
@@ -1848,12 +2112,14 @@ def run_pipeline(
         "PIPELINE_INPUT_PATH": str(input_path.absolute()),
     }
 
-    # 全局 agent 配置注入（step 内调 Agent 的 type/provider/model）
+    # 全局 agent 配置注入（step 内调 Agent 的 type/provider/model/escalate）
     base_env[ENV_AGENT_TYPE] = config.agent.type
     if config.agent.provider:
         base_env[ENV_AGENT_PROVIDER] = config.agent.provider
     if config.agent.model:
         base_env[ENV_AGENT_MODEL] = config.agent.model
+    if config.agent.escalate:
+        base_env[ENV_AGENT_ESCALATE] = json.dumps(config.agent.escalate)
 
     # ── Index 配置注入 step 环境变量 ──
     from paper_review.auto_index import resolve_index_config
@@ -1890,6 +2156,12 @@ def run_pipeline(
         if target_phase
         else [p for p in config.phases if p.directory]
     )
+    # --fix-warn --fix-skip-archive：不写回 → 跳过 Post（最后一个 per_subject 之后的 batch 阶段）
+    if not archive and not target_phase:
+        last_ps = max(
+            (i for i, p in enumerate(active_phases) if p.mode == "per_subject"), default=-1
+        )
+        active_phases = [p for i, p in enumerate(active_phases) if p.mode != "batch" or i < last_ps]
 
     all_phase_results: dict[str, dict[str, list[StepResult]]] = {}
     all_step_results: list[StepResult] = []
@@ -1917,7 +2189,7 @@ def run_pipeline(
             status="done",
             created_at=now.isoformat(),
             pipeline=config.name,
-            input=str(input_path.absolute()),
+            input=str(input_path.resolve()),
             subjects=[],
             steps=[],
             success=True,
@@ -1935,6 +2207,12 @@ def run_pipeline(
 
     # ── Subject 发现 ──
     subjects = discover_subjects(config, input_path, config.output_dir)
+    # --fix-warn：只跑问题篇目。全量列表保留给 resume 门控与 manifest.subjects
+    # （任务归属不变，仅本次执行的 per_subject 阶段被过滤）。
+    all_subjects = subjects
+    if only_subjects is not None:
+        only_set = set(only_subjects)
+        subjects = [s for s in subjects if s in only_set]
     primary_subject = subjects[0] if subjects else ""
 
     # ── Resume：Pre Phase 跳过判定 ──
@@ -1997,8 +2275,8 @@ def run_pipeline(
                             "pre step product unreadable: %s (treated as incomplete)", step_out
                         )
         prev_input = prev_manifest.get("input")
-        input_matches = not prev_input or str(Path(prev_input).absolute()) == str(
-            input_path.absolute()
+        input_matches = not prev_input or str(Path(prev_input).resolve()) == str(
+            input_path.resolve()
         )
         if prev_input and not input_matches:
             logger.warning(
@@ -2007,15 +2285,18 @@ def run_pipeline(
                 prev_input,
                 str(input_path),
             )
-        subjects_match = sorted(prev_manifest.get("subjects", [])) == sorted(subjects)
-        resume_skip_completed = resume_mode and input_matches and subjects_match
+        subjects_match = sorted(prev_manifest.get("subjects", [])) == sorted(all_subjects)
+        resume_skip_completed = (
+            resume_mode and input_matches and subjects_match and not recompute_review
+        )
         # 整个 Pre 完成 = 所有步骤产物均 ok（逐步骤判定，非旧“判最后一步”）
         pre_complete = bool(pre_steps) and len(pre_step_skip) == len(pre_steps)
         skip_pre_phase = pre_complete and input_matches and subjects_match
         if resume_mode and not resume_skip_completed:
+            reason = "fix-warn recompute" if recompute_review else "input or subjects mismatch"
             logger.warning(
-                "Resume: review-step skip disabled (input or subjects mismatch) — "
-                "existing products will be re-run to avoid mixing batches"
+                "Resume: review-step skip disabled (%s) — existing products will be re-run",
+                reason,
             )
         if skip_pre_phase:
             logger.info(
@@ -2044,8 +2325,8 @@ def run_pipeline(
         # resume 保留原发起时间（created_at 属于任务发起时刻，不是续做时刻）
         created_at=prev_manifest.get("created_at") or now.isoformat(),
         pipeline=config.name,
-        input=str(input_path.absolute()),
-        subjects=subjects,
+        input=str(input_path.resolve()),
+        subjects=all_subjects,
         steps=_review_steps_all,
     )
 
@@ -2240,14 +2521,19 @@ def run_pipeline(
                         # 彼时 manifest 尚未生成，per_subject 阶段若以 manifest 为 subject_source
                         # 会静默 fallback 到 CLI 目录扫描（只认 .pdf，漏掉 docx/doc 转换产物）。
                         # manifest_step 跑完后用真实 manifest 重新发现一次，纠正后续阶段用到的列表。
-                        subjects = discover_subjects(config, input_path, config.output_dir)
+                        full = discover_subjects(config, input_path, config.output_dir)
+                        subjects = (
+                            full
+                            if only_subjects is None
+                            else [s for s in full if s in set(only_subjects)]
+                        )
                         primary_subject = subjects[0] if subjects else ""
                         # 同步更新进度条：subject 列表变化后总量需要重新计算
                         pp.set_subject_count(len(subjects))
                         # 同步重写 manifest.subjects：运行开始时写入的是 Pre 前的 CLI
                         # 扫描列表（docx/doc 未转换时缺项），续做的 subjects 比对依赖
                         # 真实列表，否则 manifest 来源管线续做被误判为不一致而全量重跑。
-                        write_task_manifest(task_dir, subjects=subjects)
+                        write_task_manifest(task_dir, subjects=full)
                 else:
                     logger.warning(
                         "manifest_step '%s' not found in phase '%s'. Available: %s",
@@ -2315,6 +2601,20 @@ def run_pipeline(
     if degradation_warnings:
         for w in degradation_warnings:
             logger.warning("降级: %s", w)
+
+    # ── Agent 观测：记录 .md 步骤异常 + 降级（ADR 0018）──
+    # 观测是 best-effort 行为：其自身异常不得阻断报告生成与 manifest 收尾。
+    try:
+        _record_agent_stats(
+            config=config,
+            pipeline_dir=pipeline_dir,
+            all_step_results=all_step_results,
+            degradation_warnings=degradation_warnings,
+            data_dir=resolved_data_dir,
+            record_degradation=not resume_mode,
+        )
+    except Exception:
+        logger.exception("agent-stats 记录失败（观测 best-effort，不阻断主流程）")
 
     _generate_report(
         task_dir / "report.md",

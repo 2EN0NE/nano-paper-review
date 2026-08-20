@@ -298,7 +298,8 @@ def _llm_extract_features(
 ) -> list[str]:
     """调 pi（LLM）从文本抽取技术方法关键词（LLM 主线，ADR 0015）。
 
-    失败（超时/非零退出/无法解析）返回空列表，由词表兜底。
+    按升级链（ADR 0017）单调推进尝试；链耗尽仍失败（超时/非零退出/无法解析）
+    返回空列表，由词表兜底。
     """
     import subprocess
     import tempfile
@@ -311,47 +312,50 @@ def _llm_extract_features(
     except OSError:
         return []
     try:
-        # Agent 配置（type/provider/model）——留空不传 flag（继承 Agent 默认），
-        # 显式配置无效（402/模型不存在）时回退为不传。复用 agent.py 与 AgentRunner
-        # 同一实现，防两处漂移。
         from paper_review.agent import (
+            ENV_AGENT_MAX_ATTEMPTS,
             AgentConfig,
+            append_prompt_args,
             build_command,
-            build_command_without_model,
-            is_model_config_error,
+            parse_escalation_chain,
+            resolve_command_for_attempt,
         )
 
-        agent_cfg = AgentConfig.from_env(os.environ)
-        pi_cmd = build_command(agent_cfg, pi_binary, prompt_file)
-        proc = subprocess.run(  # noqa: S603 — pi_binary is user-configurable (same as AgentRunner)
-            pi_cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if (
-            proc.returncode != 0
-            and agent_cfg.has_explicit_model()
-            and is_model_config_error(proc.stderr or "")
-        ):
-            print(
-                f"  ⚠ 显式 provider/model 配置无效（exit {proc.returncode}）——回退为 Agent 默认重试"
-            )
-            pi_cmd = build_command_without_model(agent_cfg, pi_binary, prompt_file)
-            proc = subprocess.run(  # noqa: S603
-                pi_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        if proc.returncode != 0:
-            # 失败原因记入 paper-review.log（词表兜底继续，但可观测定位）
-            stderr_tail = (proc.stderr or "").strip()[-200:] or f"exit {proc.returncode}"
-            logger.warning("04: LLM 抽取失败（%s），词表兜底", stderr_tail)
-            return []
-        return _parse_feature_json(proc.stdout or "")
-    except (subprocess.TimeoutExpired, OSError) as e:
-        logger.warning("04: LLM 抽取超时/异常（%s），词表兜底", e)
+        # 升级链（ADR 0017）：第 N 次尝试用第 N 条命令，超出链长饱和末条；空链回退
+        # build_command 单命令路径。总预算 = _retry_step 注入的 retry.max_attempts。
+        chain = parse_escalation_chain(AgentConfig.from_env(os.environ).escalate)
+        max_attempts = 1
+        raw_attempts = os.environ.get(ENV_AGENT_MAX_ATTEMPTS, "")
+        if raw_attempts:
+            try:
+                max_attempts = max(1, int(raw_attempts))
+            except ValueError:
+                max_attempts = 1
+
+        last_err = ""
+        for attempt in range(1, max_attempts + 1):
+            prefix = resolve_command_for_attempt(chain, attempt)
+            if prefix is not None:
+                pi_cmd = append_prompt_args(prefix, prompt_file)
+            else:
+                pi_cmd = build_command(AgentConfig.from_env(os.environ), pi_binary, prompt_file)
+            try:
+                proc = subprocess.run(  # noqa: S603 — 命令来自 env 配置（同 AgentRunner）
+                    pi_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                last_err = str(e)
+                logger.warning("04: LLM 抽取 attempt %d 超时/异常（%s）", attempt, e)
+                continue
+            if proc.returncode != 0:
+                last_err = (proc.stderr or "").strip()[-200:] or f"exit {proc.returncode}"
+                logger.warning("04: LLM 抽取 attempt %d 失败（%s）", attempt, last_err)
+                continue
+            return _parse_feature_json(proc.stdout or "")
+        logger.warning("04: LLM 抽取失败（%s），词表兜底", last_err)
         return []
     finally:
         try:

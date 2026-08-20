@@ -8,6 +8,7 @@ CLI 单元测试 —— 使用 typer.testing.CliRunner 测试各子命令入口�
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import yaml
@@ -230,12 +231,102 @@ class TestHelp:
     def test_help_contains_commands(self):
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        for cmd in ("index", "search", "status", "tags", "serve", "review"):
+        for cmd in ("index", "search", "status", "tags", "serve", "review", "agent-status"):
             assert cmd in result.stdout
 
     def test_no_args_shows_help(self):
         result = runner.invoke(app)
         assert result.exit_code == 0
+
+
+class TestAgentStatusCommand:
+    """paper-review agent-status（ADR 0018 观测查询/清空）。"""
+
+    def _write_stats(self, data_dir: Path, pipelines: dict) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "agent-stats.json").write_text(
+            json.dumps({"pipelines": pipelines}, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def test_empty_no_stats(self, tmp_path):
+        dd = tmp_path / "data"
+        dd.mkdir()
+        result = runner.invoke(app, ["--data-dir", str(dd), "agent-status"])
+        assert result.exit_code == 0
+        assert "暂无 agent 统计" in result.stdout
+
+    def test_single_pipeline_auto_selects(self, tmp_path):
+        dd = tmp_path / "data"
+        self._write_stats(
+            dd,
+            {"standard": {"total_steps": 5, "total_anomalies": 1, "by_kind": {"timeout": 1}}},
+        )
+        result = runner.invoke(app, ["--data-dir", str(dd), "agent-status"])
+        assert result.exit_code == 0
+        assert "管线 standard" in result.stdout
+        assert "处理步骤数: 5" in result.stdout
+        assert "步骤异常占比: 20.0%" in result.stdout
+
+    def test_degradation_excluded_from_ratio(self, tmp_path):
+        """降级哨兵不计入步骤异常占比，避免 >100% 的误导展示（P3 修复）。"""
+        dd = tmp_path / "data"
+        self._write_stats(
+            dd,
+            {
+                "standard": {
+                    "total_steps": 2,
+                    "total_anomalies": 5,
+                    "by_kind": {"timeout": 1, "degradation:evidence_degraded": 4},
+                }
+            },
+        )
+        result = runner.invoke(app, ["--data-dir", str(dd), "agent-status"])
+        assert result.exit_code == 0
+        assert "步骤异常: 1" in result.stdout
+        assert "步骤异常占比: 50.0%" in result.stdout
+        assert "降级哨兵: 4" in result.stdout
+        assert "degradation:evidence_degraded" in result.stdout
+
+    def test_show_pipeline_direct(self, tmp_path):
+        dd = tmp_path / "data"
+        self._write_stats(
+            dd,
+            {
+                "standard": {
+                    "total_steps": 10,
+                    "total_anomalies": 2,
+                    "by_kind": {"timeout": 2},
+                    "by_command": {"pi -ne": {"steps": 10, "anomalies": 2}},
+                }
+            },
+        )
+        result = runner.invoke(
+            app, ["--data-dir", str(dd), "agent-status", "--pipeline", "standard"]
+        )
+        assert result.exit_code == 0
+        assert "处理步骤数: 10" in result.stdout
+        assert "步骤异常占比: 20.0%" in result.stdout
+        assert "timeout" in result.stdout
+        assert "pi -ne" in result.stdout
+
+    def test_clear_single(self, tmp_path):
+        dd = tmp_path / "data"
+        self._write_stats(dd, {"a": {"total_steps": 1}, "b": {"total_steps": 2}})
+        result = runner.invoke(
+            app, ["--data-dir", str(dd), "agent-status", "--clear", "--pipeline", "a"]
+        )
+        assert result.exit_code == 0
+        data = json.loads((dd / "agent-stats.json").read_text(encoding="utf-8"))
+        assert "a" not in data["pipelines"]
+        assert "b" in data["pipelines"]
+
+    def test_clear_all(self, tmp_path):
+        dd = tmp_path / "data"
+        self._write_stats(dd, {"a": {"total_steps": 1}, "b": {"total_steps": 2}})
+        result = runner.invoke(app, ["--data-dir", str(dd), "agent-status", "--clear", "--all"])
+        assert result.exit_code == 0
+        data = json.loads((dd / "agent-stats.json").read_text(encoding="utf-8"))
+        assert data == {"pipelines": {}}
 
 
 class TestStatusCommand:
@@ -517,3 +608,124 @@ class TestReviewCommand:
         summary = _format_task_summary(task_dir)
         # 无 subject 完成全部 3 步 → 0 篇完成（磁盘并集回退会误报 2/2）
         assert "0/2 篇完成" in summary, summary
+
+
+class TestMatchingUnfinishedTasks:
+    """_matching_unfinished_tasks：续做候选按当前输入路径过滤。"""
+
+    def test_matches_current_input_only(self, tmp_path):
+        from paper_review.cli import _matching_unfinished_tasks
+        from paper_review.orchestrator import write_task_manifest
+
+        result = tmp_path / "result"
+        input_a = tmp_path / "input-a"
+        input_b = tmp_path / "input-b"
+        a = result / "20260801-120000-aaa"
+        b = result / "20260801-130000-bbb"
+        legacy = result / "20260801-140000-legacy"
+        write_task_manifest(a, task_id="aaa", status="running", input=str(input_a.resolve()))
+        write_task_manifest(b, task_id="bbb", status="running", input=str(input_b.resolve()))
+        # 无 input 字段的老任务 → 不匹配（避免误当续做候选）
+        write_task_manifest(legacy, task_id="legacy", status="running")
+
+        matching = _matching_unfinished_tasks([a, b, legacy], str(input_a.resolve()))
+        assert matching == [a]
+
+    def test_empty_when_no_match(self, tmp_path):
+        from paper_review.cli import _matching_unfinished_tasks
+        from paper_review.orchestrator import write_task_manifest
+
+        result = tmp_path / "result"
+        other = result / "20260801-120000-other"
+        write_task_manifest(other, task_id="other", status="running", input="/some/other/path")
+
+        assert _matching_unfinished_tasks([other], str((tmp_path / "input").resolve())) == []
+
+
+class TestPickPipeline:
+    """_pick_pipeline：多管线交互式选择。"""
+
+    def test_multi_pipeline_prompt_selects(self, monkeypatch):
+        from paper_review.cli import _pick_pipeline
+
+        monkeypatch.setattr("paper_review.cli.typer.prompt", lambda prompt, default=1: "2")
+        assert _pick_pipeline({"a": {}, "b": {}, "c": {}}, "pick") == "b"
+
+    def test_invalid_choice_returns_none(self, monkeypatch):
+        from paper_review.cli import _pick_pipeline
+
+        monkeypatch.setattr("paper_review.cli.typer.prompt", lambda prompt, default=1: "99")
+        assert _pick_pipeline({"a": {}, "b": {}}, "pick") is None
+
+
+class TestPickFixWarnTask:
+    """_pick_fix_warn_task：多候选批次选择 + q 取消 + 无可修复批次。"""
+
+    def _make_done_task(self, result: Path, name: str, input_path: Path, n_error: int = 1) -> Path:
+        from paper_review.orchestrator import write_task_manifest
+
+        task_dir = result / name
+        write_task_manifest(
+            task_dir,
+            task_id=name,
+            status="done",
+            input=str(input_path.resolve()),
+            subjects=["alpha", "beta"],
+            steps=["02-quick"],
+        )
+        for i in range(n_error):
+            subj = "alpha" if i == 0 else "beta"
+            out = task_dir / "intermediates" / subj / "02-quick" / "output.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps({"status": "error", "error": "boom"}))
+        return task_dir
+
+    def test_multi_candidate_selects_index(self, tmp_path, monkeypatch):
+        from paper_review.cli import _pick_fix_warn_task
+
+        output_dir = tmp_path / "output"
+        result = output_dir / "result"
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        older = self._make_done_task(result, "20260801-120000-old", input_dir)
+        newer = self._make_done_task(result, "20260802-120000-new", input_dir)
+
+        captured: dict = {}
+
+        def fake_pick(items, prompt=""):
+            captured["labels"] = list(items)
+            captured["prompt"] = prompt
+            return 1  # 选第二个候选（older；list_done_tasks 最近优先 → newer 在前）
+
+        monkeypatch.setattr("paper_review.scroll_picker.pick_from_list", fake_pick)
+
+        picked = _pick_fix_warn_task(output_dir, str(input_dir.resolve()))
+        assert picked is not None
+        task_dir, report = picked
+        assert task_dir.name == older.name
+        assert report.error_count == 1
+        assert len(captured["labels"]) == 2
+        assert newer.name in captured["labels"][0]  # 最近优先 → newer 排第一
+        assert "ERROR 1 篇" in captured["labels"][1]
+
+    def test_q_cancels(self, tmp_path, monkeypatch):
+        from paper_review.cli import _pick_fix_warn_task
+
+        output_dir = tmp_path / "output"
+        result = output_dir / "result"
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        self._make_done_task(result, "20260801-120000-one", input_dir)
+
+        monkeypatch.setattr(
+            "paper_review.scroll_picker.pick_from_list", lambda items, prompt="": None
+        )
+        assert _pick_fix_warn_task(output_dir, str(input_dir.resolve())) is None
+
+    def test_no_candidates(self, tmp_path):
+        from paper_review.cli import _pick_fix_warn_task
+
+        output_dir = tmp_path / "output"
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        assert _pick_fix_warn_task(output_dir, str(input_dir.resolve())) is None

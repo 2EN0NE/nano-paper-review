@@ -906,18 +906,17 @@ class TestPiArgs:
         assert "--model" in args and "deepseek-v4-pro" in args
 
 
-class TestAgentModelFallback:
-    """显式 provider/model 报错 → 回退为不传（Agent 默认）重试。"""
+class TestAgentRunnerNoFallback:
+    """AgentRunner 不再内部回退：升级由 _retry_step 的升级链接管（ADR 0017）。"""
 
-    def test_explicit_model_error_retries_without_model(self, tmp_path):
-        """显式 model 非零退出 → 第二次不带 model 重试成功。"""
+    def test_model_error_no_internal_fallback(self, tmp_path):
+        """显式 model 402 报错 → AgentRunner 内不回退（升级链在 _retry_step 接管）。"""
         script = tmp_path / "fake_pi_fallback"
         script.write_text(
             "#!/bin/sh\n"
             'echo "$@" >> "$PIPELINE_STEP_DIR/all_args.txt"\n'
-            'case "$*" in *--model*) echo "402 Insufficient Balance" >&2; exit 1 ;; esac\n'
-            'echo \'{"step":"test","status":"ok","data":{"ok":true}}\'\n'
-            "exit 0\n"
+            'echo "402 Insufficient Balance" >&2\n'
+            "exit 1\n"
         )
         os.chmod(str(script), stat.S_IRWXU)  # noqa: S103
         step_dir = tmp_path / "step"
@@ -934,11 +933,39 @@ class TestAgentModelFallback:
             timeout=5,
         )
 
-        assert result.status == "ok"
+        assert result.status == "error"
         calls = (step_dir / "all_args.txt").read_text().strip().splitlines()
-        assert len(calls) == 2  # 第一次带 model 失败 → 第二次不带 model 成功
-        assert "--model" in calls[0].split()
-        assert "--model" not in calls[1].split()
+        assert len(calls) == 1  # 不再内回退，单次调用
+
+    def test_injected_command_used_directly(self, tmp_path):
+        """升级链注入的单条命令（ENV_AGENT_COMMAND）→ 原样使用并追加 prompt 参数。"""
+        script = tmp_path / "fake_pi_injected"
+        script.write_text(
+            "#!/bin/sh\n"
+            'echo "$@" > "$PIPELINE_STEP_DIR/args.txt"\n'
+            'echo \'{"step":"test","status":"ok","data":{"ok":true}}\'\n'
+            "exit 0\n"
+        )
+        os.chmod(str(script), stat.S_IRWXU)  # noqa: S103
+        step_dir = tmp_path / "step"
+
+        runner = AgentRunner()
+        result = runner.run(
+            prompt="test",
+            step_stem="01-test",
+            step_dir=step_dir,
+            env={
+                "PIPELINE_PI_BINARY": str(script),
+                "PIPELINE_AGENT_COMMAND": json.dumps([str(script), "-ne", "--model", "gpt-4o"]),
+            },
+            timeout=5,
+        )
+
+        assert result.status == "ok"
+        args = (step_dir / "args.txt").read_text().strip().split()
+        assert "--model" in args and "gpt-4o" in args
+        assert "--no-session" in args
+        assert "-p" in args
 
     def test_no_retry_when_no_explicit_model(self, tmp_path):
         """未显式配置 model 时，失败不重试（避免双倍开销）。"""

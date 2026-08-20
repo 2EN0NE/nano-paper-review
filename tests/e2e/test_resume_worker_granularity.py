@@ -5,7 +5,7 @@ E2E: Resume（断点续做）+ Worker 粒度（granularity）测试
   1. 完整 review 后 task.json status=done
   2. 中断（kill 子进程）→ 再次 review 检测到未完成任务 → 交互选择 [1] 续做
      → task_id 复用、已完成步骤跳过、最终 done
-  3. 中断 → 选择 [2] 重新一批 → 新 task_id + 旧任务 abandoned
+  3. 中断 → 选择 [3] 重新一批 → 新 task_id + 旧任务 abandoned
   4. granularity: step 配置端到端跑通（barrier 调度产物齐全）
 """
 
@@ -211,6 +211,32 @@ def _read_manifest(task_dir: Path) -> dict:
     return json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
 
 
+def _craft_interrupted_task(output_dir: Path, name: str, input_path: Path) -> Path:
+    """手工构造一个未完成（running）任务目录，供 resume 多任务选择测试。
+
+    与真实中断（kill）相比，手工构造更可控：可精确制造「同输入下多个 running 任务」
+    的菜单状态，而不必依赖两次 kill 的时序窗口。
+    """
+    task_dir = output_dir / "result" / name
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "task.json").write_text(
+        json.dumps(
+            {
+                "task_id": name,
+                "status": "running",
+                "created_at": "2026-01-01T00:00:00",
+                "pipeline": "e2e-resume",
+                "input": str(input_path.resolve()),
+                "subjects": ["alpha", "beta"],
+                "steps": ["02-quick"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return task_dir
+
+
 # ============================================================================
 # 测试
 # ============================================================================
@@ -398,7 +424,7 @@ class TestResumeWorkflow:
             assert (tasks[0] / "intermediates" / subj / "02-quick" / "output.json").exists()
 
     def test_restart_new_batch_abandons_old(self, tmp_path: Path):
-        """中断 → 选择 [2] 重新一批 → 新 task_id + 旧任务 abandoned。"""
+        """中断 → 选择 [3] 重新一批 → 新 task_id + 旧任务 abandoned。"""
         data_dir = tmp_path / "data"
         (data_dir / "index").mkdir(parents=True)
         (data_dir / ".first-use-hint-shown").touch()
@@ -429,7 +455,7 @@ class TestResumeWorkflow:
         proc.wait(timeout=10)
         first_task = _find_task_dirs(data_dir / "output")[0]
 
-        # 再次 review → [2] 重新一批
+        # 再次 review → [3] 重新一批
         result = subprocess.run(
             [
                 _paper_review_bin(),
@@ -438,7 +464,7 @@ class TestResumeWorkflow:
                 "review",
                 str(input_dir),
             ],
-            input="Y\n2\n",  # 先确认空索引警告，再选择 [2] 重新一批
+            input="Y\n3\n",  # 先确认空索引警告，再选择 [3] 重新一批
             capture_output=True,
             text=True,
             timeout=60,
@@ -454,6 +480,295 @@ class TestResumeWorkflow:
         new_task = tasks[0]
         assert new_task.name != first_task.name
         assert _read_manifest(new_task)["status"] == "done"
+
+    def test_select_other_interrupted_task(self, tmp_path: Path):
+        """多个同输入中断任务 → [2] 选择其他 → 续做所选（非最近）任务。"""
+        data_dir = tmp_path / "data"
+        (data_dir / "index").mkdir(parents=True)
+        (data_dir / ".first-use-hint-shown").touch()
+        _setup_pipeline(data_dir)  # fast：无 slow 步骤，续做后快速完成
+        input_dir = _setup_input(data_dir, "alpha", "beta")
+
+        output_dir = data_dir / "output"
+        older = _craft_interrupted_task(output_dir, "20260101-000000-aaaa", input_dir)
+        newer = _craft_interrupted_task(output_dir, "20260101-000001-bbbb", input_dir)
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                str(input_dir),
+            ],
+            input="Y\n2\n2\n",  # 空索引警告 Y；[2] 选择其他；picker 选第 2 项（older）
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"选择其他中断任务续做失败:\nSTDOUT:{result.stdout[:800]}\nSTDERR:{result.stderr[:500]}"
+        )
+        assert f"续做任务 {older.name}" in result.stdout
+
+        older_manifest = _read_manifest(older)
+        assert older_manifest["status"] == "done", f"所选任务应续做完成: {older_manifest}"
+        newer_manifest = _read_manifest(newer)
+        assert newer_manifest["status"] == "running", f"未选任务应保持未完成: {newer_manifest}"
+
+    def test_resume_scoped_to_current_input(self, tmp_path: Path):
+        """不同输入的中断任务互不干扰：review A 只续做 A 的最近任务，不把 B 的当作候选。"""
+        data_dir = tmp_path / "data"
+        (data_dir / "index").mkdir(parents=True)
+        (data_dir / ".first-use-hint-shown").touch()
+        _setup_pipeline(data_dir)
+        input_a = _setup_input(data_dir, "alpha", "beta")
+        input_b = data_dir / "input-b"
+        input_b.mkdir(parents=True, exist_ok=True)
+        _make_pdf(input_b / "alpha.pdf", "content alpha")
+        _make_pdf(input_b / "beta.pdf", "content beta")
+
+        output_dir = data_dir / "output"
+        # 全局「最近」是 b 任务（名字更新），但其输入是 input_b——不应被 review A 续做
+        older_a = _craft_interrupted_task(output_dir, "20260101-000000-aaaa", input_a)
+        newer_b = _craft_interrupted_task(output_dir, "20260101-000001-bbbb", input_b)
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                str(input_a),
+            ],
+            input="Y\n1\n",  # 空索引警告 Y；[1] 继续最近（应是 A 的任务，而非 B）
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"输入作用域续做失败:\nSTDOUT:{result.stdout[:800]}\nSTDERR:{result.stderr[:500]}"
+        )
+        # 续做的是 A 的任务，而非全局最近（B 的任务）
+        assert f"续做任务 {older_a.name}" in result.stdout
+        assert newer_b.name not in result.stdout, "其他输入的中断任务不应出现在续做菜单里"
+        assert _read_manifest(older_a)["status"] == "done"
+        assert _read_manifest(newer_b)["status"] == "running", "其他输入的任务应保持未动"
+
+    def test_fix_warn_reruns_only_problem_subjects(self, tmp_path: Path):
+        """--fix-warn：扫描已完成批次，只重跑有 ERROR 的篇目，其余篇目复用。"""
+        data_dir = tmp_path / "data"
+        (data_dir / "index").mkdir(parents=True)
+        (data_dir / ".first-use-hint-shown").touch()
+        _setup_pipeline(data_dir)
+        input_dir = _setup_input(data_dir, "alpha", "beta")
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+
+        # 首次完整运行 → done
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(input_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"首次运行失败:\n{result.stdout[:800]}\n{result.stderr[:500]}"
+        )
+
+        task_dir = _find_task_dirs(data_dir / "output")[0]
+        # 注入 alpha 的 ERROR：覆盖 02-quick 产物为 status=error
+        alpha_out = task_dir / "intermediates" / "alpha" / "02-quick" / "output.json"
+        alpha_out.write_text(
+            json.dumps({"status": "error", "error": "inject"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        beta_out = task_dir / "intermediates" / "beta" / "02-quick" / "output.json"
+        beta_mtime = beta_out.stat().st_mtime
+
+        # --fix-warn：单候选批次，picker 选第 1 项（不再静默自动选中）
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--fix-warn",
+                str(input_dir),
+            ],
+            input="Y\n1\n",  # 空索引确认；单批次 picker 选第 1 项
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"fix-warn 失败:\n{result.stdout[:800]}\n{result.stderr[:500]}"
+        )
+        assert "修复批次" in result.stdout
+        assert "重跑 1 篇" in result.stdout
+
+        # alpha 被重跑（status 恢复 ok），beta 复用（mtime 不变）
+        alpha_after = json.loads(alpha_out.read_text(encoding="utf-8"))
+        assert alpha_after.get("status") == "ok", f"alpha 应被重跑恢复: {alpha_after}"
+        assert beta_out.stat().st_mtime == beta_mtime, "beta 不应被重跑（复用产物）"
+
+    def test_fix_warn_reruns_warn_subject(self, tmp_path: Path):
+        """--fix-warn：识别 WARN（证据降级）篇目并重跑，非 ERROR 也能触发。"""
+        data_dir = tmp_path / "data"
+        (data_dir / "index").mkdir(parents=True)
+        (data_dir / ".first-use-hint-shown").touch()
+        _setup_pipeline(data_dir)
+        input_dir = _setup_input(data_dir, "alpha", "beta")
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(input_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"首次运行失败:\n{result.stdout[:800]}\n{result.stderr[:500]}"
+        )
+
+        task_dir = _find_task_dirs(data_dir / "output")[0]
+        # 注入 alpha 的 08-summarize evidence 降级（WARN，非 ERROR）
+        warn_out = task_dir / "intermediates" / "alpha" / "08-summarize" / "output.json"
+        warn_out.parent.mkdir(parents=True, exist_ok=True)
+        warn_out.write_text(
+            json.dumps(
+                {"data": {"evidence": {"rationale_missing": ["rationale"], "tags_missing": True}}},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        alpha_quick = task_dir / "intermediates" / "alpha" / "02-quick" / "output.json"
+        alpha_mtime = alpha_quick.stat().st_mtime
+        beta_quick = task_dir / "intermediates" / "beta" / "02-quick" / "output.json"
+        beta_mtime = beta_quick.stat().st_mtime
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--fix-warn",
+                str(input_dir),
+            ],
+            input="Y\n1\n",  # 空索引确认；单批次 picker 选第 1 项
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"fix-warn WARN 失败:\n{result.stdout[:800]}\n{result.stderr[:500]}"
+        )
+        assert "重跑 1 篇" in result.stdout
+        assert "WARN 1" in result.stdout  # 识别为 WARN 而非 ERROR
+        # alpha 被重跑（02-quick mtime 变化），beta 复用
+        assert alpha_quick.stat().st_mtime > alpha_mtime, "alpha 应被重跑"
+        assert beta_quick.stat().st_mtime == beta_mtime, "beta 不应被重跑"
+
+    def test_fix_warn_skip_archive(self, tmp_path: Path):
+        """--fix-warn --fix-skip-archive：跳过 Post 写回，post 产物不被重写。"""
+        data_dir = tmp_path / "data"
+        (data_dir / "index").mkdir(parents=True)
+        (data_dir / ".first-use-hint-shown").touch()
+        _setup_pipeline(data_dir)
+        input_dir = _setup_input(data_dir, "alpha", "beta")
+
+        env = os.environ.copy()
+        env["PATH"] = str(tmp_path) + os.pathsep + env.get("PATH", "")
+        env["PIPELINE_PI_BINARY"] = "pi-not-found"
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--skip-warnings",
+                str(input_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"首次运行失败:\n{result.stdout[:800]}\n{result.stderr[:500]}"
+        )
+
+        task_dir = _find_task_dirs(data_dir / "output")[0]
+        # 注入 alpha ERROR
+        alpha_out = task_dir / "intermediates" / "alpha" / "02-quick" / "output.json"
+        alpha_out.write_text(
+            json.dumps({"status": "error", "error": "inject"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        post_out = task_dir / "intermediates" / "post" / "01-archive" / "output.json"
+        assert post_out.exists(), f"post 产物应存在: {post_out}"
+        post_mtime = post_out.stat().st_mtime
+
+        result = subprocess.run(
+            [
+                _paper_review_bin(),
+                "--data-dir",
+                str(data_dir),
+                "review",
+                "--fix-warn",
+                "--fix-skip-archive",
+                str(input_dir),
+            ],
+            input="Y\n1\n",  # 空索引确认；单批次 picker 选第 1 项
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"fix-warn skip-archive 失败:\n{result.stdout[:800]}\n{result.stderr[:500]}"
+        )
+        assert "跳过 Post 写回" in result.stdout
+        # alpha 被重跑恢复 ok
+        alpha_after = json.loads(alpha_out.read_text(encoding="utf-8"))
+        assert alpha_after.get("status") == "ok", f"alpha 应被重跑恢复: {alpha_after}"
+        # post 产物未被重写（archive=False 过滤了 post 阶段）
+        assert post_out.stat().st_mtime == post_mtime, "post 产物不应被重写（--fix-skip-archive）"
 
     def test_step_granularity_full_run(self, tmp_path: Path):
         """granularity: step 配置端到端跑通（barrier 调度产物齐全）。"""

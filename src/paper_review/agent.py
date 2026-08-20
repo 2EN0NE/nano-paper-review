@@ -7,8 +7,12 @@
 
 - **provider/model 留空 → 不传对应 CLI flag**，由 Agent 继承自身默认
   （pi 继承 ``PI_PROVIDER``/``PI_MODEL`` 环境；opencode 用自身 config 默认）。
-- **显式传了 provider/model 但非零退出报错 → 回退为不传（Agent 默认）**，
-  由调用方记录 warning。
+
+升级链（Agent Escalation Chain，ADR 0017）：
+
+- ``agent.escalate`` 定义「第 N 次尝试用哪条命令」的完整命令行序列（str 或
+  argv 列表），框架解析后按 ``_retry_step`` 的 attempt 单调推进、顶部饱和。
+- ``build_command`` 仅用于 ``escalate`` 缺省时的向后兼容单命令路径。
 
 当前仅实现 pi；opencode 预留（入参形状不同：opencode 用 ``--model
 provider/model`` 合并串，pi 用 ``--provider``/``--model`` 两个分离 flag）。
@@ -16,8 +20,10 @@ provider/model`` 合并串，pi 用 ``--provider``/``--model`` 两个分离 flag
 
 from __future__ import annotations
 
+import json
+import shlex
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # 已实现的 Agent 类型（opencode 预留，暂未实现）
 SUPPORTED_AGENT_TYPES = ("pi",)
@@ -26,6 +32,12 @@ SUPPORTED_AGENT_TYPES = ("pi",)
 ENV_AGENT_TYPE = "PIPELINE_AGENT_TYPE"
 ENV_AGENT_PROVIDER = "PIPELINE_AGENT_PROVIDER"
 ENV_AGENT_MODEL = "PIPELINE_AGENT_MODEL"
+# 升级链（命令列表，JSON 序列化后注入；.md 由 _retry_step 消费，.py 由脚本消费）
+ENV_AGENT_ESCALATE = "PIPELINE_AGENT_ESCALATE"
+# _retry_step 为 .md 步骤按 attempt 解析出的单条命令（argv 的 JSON）
+ENV_AGENT_COMMAND = "PIPELINE_AGENT_COMMAND"
+# 升级链的每步骤总预算（retry.max_attempts）；调 pi 的 .py 步骤据此封顶内部迭代
+ENV_AGENT_MAX_ATTEMPTS = "PIPELINE_AGENT_MAX_ATTEMPTS"
 
 
 @dataclass
@@ -36,23 +48,41 @@ class AgentConfig:
         type: Agent 类型（``"pi"``；``"opencode"`` 预留未实现）。
         provider: Agent 的 provider（空 = 不传 flag，继承 Agent 默认）。
         model: Agent 的 model（空 = 不传 flag，继承 Agent 默认）。
+        escalate: 升级链命令列表（每条是完整命令行 str 或 argv list[str]；
+            空 = 不启用升级链，回退 provider/model 单命令路径）。
     """
 
     type: str = "pi"
     provider: str = ""
     model: str = ""
+    escalate: list = field(default_factory=list)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> AgentConfig:
-        """从 step 环境变量解析 Agent 配置（缺省 type=pi、provider/model 空）。"""
+        """从 step 环境变量解析 Agent 配置（缺省 type=pi、provider/model/escalate 空）。"""
+        escalate: list = []
+        raw = env.get(ENV_AGENT_ESCALATE, "") or ""
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as e:
+                # 大声失败：升级链由框架 json.dumps 注入，解析失败说明配置/环境损坏，
+                # 静默回退 [] 会悄悄禁用升级链并掩盖损坏信号（快速失败原则）。
+                raise ValueError(f"{ENV_AGENT_ESCALATE} 不是合法 JSON: {raw!r}") from e
+            if not isinstance(parsed, list):
+                raise ValueError(
+                    f"{ENV_AGENT_ESCALATE} 必须是 JSON 数组，实际为 {type(parsed).__name__}: {raw!r}"
+                )
+            escalate = parsed
         return cls(
             type=env.get(ENV_AGENT_TYPE, "pi") or "pi",
             provider=env.get(ENV_AGENT_PROVIDER, "") or "",
             model=env.get(ENV_AGENT_MODEL, "") or "",
+            escalate=escalate,
         )
 
     def has_explicit_model(self) -> bool:
-        """是否显式配置了 provider/model（决定报错时是否回退重试）。"""
+        """是否显式配置了 provider/model（phase 级覆盖判定用）。"""
         return bool(self.provider or self.model)
 
 
@@ -100,41 +130,42 @@ def build_command(
     )
 
 
-def build_command_without_model(
-    cfg: AgentConfig,
-    binary: str,
-    prompt_file: str,
-    extra_args: list[str] | None = None,
-) -> list[str]:
-    """构建不带 provider/model flag 的 Agent 命令行（报错回退用）。"""
-    return build_command(AgentConfig(type=cfg.type), binary, prompt_file, extra_args)
+def parse_escalation_chain(escalate: list) -> list[list[str]]:
+    """将 ``agent.escalate`` 解析为 argv 列表的列表。
 
-
-# 模型配置错误特征（stderr 命中才触发「回退为不传 model flag」重试）。
-# 仅这类错误才回退：显式 provider/model 无效/欠费/不存在。其他非零退出
-# （prompt 崩溃、网络抖动、限流等）应直接传播为 error，避免静默改用默认
-# 模型掩盖根因、造成同批 review 内模型不一致。
-_MODEL_CONFIG_ERROR_PATTERNS = (
-    "402",
-    "insufficient balance",
-    "insufficient quota",
-    "model not found",
-    "model not exist",
-    "unknown model",
-    "invalid model",
-    "model not supported",
-    "no such model",
-)
-
-
-def is_model_config_error(stderr: str) -> bool:
-    """判断 stderr 是否命中「显式 provider/model 配置无效」特征。
-
-    只有命中才触发回退为「不传 model flag」（Agent 默认）重试。
-    依据错误码（402）或稳定标识符（insufficient balance / model not found 等），
-    不做宽泛子串匹配。
+    每条可以是完整命令行字符串（``shlex.split`` 解析，支持引号）或 argv 列表
+    （原样转 str）。空条目跳过。返回的 argv 是「命令前缀」——不含 prompt 注入
+    （``--no-session -p @prompt.md`` 由框架追加，见 append_prompt_args）。
     """
-    if not stderr:
-        return False
-    lowered = stderr.lower()
-    return any(pattern in lowered for pattern in _MODEL_CONFIG_ERROR_PATTERNS)
+    chain: list[list[str]] = []
+    for entry in escalate:
+        if isinstance(entry, str):
+            parts = shlex.split(entry)
+        elif isinstance(entry, (list, tuple)):
+            parts = [str(x) for x in entry]
+        else:
+            continue
+        if parts:
+            chain.append(parts)
+    return chain
+
+
+def resolve_command_for_attempt(chain: list[list[str]], attempt: int) -> list[str] | None:
+    """返回第 attempt 次尝试（1-based）应使用的命令 argv。
+
+    链空返回 None（调用方回退 build_command 单命令路径）；attempt 超出链长时
+    饱和到末条（顶部饱和语义，ADR 0017）。
+    """
+    if not chain:
+        return None
+    idx = min(attempt - 1, len(chain) - 1)
+    return chain[idx]
+
+
+def append_prompt_args(argv: list[str], prompt_file: str) -> list[str]:
+    """框架兜底：在命令前缀后追加 ``--no-session -p @prompt_file``。
+
+    prompt 文件路径运行时生成、``--no-session`` 是批处理不污染会话的必需项，
+    两者由框架统一追加，升级链条目只负责「二进制 + 任意 flag + 模型」。
+    """
+    return [*argv, "--no-session", "-p", f"@{prompt_file}"]

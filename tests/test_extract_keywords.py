@@ -210,25 +210,51 @@ class TestLlmExtractFeatures:
         assert "--provider" in args and "cli-proxy-api" in args
         assert "--model" in args and "deepseek-v4-flash" in args
 
-    def test_explicit_model_error_retries_without_model(self, tmp_path, monkeypatch):
-        """显式 model 非零退出 → 回退为不传 model 重试成功（与 AgentRunner 同款逻辑，防漂移）。"""
+    def test_model_error_no_internal_fallback(self, tmp_path, monkeypatch):
+        """显式 model 402 报错 → 不再内回退（升级链在脚本内接管，ADR 0017）。"""
         mock_pi = tmp_path / "pi"
         mock_pi.write_text(
             "#!/bin/sh\n"
             'echo "$@" >> "$(dirname "$0")/all_args.txt"\n'
-            'case "$*" in *--model*) echo "402 Insufficient Balance" >&2; exit 1 ;; esac\n'
-            "echo '[\"向量化执行\"]'\n"
-            "exit 0\n"
+            'echo "402 Insufficient Balance" >&2\n'
+            "exit 1\n"
         )
         mock_pi.chmod(0o755)
         monkeypatch.setenv("PIPELINE_AGENT_MODEL", "deepseek-v4-pro")
 
-        assert _mod._llm_extract_features("x", pi_binary=str(mock_pi)) == ["向量化执行"]
+        assert _mod._llm_extract_features("x", pi_binary=str(mock_pi)) == []
 
         calls = (tmp_path / "all_args.txt").read_text().strip().splitlines()
-        assert len(calls) == 2  # 第一次带 model 失败 → 第二次不带 model 成功
-        assert "--model" in calls[0].split()
-        assert "--model" not in calls[1].split()
+        assert len(calls) == 1  # 不再内回退，单次调用
+
+    def test_escalation_chain_iterates_commands(self, tmp_path, monkeypatch):
+        """升级链注入 → 按链单调推进：第 1 条失败换第 2 条成功。"""
+        mock_pi = tmp_path / "pi"
+        mock_pi.write_text(
+            "#!/bin/sh\n"
+            'echo "$@" >> "$(dirname "$0")/all_args.txt"\n'
+            'case "$*" in *--model*) echo \'["升级模型"]\'; exit 0 ;; esac\n'
+            "exit 1\n"
+        )
+        mock_pi.chmod(0o755)
+        monkeypatch.setenv(
+            "PIPELINE_AGENT_ESCALATE",
+            json.dumps(
+                [
+                    [str(mock_pi), "-ne"],
+                    [str(mock_pi), "-ne", "--model", "gpt-4o"],
+                    [str(mock_pi), "-ne"],
+                ]
+            ),
+        )
+        monkeypatch.setenv("PIPELINE_AGENT_MAX_ATTEMPTS", "2")
+
+        assert _mod._llm_extract_features("x", pi_binary=str(mock_pi)) == ["升级模型"]
+
+        calls = (tmp_path / "all_args.txt").read_text().strip().splitlines()
+        assert len(calls) == 2  # 第 1 条（无 --model）失败 → 第 2 条成功
+        assert "--model" not in calls[0].split()
+        assert "--model" in calls[1].split()
 
     def test_no_retry_when_no_explicit_model(self, tmp_path, monkeypatch):
         """未显式配置 model 时，失败不重试（避免双倍开销）。"""

@@ -23,8 +23,11 @@ import typer
 from paper_review.config import _is_initialized_data_dir, resolve_data_dir
 from paper_review.logging_config import setup_logging
 from paper_review.orchestrator import (
+    FixReport,
     PoolProgress,
+    collect_fix_subjects,
     detect_unfinished_tasks,
+    list_done_tasks,
     read_task_manifest,
     run_pipeline,
     write_task_manifest,
@@ -490,6 +493,108 @@ def serve(
     app.run(host=host, port=port, debug=False)
 
 
+@app.command()
+def agent_status(
+    ctx: typer.Context,
+    pipeline: str | None = typer.Option(None, "--pipeline", help="只看/只清指定管线（目录名）"),
+    clear: bool = typer.Option(
+        False, "--clear", help="清空 agent 统计（需指定管线；--all 清全部）"
+    ),
+    all_pipelines: bool = typer.Option(False, "--all", help="配合 --clear：清空全部管线"),
+):
+    """查看 / 清空 Agent 表现统计（异常占总步骤数占比，ADR 0018）。
+
+    统计存于 {data_dir}/agent-stats.json，按管线分桶。改管线 agent 段（升级链/type）
+    会在下次运行时自动清零该管线计数；也可用 --clear 手动清空。
+    """
+    from paper_review.agent_stats import (  # pyright: ignore[reportMissingImports] — 新模块，pyright 文件索引未刷新
+        load_stats,
+        save_stats,
+    )
+
+    dd = resolve_data_dir(_get_data_dir(ctx))
+    path = dd / "agent-stats.json"
+    data = load_stats(path)
+    pipelines: dict = data.get("pipelines", {})
+
+    if clear:
+        if all_pipelines:
+            save_stats(path, {"pipelines": {}})
+            typer.echo("✓ 已清空全部管线的 agent 统计。")
+            return
+        target = pipeline or _pick_pipeline(pipelines, "清空哪条管线的统计？")
+        if target is None:
+            typer.echo("（没有可清空的管线统计。）")
+            return
+        if target in pipelines:
+            del pipelines[target]
+            save_stats(path, {"pipelines": pipelines})
+            typer.echo(f"✓ 已清空管线 {target} 的 agent 统计。")
+        else:
+            typer.echo(f"管线 {target} 无统计记录。")
+        return
+
+    if not pipelines:
+        typer.echo("暂无 agent 统计（运行 review 后生成）。")
+        return
+
+    target = pipeline or _pick_pipeline(pipelines, "查看哪条管线的统计？")
+    if target is None or target not in pipelines:
+        typer.echo(f"管线 {target or pipeline} 无统计记录。")
+        return
+    _print_agent_stats(target, pipelines[target])
+
+
+def _pick_pipeline(pipelines: dict, prompt: str) -> str | None:
+    """单管线自动返回；多管线交互式选择。空返回 None。"""
+    names = list(pipelines.keys())
+    if not names:
+        return None
+    if len(names) == 1:
+        return names[0]
+    typer.echo()
+    for i, name in enumerate(names, 1):
+        typer.echo(f"  {i}. {name}")
+    choice = typer.prompt(prompt, default=1)
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(names):
+            return names[idx]
+    except ValueError:
+        pass
+    return None
+
+
+def _print_agent_stats(name: str, slot: dict) -> None:
+    """打印单条管线的 agent 统计（占比 + by_kind + by_command）。"""
+    total = slot.get("total_steps", 0)
+    anomalies = slot.get("total_anomalies", 0)
+    by_kind = slot.get("by_kind", {}) or {}
+    # 降级哨兵不计入「步骤异常占比」（record_anomaly 不增 total_steps），单独展示，
+    # 避免分母只含 .md 步骤、分子却含降级哨兵导致的 >100% 误导性占比。
+    degradation = sum(v for k, v in by_kind.items() if k.startswith("degradation:"))
+    step_anomalies = anomalies - degradation
+    ratio = (step_anomalies / total * 100.0) if total else 0.0
+    typer.echo(f"\nAgent 表现 · 管线 {name}")
+    typer.echo(f"  处理步骤数: {total}   步骤异常: {step_anomalies}   步骤异常占比: {ratio:.1f}%")
+    if degradation:
+        typer.echo(f"  降级哨兵: {degradation}（不计入步骤异常占比）")
+
+    if by_kind:
+        typer.echo("\n  按异常类型:")
+        for k, v in sorted(by_kind.items(), key=lambda x: -x[1]):
+            typer.echo(f"    {k:<26} {v}")
+
+    by_command = slot.get("by_command", {})
+    if by_command:
+        typer.echo("\n  按升级链命令:")
+        for cmd, c in sorted(by_command.items(), key=lambda x: -x[1].get("steps", 0)):
+            steps = c.get("steps", 0)
+            anom = c.get("anomalies", 0)
+            r = (anom / steps * 100.0) if steps else 0.0
+            typer.echo(f"    {cmd:<34} {steps} 步 / {anom} 异常 ({r:.1f}%)")
+
+
 def _format_task_summary(task_dir: Path) -> str:
     """格式化未完成任务摘要：Task ID + 发起日期 + 完成进度 + 中断位置。"""
     manifest = read_task_manifest(task_dir)
@@ -530,6 +635,81 @@ def _format_task_summary(task_dir: Path) -> str:
     return summary
 
 
+def _announce_resume(task_dir: Path) -> None:
+    """续做任务的统一提示。"""
+    typer.echo(f"  ↻ 续做任务 {task_dir.name}")
+
+
+def _matching_unfinished_tasks(unfinished: list[Path], current_input: str) -> list[Path]:
+    """过滤出「当前输入路径」对应的中断任务（input 解析后与 current_input 一致）。
+
+    老任务无 input 字段视为不匹配——避免把其他输入路径的批次当作续做候选。
+    """
+    matching: list[Path] = []
+    for t in unfinished:
+        m = read_task_manifest(t)
+        inp = str(Path(m["input"]).resolve()) if m.get("input") else ""
+        if inp == current_input:
+            matching.append(t)
+    return matching
+
+
+def _pick_interrupted_task(matching: list[Path], current_input: str) -> Path | None:
+    """从「当前输入路径」的中断任务中交互式选择要续做的那个（限高滚动选择器）。"""
+    from paper_review.scroll_picker import (  # pyright: ignore[reportMissingImports] — 新模块，pyright 文件索引未刷新
+        pick_from_list,
+    )
+
+    labels = [_format_task_summary(t) for t in matching]
+    idx = pick_from_list(
+        labels,
+        prompt=f"当前输入 {current_input} 的中断任务（↑/↓ 移动 · Enter 确认 · q 取消）",
+    )
+    if idx is None:
+        return None
+    return matching[idx]
+
+
+def _pick_fix_warn_task(output_dir: Path, current_input: str) -> tuple[Path, FixReport] | None:
+    """扫描已完成批次，交互式选择要修复的那个（限高滚动选择器）。
+
+    只列出「当前输入路径」下、且存在逐篇问题（ERROR/WARN）的批次。
+    返回 (task_dir, FixReport) 或 None（取消 / 无可修复批次）。
+    """
+    from paper_review.scroll_picker import (  # pyright: ignore[reportMissingImports] — 新模块，pyright 文件索引未刷新
+        pick_from_list,
+    )
+
+    candidates: list[tuple[Path, FixReport]] = []
+    for task_dir in list_done_tasks(output_dir):
+        m = read_task_manifest(task_dir)
+        inp = str(Path(m.get("input", "")).resolve()) if m.get("input") else ""
+        if inp != current_input:
+            continue
+        report = collect_fix_subjects(task_dir)
+        if report.problem_count == 0:
+            continue
+        candidates.append((task_dir, report))
+
+    if not candidates:
+        typer.echo(f"\n当前输入 {current_input} 下没有可修复的批次（无逐篇 ERROR/WARN）。")
+        return None
+
+    labels = []
+    for task_dir, report in candidates:
+        parts = []
+        if report.error_count:
+            parts.append(f"ERROR {report.error_count} 篇")
+        if report.warn_count:
+            parts.append(f"缺证据/WARN {report.warn_count} 篇")
+        labels.append(f"{task_dir.name} · {' · '.join(parts)}")
+
+    idx = pick_from_list(labels, prompt="选择要修复的批次（↑/↓ 移动 · Enter 确认 · q 取消）")
+    if idx is None:
+        return None
+    return candidates[idx]
+
+
 @app.command()
 def review(
     ctx: typer.Context,
@@ -564,6 +744,16 @@ def review(
         False,
         "--allow-degraded",
         help="显式降级开关：允许 batch 阶段（pre/post）步骤失败后继续执行（默认失败即中断管线）",
+    ),
+    fix_warn: bool = typer.Option(
+        False,
+        "--fix-warn",
+        help="修复模式：扫描已完成批次中的逐篇问题（ERROR/缺证据），交互式选择批次后仅重跑问题篇目",
+    ),
+    fix_skip_archive: bool = typer.Option(
+        False,
+        "--fix-skip-archive",
+        help="配合 --fix-warn：跳过 Post 写回（默认写回标签库/history 池）",
     ),
 ):
     """
@@ -640,44 +830,72 @@ def review(
     # 否则中断遗留的 running 任务永不清理，result/ 下持续累积，且后续交互式运行
     # 会把陈旧批次当作“最近一批”提示续做（无人值守即“重新开始”语义）。
     resume_task_dir = None
-    unfinished = detect_unfinished_tasks(default_output)
-    if skip_warnings:
-        if unfinished:
-            for t in unfinished:
-                write_task_manifest(t, status="abandoned")
-            typer.echo(f"⚠ 无人值守模式：已弃置 {len(unfinished)} 个未完成任务，新建一批")
-    elif unfinished:
-        latest = unfinished[0]
-        current_input = str(path.absolute())
-        typer.echo(f"\n⚠ 检测到 {len(unfinished)} 个未完成的任务（中断遗留）：")
-        for i, t in enumerate(unfinished[:3], 1):
-            marker = " [最近]" if i == 1 else " [次近]" if i == 2 else ""
-            m = read_task_manifest(t)
-            mismatch = bool(m.get("input")) and str(Path(m["input"]).absolute()) != current_input
-            hint = "（输入与当前不一致：续做将重跑全部步骤并覆盖已有产物）" if mismatch else ""
-            typer.echo(f"  {marker} {_format_task_summary(t)}{hint}")
-        if len(unfinished) > 3:
-            typer.echo(f"  … 共 {len(unfinished)} 个未完成任务")
-        typer.echo("\n继续哪一批？")
-        typer.echo(f"  [1] 继续最近一批（{latest.name}）")
-        typer.echo("  [2] 重新开始一批（新建任务，放弃未完成任务）")
-        typer.echo("  [3] 取消")
-        choice = typer.prompt("选择", default="1")
-        if choice == "1":
-            resume_task_dir = latest
-            typer.echo(f"  ↻ 续做任务 {latest.name}")
-            lm = read_task_manifest(latest)
-            if bool(lm.get("input")) and str(Path(lm["input"]).absolute()) != current_input:
-                typer.echo(
-                    "  ⚠ 输入与任务原输入不一致：将全量重跑（不跳过已有产物），避免跨批次混批"
-                )
-        elif choice == "2":
-            for t in unfinished:
-                write_task_manifest(t, status="abandoned")
-            typer.echo(f"  ⊘ 已放弃 {len(unfinished)} 个未完成任务，新建一批")
-        else:
-            typer.echo("已取消")
+    fix_only_subjects: list[str] | None = None
+    fix_recompute = False
+    fix_archive = True
+
+    if fix_warn:
+        # 修复模式：扫描已完成批次 → 选批次 → 只重跑问题篇目（复用 Pre，重跑 Review）。
+        current_input = str(path.resolve())
+        picked = _pick_fix_warn_task(default_output, current_input)
+        if picked is None:
             raise typer.Exit(0)
+        resume_task_dir, fix_report = picked
+        fix_only_subjects = fix_report.all_subjects
+        fix_recompute = True
+        fix_archive = not fix_skip_archive
+        typer.echo(
+            f"\n✓ 修复批次 {resume_task_dir.name}：重跑 {len(fix_only_subjects)} 篇"
+            f"（ERROR {fix_report.error_count} / WARN {fix_report.warn_count}）"
+            + ("，跳过 Post 写回" if not fix_archive else "")
+        )
+    else:
+        unfinished = detect_unfinished_tasks(default_output)
+        if skip_warnings:
+            if unfinished:
+                for t in unfinished:
+                    write_task_manifest(t, status="abandoned")
+                typer.echo(f"⚠ 无人值守模式：已弃置 {len(unfinished)} 个未完成任务，新建一批")
+        elif unfinished:
+            current_input = str(path.resolve())
+            # 输入作用域：仅当前 CLI 输入对象对应的中断任务参与续做——
+            # 避免「继续最近一批」误续做其他输入路径的批次。
+            matching = _matching_unfinished_tasks(unfinished, current_input)
+            if not matching:
+                typer.echo(
+                    f"\nℹ 当前输入 {current_input} 下没有中断任务"
+                    f"（另有 {len(unfinished)} 个其他输入的中断任务保留未动）。"
+                )
+            else:
+                latest = matching[0]
+                typer.echo(f"\n⚠ 检测到 {len(matching)} 个未完成的任务（当前输入）：")
+                for i, t in enumerate(matching[:3], 1):
+                    marker = " [最近]" if i == 1 else " [次近]" if i == 2 else ""
+                    typer.echo(f"  {marker} {_format_task_summary(t)}")
+                if len(matching) > 3:
+                    typer.echo(f"  … 共 {len(matching)} 个未完成任务")
+                typer.echo("\n继续哪一批？")
+                typer.echo(f"  [1] 继续最近一批（{latest.name}）")
+                typer.echo("  [2] 选择其他中断任务")
+                typer.echo("  [3] 重新开始一批（新建任务，放弃这些未完成任务）")
+                typer.echo("  [4] 取消")
+                choice = typer.prompt("选择", default="1")
+                if choice == "1":
+                    resume_task_dir = latest
+                    _announce_resume(latest)
+                elif choice == "2":
+                    resume_task_dir = _pick_interrupted_task(matching, current_input)
+                    if resume_task_dir is None:
+                        typer.echo("已取消")
+                        raise typer.Exit(0)
+                    _announce_resume(resume_task_dir)
+                elif choice == "3":
+                    for t in matching:
+                        write_task_manifest(t, status="abandoned")
+                    typer.echo(f"  ⊘ 已放弃 {len(matching)} 个未完成任务，新建一批")
+                else:
+                    typer.echo("已取消")
+                    raise typer.Exit(0)
 
     # ── 执行 ──
     if pipeline_path.is_dir():
@@ -691,6 +909,9 @@ def review(
             pool_progress=progress,
             resume_task_dir=resume_task_dir,
             allow_degraded=allow_degraded,
+            only_subjects=fix_only_subjects,
+            recompute_review=fix_recompute,
+            archive=fix_archive,
         )
     else:
         # pipeline_path 是 pipeline.yaml 文件
@@ -704,6 +925,9 @@ def review(
             pool_progress=progress,
             resume_task_dir=resume_task_dir,
             allow_degraded=allow_degraded,
+            only_subjects=fix_only_subjects,
+            recompute_review=fix_recompute,
+            archive=fix_archive,
         )
 
     typer.echo(f"\nPipeline 完成: {result.subject}")

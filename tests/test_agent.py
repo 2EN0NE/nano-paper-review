@@ -1,6 +1,7 @@
-"""agent 模块单元测试 — AgentConfig / model_args / build_command（Agent 抽象）。
+"""agent 模块单元测试 — AgentConfig / model_args / build_command / 升级链解析。
 
-验证：留空不传 flag、显式配置拼入对应 CLI args、opencode 预留失败明确。
+验证：留空不传 flag、显式配置拼入对应 CLI args、opencode 预留失败明确、
+升级链（escalate）解析与单调推进 + 顶部饱和（ADR 0017）。
 """
 
 from __future__ import annotations
@@ -9,10 +10,11 @@ import pytest
 
 from paper_review.agent import (
     AgentConfig,
+    append_prompt_args,
     build_command,
-    build_command_without_model,
-    is_model_config_error,
     model_args,
+    parse_escalation_chain,
+    resolve_command_for_attempt,
 )
 
 
@@ -22,6 +24,7 @@ class TestAgentConfig:
         assert cfg.type == "pi"
         assert cfg.provider == ""
         assert cfg.model == ""
+        assert cfg.escalate == []
         assert not cfg.has_explicit_model()
 
     def test_from_env_reads_agent_vars(self):
@@ -47,6 +50,22 @@ class TestAgentConfig:
         cfg = AgentConfig.from_env({"PI_PROVIDER": "cli-proxy-api", "PI_MODEL": "deepseek-v4-pro"})
         assert cfg.provider == ""
         assert cfg.model == ""
+
+    def test_from_env_reads_escalate(self):
+        cfg = AgentConfig.from_env({"PIPELINE_AGENT_ESCALATE": '["pi -ne", "pi -ne --model x"]'})
+        assert cfg.escalate == ["pi -ne", "pi -ne --model x"]
+
+    def test_from_env_escalate_invalid_json_raises(self):
+        with pytest.raises(ValueError, match="不是合法 JSON"):
+            AgentConfig.from_env({"PIPELINE_AGENT_ESCALATE": "{not json"})
+
+    def test_from_env_escalate_non_list_raises(self):
+        with pytest.raises(ValueError, match="必须是 JSON 数组"):
+            AgentConfig.from_env({"PIPELINE_AGENT_ESCALATE": '"pi -ne"'})
+
+    def test_has_explicit_model_ignores_escalate(self):
+        cfg = AgentConfig(escalate=["pi -ne"])
+        assert not cfg.has_explicit_model()
 
 
 class TestModelArgs:
@@ -94,38 +113,51 @@ class TestBuildCommand:
             "@prompt.md",
         ]
 
-    def test_without_model_drops_flags(self):
-        cfg = AgentConfig(provider="p", model="m")
-        cmd = build_command_without_model(cfg, "pi", "prompt.md", ["-ne"])
-        assert cmd == ["pi", "-ne", "--no-session", "-p", "@prompt.md"]
-
     def test_opencode_not_implemented(self):
         with pytest.raises(NotImplementedError):
             build_command(AgentConfig(type="opencode"), "opencode", "prompt.md")
 
 
-class TestIsModelConfigError:
-    def test_model_config_errors_detected(self):
-        for stderr in [
-            "HTTP 402 Payment Required",
-            "402 Insufficient Balance",
-            "insufficient quota",
-            "model not found",
-            "unknown model",
-            "no such model",
-        ]:
-            assert is_model_config_error(stderr), stderr
+class TestParseEscalationChain:
+    def test_string_entries_shlex_split(self):
+        chain = parse_escalation_chain(["pi -ne", 'pi --model "openai/gpt-4o"'])
+        assert chain == [["pi", "-ne"], ["pi", "--model", "openai/gpt-4o"]]
 
-    def test_non_model_errors_not_detected(self):
-        for stderr in [
-            "",
-            "panic: index out of range",
-            "HTTP 429 Too Many Requests",
-            "HTTP 503 Service Unavailable",
-            "auth_unavailable",
-        ]:
-            assert not is_model_config_error(stderr), stderr
+    def test_list_entries_passthrough(self):
+        chain = parse_escalation_chain([["pi", "-ne"], ["pi", "--model", "x"]])
+        assert chain == [["pi", "-ne"], ["pi", "--model", "x"]]
 
-    def test_case_insensitive(self):
-        assert is_model_config_error("MODEL NOT FOUND")
-        assert is_model_config_error("Insufficient Balance")
+    def test_mixed_and_empty_skipped(self):
+        chain = parse_escalation_chain(["pi -ne", [], ["pi", "--model", "x"], ""])
+        assert chain == [["pi", "-ne"], ["pi", "--model", "x"]]
+
+    def test_empty_input(self):
+        assert parse_escalation_chain([]) == []
+
+
+class TestResolveCommandForAttempt:
+    def test_monotonic_advance(self):
+        chain = [["pi", "-ne"], ["pi", "--model", "x"], ["pi", "-ne"]]
+        assert resolve_command_for_attempt(chain, 1) == ["pi", "-ne"]
+        assert resolve_command_for_attempt(chain, 2) == ["pi", "--model", "x"]
+        assert resolve_command_for_attempt(chain, 3) == ["pi", "-ne"]
+
+    def test_saturate_at_last(self):
+        chain = [["a"], ["b"]]
+        assert resolve_command_for_attempt(chain, 5) == ["b"]
+
+    def test_empty_chain_returns_none(self):
+        assert resolve_command_for_attempt([], 1) is None
+
+
+class TestAppendPromptArgs:
+    def test_appends_session_and_prompt(self):
+        assert append_prompt_args(["pi", "-ne", "--model", "x"], "p.md") == [
+            "pi",
+            "-ne",
+            "--model",
+            "x",
+            "--no-session",
+            "-p",
+            "@p.md",
+        ]
