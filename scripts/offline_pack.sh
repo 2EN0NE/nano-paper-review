@@ -60,24 +60,35 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---- 找一个带 pip 的 Python（用于生成依赖清单 + 下载 wheels） ----
+# 两个坑（CI 实测踩过）：
+#   1. Ubuntu 24.04 系统自带 python3.12 无 pip（需 python3.12-pip 包）；
+#   2. `uv run` 会把项目 .venv/bin 前置到 PATH，其解释器默认不装 pip，会遮蔽
+#      PATH 后面真正带 pip 的解释器（command -v 只返回第一个命中）。
+# 因此这里遍历 PATH 各目录、跳过 venv 内解释器、逐个验证 `-m pip --version`，
+# 确保选中一个真正能执行 pip download 的 Python（>= 3.10）。
+# pip download 用 --python-version 指定目标 cp 标签，与 PACK_PYTHON 自身版本无关。
 PACK_PYTHON=""
+IFS=':' read -ra _PATH_DIRS <<< "$PATH"
 for candidate in "python3.12" "python3.11" "python3.10" "python3"; do
-	if command -v "$candidate" >/dev/null 2>&1; then
-		ver="$("$candidate" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")"
+	for _dir in "${_PATH_DIRS[@]}"; do
+		[[ -n "$_dir" ]] || _dir="."
+		_candidate_path="$_dir/$candidate"
+		[[ -x "$_candidate_path" ]] || continue
+		# 跳过 venv 内解释器（uv 创建的 venv 默认无 pip）
+		case "$_candidate_path" in
+			*"/.venv/"*|*"/venv/"*) continue ;;
+		esac
+		ver="$("$_candidate_path" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")"
 		major="${ver%%.*}"
 		minor="${ver##*.}"
-		if [[ "$major" -ge 3 && "$minor" -ge 10 ]]; then
-			PACK_PYTHON="$candidate"
-			break
+		if [[ "$major" -ge 3 && "$minor" -ge 10 ]] && "$_candidate_path" -m pip --version >/dev/null 2>&1; then
+			PACK_PYTHON="$_candidate_path"
+			break 2
 		fi
-	fi
+	done
 done
 if [[ -z "$PACK_PYTHON" ]]; then
 	echo "  [ERR] 未找到带 pip 的 Python >= 3.10（用于下载 wheels）" >&2
-	exit 1
-fi
-if ! "$PACK_PYTHON" -m pip --version >/dev/null 2>&1; then
-	echo "  [ERR] $PACK_PYTHON 缺少 pip" >&2
 	exit 1
 fi
 

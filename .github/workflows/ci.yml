@@ -143,10 +143,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Python ${{ env.PYTHON_VERSION }}
+      # 离线包 wheels 按 cp312 打包，安装测试需用 python3.12 建 venv（见
+      # test_offline_install.py）。Ubuntu 24.04 系统自带 python3.12 无 pip/venv，
+      # 故用 setup-python 提供带 pip+venv 的 3.12，避免 offline_pack.sh 命中无 pip
+      # 的系统解释器（CI 曾因此报「python3.12 缺少 pip」）。
+      - name: Install Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.12"
 
       - name: Install uv
         run: pip install uv
