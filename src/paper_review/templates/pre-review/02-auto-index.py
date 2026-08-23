@@ -61,6 +61,7 @@ def main():
     reference_dir = Path(os.environ.get("PIPELINE_INDEX_REFERENCE_DIR", "./origin/pdf"))
     auto_index = os.environ.get("PIPELINE_INDEX_AUTO_INDEX", "1") == "1"
     copy_subjects = os.environ.get("PIPELINE_INDEX_COPY_SUBJECTS", "1") == "1"
+    data_dir = Path(os.environ.get("PIPELINE_DATA_DIR", "."))
 
     # ── 前置依赖：01-convert 的 manifest ──
     manifest_path = Path(output_dir) / "subject-manifest.json"
@@ -102,15 +103,21 @@ def main():
     conflict_renamed = 0
 
     # ── 初始化 Store 和模型 ──
+    from paper_review.config import load_config
     from paper_review.extractor import count_pages, extract_meta, extract_pdf
     from paper_review.progress import report_batch_progress
     from paper_review.search.indexer import build_index
     from paper_review.search.models import EmbeddingModelManager
     from paper_review.search.store import Paper, PaperMeta, Store
 
+    # 配置按 PIPELINE_DATA_DIR 解析（与 05-batch-search 一致）——否则 --data-dir
+    # 场景下会用 cwd/~/.paper-review 的默认模型（512 维）建索引，与 05 查询端
+    # 维度不一致 → 查询退化为哈希向量，embedding_model/vector_dim 配置失效。
+    cfg = load_config(data_dir=os.environ.get("PIPELINE_DATA_DIR") or None)
+
     store_dir.mkdir(parents=True, exist_ok=True)
     db_path = str(store_dir / "index.sqlite")
-    store = Store(db_path)
+    store = Store(db_path, config=cfg)
     store.load_content_hashes_only()
 
     # T5b: 校验索引存储状态——store 中缺失 paper_id 的现有产物视为未索引（重新索引）。
@@ -130,7 +137,7 @@ def main():
     if not store.load_faiss():
         store.init_faiss()
 
-    model = EmbeddingModelManager()
+    model = EmbeddingModelManager(config=cfg)
     model.load()
 
     # ═══════════════════════════════════════════════════════════
@@ -138,7 +145,6 @@ def main():
     # ═══════════════════════════════════════════════════════════
     from paper_review.auto_index import check_sentinel, write_sentinel
 
-    data_dir = Path(os.environ.get("PIPELINE_DATA_DIR", "."))
     if auto_index and not check_sentinel(data_dir):
         reference_dir.mkdir(parents=True, exist_ok=True)
         pdf_files = sorted(reference_dir.glob("*.pdf"))
