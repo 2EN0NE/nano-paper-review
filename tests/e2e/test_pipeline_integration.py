@@ -2006,14 +2006,8 @@ def _embedding_model_available() -> bool:
 _HAS_EMBEDDING_MODEL = _embedding_model_available()
 
 
-class TestRealModelChunkRetrieval:
-    """真实模型 + 真实 FAISS 建索引 → 批量预检索的端到端链路。
-
-    覆盖审查 P1 缺口：TestChunkLevelRetrievalPipeline 用 noop 02-auto-index 绕过
-    FAISS 建索引，导致「真实 02-auto-index 写 chunks.index → 05-batch-search
-    load_faiss → FAISS chunk 检索」这条 Pre→Review 链路零 e2e 覆盖。
-    有 embedding 模型时真跑（真实 ONNX embedding + FAISS），无模型时跳过。
-    """
+class _ChunkRetrievalHelpers:
+    """FAISS 链路 e2e 的共享 helper（真实模型 / tiny 模型两个测试类复用）。"""
 
     def _make_capturing_pi(self, bindir: Path) -> Path:
         """fake pi：捕获 prompt.md 内容 + 按步骤输出完整评分 data。"""
@@ -2143,6 +2137,16 @@ phases:
             timeout=300,
             env=env,
         )
+
+
+class TestRealModelChunkRetrieval(_ChunkRetrievalHelpers):
+    """真实模型 + 真实 FAISS 建索引 → 批量预检索的端到端链路。
+
+    覆盖审查 P1 缺口：TestChunkLevelRetrievalPipeline 用 noop 02-auto-index 绕过
+    FAISS 建索引，导致「真实 02-auto-index 写 chunks.index → 05-batch-search
+    load_faiss → FAISS chunk 检索」这条 Pre→Review 链路零 e2e 覆盖。
+    有 embedding 模型时真跑（真实 ONNX embedding + FAISS），无模型时跳过。
+    """
 
     @pytest.mark.skipif(
         not _HAS_EMBEDDING_MODEL, reason="无本地 embedding 模型，跳过真实 FAISS 链路 e2e"
@@ -2661,3 +2665,95 @@ class TestTechnicalFeaturePipeline:
         assert len(pending) == 1, f"pending 应为 gc-b，实为 {pending}"
         # 模糊匹配：gc-b 的 combined_score = overlap（1.0），非退化 vector
         assert pending[0]["combined_score"] > 0.9, f"模糊匹配未生效: {pending[0]}"
+
+
+class TestTinyModelChunkRetrieval(_ChunkRetrievalHelpers):
+    """极小确定性 embedding 模型 + 真实 FAISS 建索引 → 批量预检索端到端链路。
+
+    与 ``TestRealModelChunkRetrieval``（需真实 ~25MB embedding，CI 上 skip）互补：
+    这里用提交进仓库的 tiny-embedding fixture（dim=4），CI 常态真跑，覆盖
+    「chunking → ONNX embedding → FAISS 建索引 → BM25+FAISS 检索」完整管线机制，
+    不验证语义质量（语义由真实模型在本地/单独 job 覆盖）。
+    """
+
+    _FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
+
+    def _write_tiny_config(self, data_dir: Path) -> None:
+        (data_dir / "config.yaml").write_text(
+            f"model_cache_dir: {self._FIXTURES}\n"
+            "embedding_model: tiny-embedding\n"
+            "reranker_model: tiny-reranker\n"
+            "vector_dim: 4\n",
+            encoding="utf-8",
+        )
+
+    def test_tiny_auto_index_faiss_and_batch_search(self, tmp_path):
+        """tiny embedding + 真实 FAISS 建索引 → 批量预检索完整链路（CI 常态真跑）。"""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / ".first-use-hint-shown").touch()
+        self._write_tiny_config(data_dir)
+
+        pipelines_dir = data_dir / "pipelines"
+        self._setup_real_pipeline(pipelines_dir)
+
+        reference_dir = data_dir / "origin" / "pdf"
+        reference_dir.mkdir(parents=True)
+        _make_pdf(
+            reference_dir / "credit-history.pdf",
+            "This paper proposes a credit assessment method using deep learning for risk control.",
+        )
+        _make_pdf(
+            reference_dir / "graph-history.pdf",
+            "Graph neural networks for social network analysis.",
+        )
+        _make_pdf(reference_dir / "system-history.pdf", "Distributed system scheduling algorithms.")
+        _make_pdf(reference_dir / "database-history.pdf", "Database query optimization techniques.")
+        _make_pdf(
+            reference_dir / "security-history.pdf", "Security vulnerability detection methods."
+        )
+
+        mock_bin = tmp_path / "mock-bin"
+        mock_bin.mkdir()
+        fake_pi = self._make_capturing_pi(mock_bin)
+        _make_mock_pandoc(mock_bin)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _make_pdf(
+            input_dir / "credit-assessment.pdf",
+            "credit assessment method research for risk control",
+        )
+
+        result = self._run_review(data_dir, input_dir, mock_bin, fake_pi)
+        assert result.returncode == 0, f"STDOUT:{result.stdout[:800]}\nSTDERR:{result.stderr[:800]}"
+
+        # 1. FAISS chunks.index 真实落盘（02-auto-index 建索引而非 noop）
+        chunks_index = data_dir / "index" / "chunks.index"
+        assert chunks_index.exists(), f"chunks.index 未落盘: {chunks_index}"
+
+        # 1b. FAISS 索引维度 = tiny 模型维度（4）——锁定 02-auto-index 按
+        # PIPELINE_DATA_DIR 读 config：若退回默认模型（512 维）此处即失败，
+        # 杜绝“02 用默认模型建索引、05 查询退化哈希”的假阳性覆盖。
+        import faiss
+
+        idx = faiss.read_index(str(chunks_index))
+        assert idx.d == 4, f"FAISS 索引维度应为 4（tiny 模型），实为 {idx.d}"
+
+        task_dir = _find_task_dir(data_dir / "output")
+        intermediates = task_dir / "intermediates"
+
+        # 2. 05-batch-search 检索到 history 参考
+        batch_out = intermediates / "credit-assessment" / "05-batch-search" / "output.json"
+        assert batch_out.exists(), f"05-batch-search 产物缺失: {batch_out}"
+        batch_data = json.loads(batch_out.read_text())
+        assert batch_data["data"]["history_count"] >= 1
+
+        # 2b. BM25 腿非零
+        history = batch_data["data"]["history"]
+        assert any(r["bm25_score"] > 0 for r in history)
+
+        # 3. 真实 embedding 参与（非哈希降级）：config 与 fixture 一致 → embedding_used
+        summary_out = intermediates / "pre" / "05-batch-search" / "output.json"
+        summary = json.loads(summary_out.read_text())
+        assert summary["data"]["model"]["embedding_used"]
