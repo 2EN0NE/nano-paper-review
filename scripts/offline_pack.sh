@@ -68,7 +68,7 @@ done
 # 确保选中一个真正能执行 pip download 的 Python（>= 3.10）。
 # pip download 用 --python-version 指定目标 cp 标签，与 PACK_PYTHON 自身版本无关。
 PACK_PYTHON=""
-IFS=':' read -ra _PATH_DIRS <<< "$PATH"
+IFS=':' read -ra _PATH_DIRS <<<"$PATH"
 for candidate in "python3.12" "python3.11" "python3.10" "python3"; do
 	for _dir in "${_PATH_DIRS[@]}"; do
 		[[ -n "$_dir" ]] || _dir="."
@@ -76,7 +76,7 @@ for candidate in "python3.12" "python3.11" "python3.10" "python3"; do
 		[[ -x "$_candidate_path" ]] || continue
 		# 跳过 venv 内解释器（uv 创建的 venv 默认无 pip）
 		case "$_candidate_path" in
-			*"/.venv/"*|*"/venv/"*) continue ;;
+		*"/.venv/"* | *"/venv/"*) continue ;;
 		esac
 		ver="$("$_candidate_path" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")"
 		major="${ver%%.*}"
