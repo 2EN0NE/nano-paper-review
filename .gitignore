@@ -227,6 +227,7 @@ prototype_index.sqlite
 
 # Agent
 .pi/
+.agents/
 
 # Full system pip freeze (use pip install -e .[dev] instead)
 requirements.lock

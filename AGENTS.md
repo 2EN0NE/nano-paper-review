@@ -111,6 +111,22 @@ src/paper_review/templates/   # Scaffold Template —— init 生成脚本的唯
 
 测试 mirrors src —— `tests/test_store.py`、`tests/test_orchestrator.py` 等。
 
+## Skills 体系（agent 技能封装）
+
+CLI 能力封装为 Agent Skills，供用户在 agent 里以自然语言驱动评审/检索。设计决策见
+ADR 0020，术语见 CONTEXT.md「Skill 体系」小节。
+
+```text
+skills/
+├── paper-review/    # Skill Router（引导技能）
+├── user/            # setup / index / search / review / pipeline（给安装项目的用户）
+└── builder/         # testing / retrieval-dev / deploy（给构建/维护项目的人）
+```
+
+安装：`bash scripts/install-skills.sh`（默认装 router+user 到项目级 `.agents/skills/`；
+`--global` 装到 `~/.agents/skills/`；`--all` 额外装 builder；`--link` 软链供开发迭代）。
+重启 pi 会话后 skill 生效。
+
 ## 规范约定
 
 - **`Store` 是唯一持久化入口**：所有索引操作（add/remove/rebuild）通过 Store，不直接操作 SQLite。

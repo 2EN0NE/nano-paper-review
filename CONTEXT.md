@@ -246,3 +246,21 @@ pipelines:
     name: "标准论文评审"
     description: "默认双维度评审管线"
 ```
+
+### Skill 体系
+
+**Builder Skill**:
+面向构建/维护 paper-review 项目本身的人（维护者）的技能，指导 agent 定制管线、开发检索子系统、跑测试、打包部署。源文件在 `skills/builder/`。
+_Avoid_: Dev skill, maintainer skill
+
+**User Skill**:
+面向安装了 paper-review 的用户（用它完成论文评审）的技能，指导 agent 建索引、检索、评审、自定义管线。源文件在 `skills/user/`。
+_Avoid_: Consumer skill, operator skill
+
+**Skill Router**:
+引导技能。一个 model-invoked（= 不设 `disable-model-invocation`，agent 自动可见）的入口技能（`paper-review`），介绍所有 skill 及各自适用场景，供 agent 在需求模糊时自动拉起做推荐。是「用户不知道用哪个技能」时的入口。
+_Avoid_: Dispatcher, hub skill, index skill
+
+**Skill Installer**:
+安装脚本（`scripts/install-skills.sh`），把 skills 从 `skills/` 源目录安装到项目级 `.agents/skills/` 或用户级 `~/.agents/skills/`。默认拷贝（可移植），`--link` 软链供开发迭代。
+_Avoid_: Skill setup, bootstrap script
